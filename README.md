@@ -64,6 +64,8 @@ OpenAPI Spec → AI Agent → Learning → Better Tests Over Time
 
 ## 🚀 Quick Start (5 Minutes)
 
+> **📖 For complete instructions, see [HOW_TO_RUN_EVERYTHING.md](./HOW_TO_RUN_EVERYTHING.md)**
+
 ### 1. Install Dependencies
 ```bash
 git clone https://github.com/joybratasarkar/spec-test-pilot-.git
@@ -79,16 +81,16 @@ python run_agent.py --spec sample_api.yaml --verbose
 # Result: 20 comprehensive test cases in JSON format
 ```
 
-### 3. Train the Agent (Optional)
+### 3. Test All Components
 ```bash
-# Generate training data
-python data/generate_dataset.py
+# Test GAM memory system
+python gam_implementation.py
 
-# Educational training (free)
-python train_agent_lightning.py --mock --epochs 5
+# Test Agent Lightning integration  
+python final_agent_lightning_test.py
 
-# Real RL training with Agent Lightning
-python train_agent_lightning_real.py --algorithm ppo --epochs 10
+# Test full system integration
+python spectestpilot_with_gam.py
 ```
 
 ### 4. Verify Everything Works
@@ -96,6 +98,15 @@ python train_agent_lightning_real.py --algorithm ppo --epochs 10
 # Run comprehensive test suite
 ./run_tests.sh
 # Should show: 8/8 comprehensive tests + 23/23 unit tests passing
+```
+
+### 5. Optional: Train the Agent
+```bash
+# Educational training (free)
+python train_agent_lightning.py --mock --epochs 5
+
+# Real RL training with Agent Lightning (costs money)
+python train_agent_lightning_real.py --algorithm ppo --epochs 10
 ```
 
 ---
@@ -267,9 +278,13 @@ print(f"Generated {len(test_cases)} test cases")
 | Document | Purpose | Audience |
 |----------|---------|----------|
 | **README.md** | Project overview & quick start | Everyone |
+| **HOW_TO_RUN_EVERYTHING.md** | Complete system guide | **START HERE** |
+| **QUICK_REFERENCE.md** | Essential commands | Daily users |
 | **GETTING_STARTED.md** | Step-by-step beginner guide | New users |
 | **ARCHITECTURE.md** | Technical deep-dive | Developers |
 | **RL_TRAINING_EXPLAINED.md** | RL training comparison | ML practitioners |
+| **GAM_IMPLEMENTATION_GUIDE.md** | Memory system details | Advanced users |
+| **TESTING_GUIDE.md** | Testing & validation | QA engineers |
 | **SAMPLE_RUN_EXPLAINED.md** | Example execution walkthrough | Users |
 
 ---
