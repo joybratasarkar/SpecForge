@@ -9,6 +9,7 @@ An RL-trainable agent that automatically generates comprehensive API test cases 
 - **🧠 GAM-Style Memory**: Deep research loop with BM25 + vector search (plan → search → integrate → reflect)
 - **🔄 LangGraph Orchestration**: 8-node state machine for reliable workflow
 - **🎓 RL-Friendly**: Deterministic reward function with hard gates and positive components
+- **⚡ Agent Lightning**: Real RL training with Microsoft's Agent Lightning framework
 - **🚀 Mock Mode Training**: Train locally without API keys using deterministic stub LLM
 - **📊 Synthetic Dataset**: Built-in generator for 500+ training examples
 
@@ -32,8 +33,11 @@ python data/generate_dataset.py
 # Run agent
 python run_agent.py --spec api.yaml --verbose
 
-# Train (mock mode)
+# Train (mock mode - educational)
 python train_agent_lightning.py --mock --epochs 10
+
+# Train (real RL with Agent Lightning)
+python train_agent_lightning_real.py --algorithm ppo --epochs 10
 
 # Test
 ./run_tests.sh

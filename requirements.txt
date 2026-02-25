@@ -30,3 +30,6 @@ python-dotenv>=1.0.0
 
 # OpenAI (for real model training)
 openai>=1.0.0
+
+# Agent Lightning (for RL training)
+agentlightning>=0.1.0
