@@ -34,6 +34,11 @@ openai>=1.0.0
 # Agent Lightning (for RL training)
 agentlightning>=0.1.0
 
+# Isolated API execution sandbox
+fastapi>=0.110.0
+uvicorn>=0.29.0
+httpx>=0.27.0
+
 # GAM (General Agentic Memory) dependencies
 sentence-transformers>=2.2.0
 rank-bm25>=0.2.2

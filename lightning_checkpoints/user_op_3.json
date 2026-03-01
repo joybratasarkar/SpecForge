@@ -1,0 +1,61 @@
+{
+  "operation_id": 3,
+  "timestamp": 1772374413.612541,
+  "task": {
+    "spec_title": "Healthcare Data API",
+    "nlp_prompt": "Test HIPAA compliance and data privacy controls",
+    "tenant_id": "healthcare_compliance"
+  },
+  "result": {
+    "success": true,
+    "result": {
+      "success": true,
+      "result": {
+        "success": true,
+        "generated_tests": "Multi-language test suite with 1 scenarios",
+        "test_count": 1,
+        "endpoint_count": 1,
+        "processing_time": 0.3557707193831535,
+        "output_files": [
+          "ml_test_api.sh",
+          "ml_pom.xml",
+          "healthcare_data_api_spec.yaml",
+          "ml_test_api.py",
+          "ml_package.json",
+          "ml_TEST_PLAN.md",
+          "ml_test_api.test.js",
+          "ml_APITests.java",
+          "ml_requirements.txt"
+        ],
+        "execution_id": 1,
+        "multi_language_files": [
+          "ml_test_api.test.js",
+          "ml_requirements.txt",
+          "ml_test_api.sh",
+          "ml_pom.xml",
+          "ml_TEST_PLAN.md",
+          "ml_package.json",
+          "ml_APITests.java",
+          "ml_test_api.py"
+        ],
+        "languages_supported": [
+          "python",
+          "javascript",
+          "java",
+          "curl"
+        ]
+      },
+      "quality_score": 0.9
+    },
+    "execution_time": 0.37661218643188477,
+    "session_id": "731283cc-8c9e-4538-8592-0ee46a0d124c",
+    "traces_collected": 2,
+    "training_enabled": true,
+    "registered_agents": 1,
+    "total_traces": 2,
+    "active_sessions": 0,
+    "rl_buffer_size": 1,
+    "rl_training_steps": 0
+  },
+  "duration": 0.37810826301574707
+}

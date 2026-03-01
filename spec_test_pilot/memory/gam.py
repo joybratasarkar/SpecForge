@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Any, Optional, Tuple, Literal
 import uuid
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 
 from rank_bm25 import BM25Okapi
@@ -424,17 +425,39 @@ class PageStore:
         
         return results
     
-    def search_by_tags(self, tags: List[str], top_k: int = 5) -> List[Page]:
-        """Search pages by tags."""
+    def search_by_tags(
+        self, tags: List[str], top_k: int = 5, tenant_id: Optional[str] = None
+    ) -> List[Page]:
+        """Search pages by tags with optional tenant filtering."""
         tag_set = set(tags)
         scored = []
         for page in self.pages:
+            if tenant_id is not None and page.tenant_id not in (None, tenant_id):
+                continue
             overlap = len(tag_set & set(page.tags))
             if overlap > 0:
                 scored.append((page, overlap))
         
         scored.sort(key=lambda x: x[1], reverse=True)
         return [p for p, _ in scored[:top_k]]
+
+    def search_by_page_ids(
+        self, page_ids: List[str], tenant_id: Optional[str] = None
+    ) -> List[Page]:
+        """Retrieve pages by explicit page IDs with optional tenant filtering."""
+        seen = set()
+        pages: List[Page] = []
+        for page_id in page_ids:
+            if page_id in seen:
+                continue
+            seen.add(page_id)
+            page = self.get_page(page_id)
+            if not page:
+                continue
+            if tenant_id is not None and page.tenant_id not in (None, tenant_id):
+                continue
+            pages.append(page)
+        return pages
 
 
 class Memorizer:
@@ -807,27 +830,110 @@ class Researcher:
         
         return plan[:4]  # Limit plan steps
     
-    def search(self, plan: List[str]) -> List[Tuple[Page, float]]:
+    def search(
+        self,
+        plan: List[str],
+        tenant_id: Optional[str] = None,
+        prior_page_ids: Optional[List[str]] = None,
+    ) -> List[Tuple[Page, float]]:
         """
         Execute search based on plan.
         
+        Implements retrieval tools over pages:
+        - retrieve_by_query: hybrid search per query
+        - retrieve_by_group: tag/group-based retrieval
+        - retrieve_by_page_ids: explicit prior page references
+        
+        Retrieval calls are executed in parallel and merged.
+        
         Args:
             plan: List of search queries
+            tenant_id: Optional tenant scope
+            prior_page_ids: Optional page IDs from previous iteration
             
         Returns:
             List of (Page, score) tuples
         """
         all_results: Dict[str, Tuple[Page, float]] = {}
-        
-        for query in plan:
-            results = self.page_store.hybrid_search(query, top_k=3)
-            for page, score in results:
-                if page.id not in all_results or all_results[page.id][1] < score:
-                    all_results[page.id] = (page, score)
+
+        futures = []
+        with ThreadPoolExecutor(max_workers=max(1, min(8, len(plan) + 3))) as executor:
+            for query in plan:
+                futures.append(
+                    executor.submit(self.retrieve_by_query, query, tenant_id)
+                )
+            
+            group_tags = self._derive_group_tags(plan)
+            if group_tags:
+                futures.append(
+                    executor.submit(self.retrieve_by_group, group_tags, tenant_id)
+                )
+            
+            if prior_page_ids:
+                futures.append(
+                    executor.submit(
+                        self.retrieve_by_page_ids,
+                        prior_page_ids[: self.MAX_EXCERPTS * 2],
+                        tenant_id,
+                    )
+                )
+            
+            for future in as_completed(futures):
+                results = future.result()
+                for page, score in results:
+                    if page.id not in all_results or all_results[page.id][1] < score:
+                        all_results[page.id] = (page, score)
         
         # Sort by score and return
         sorted_results = sorted(all_results.values(), key=lambda x: x[1], reverse=True)
         return sorted_results[:self.MAX_EXCERPTS * 2]
+
+    def retrieve_by_query(
+        self, query: str, tenant_id: Optional[str] = None
+    ) -> List[Tuple[Page, float]]:
+        """Tool: retrieve pages by free-text query."""
+        return self.page_store.hybrid_search(query, top_k=3, tenant_id=tenant_id)
+
+    def retrieve_by_group(
+        self, group_tags: List[str], tenant_id: Optional[str] = None
+    ) -> List[Tuple[Page, float]]:
+        """Tool: retrieve pages by semantic group tags."""
+        pages = self.page_store.search_by_tags(
+            group_tags, top_k=self.MAX_EXCERPTS * 2, tenant_id=tenant_id
+        )
+        # Tag retrieval has weaker evidence than exact query matches.
+        return [(page, 0.35 - idx * 0.02) for idx, page in enumerate(pages)]
+
+    def retrieve_by_page_ids(
+        self, page_ids: List[str], tenant_id: Optional[str] = None
+    ) -> List[Tuple[Page, float]]:
+        """Tool: retrieve previously known page IDs."""
+        pages = self.page_store.search_by_page_ids(page_ids, tenant_id=tenant_id)
+        # Direct page-id retrieval is high-confidence.
+        return [(page, 0.60 - idx * 0.03) for idx, page in enumerate(pages)]
+
+    def _derive_group_tags(self, plan: List[str]) -> List[str]:
+        """Infer group tags from plan items."""
+        tags = set()
+        plan_text = " ".join(plan).lower()
+
+        mapping = {
+            "auth": ["auth", "security"],
+            "security": ["security", "auth"],
+            "validation": ["validation", "negative"],
+            "schema": ["schema", "contract", "validator"],
+            "pagination": ["pagination", "list"],
+            "rest": ["rest", "testing", "convention"],
+        }
+
+        for token, mapped in mapping.items():
+            if token in plan_text:
+                tags.update(mapped)
+
+        if not tags:
+            tags.add("convention")
+
+        return list(tags)
     
     def integrate(
         self,
@@ -919,6 +1025,8 @@ class Researcher:
         """
         all_excerpts: List[Dict[str, str]] = []
         all_plan: List[str] = []
+        tracked_page_ids: List[str] = []
+        tenant_id = context.get("tenant_id")
         
         for iteration in range(1, self.MAX_REFLECTIONS + 1):
             # Plan
@@ -926,7 +1034,12 @@ class Researcher:
             all_plan.extend(plan)
             
             # Search
-            results = self.search(plan)
+            results = self.search(
+                plan,
+                tenant_id=tenant_id,
+                prior_page_ids=tracked_page_ids,
+            )
+            tracked_page_ids = [page.id for page, _ in results]
             
             # Integrate
             excerpts = self.integrate(results)
