@@ -20,31 +20,42 @@ This document defines the production-ready architecture for a QA-specialist agen
 ## 3. High-Level Architecture
 
 ```text
-                               +-----------------------------+
-                               |        Control Plane        |
-                               | run API / CLI / scheduler   |
-                               +--------------+--------------+
-                                              |
-                                              v
-+----------------------+        +-------------+---------------+        +----------------------+
-|   Memory Plane       |<------>|    Agent Runtime Plane      |<------>|   Isolation Plane    |
-|   GAM                |        | parse -> plan -> generate   |        | mock API / sandbox   |
-| page store / memo    |        | execute -> report           |        | per-run environment  |
-+----------+-----------+        +-------------+---------------+        +-----------+----------+
-           |                                  |
-           |                                  v
-           |                    +-------------+---------------+
-           +------------------->|   Learning Plane            |
-                                | Agent Lightning sidecar RL  |
-                                | traces -> transitions       |
-                                +-------------+---------------+
-                                              |
-                                              v
-                                +-------------+---------------+
-                                | Observability & Governance   |
-                                | logs / metrics / quality     |
-                                +-----------------------------+
+                     +--------------------------------------------+
+                     |                Control Plane               |
+                     |      CLI runner / scheduler / triggers     |
+                     +---------------------+----------------------+
+                                           |
+                                           v
+      +------------------------------------+------------------------------------+
+      |                  Agent Runtime Plane (QASpecialistAgent)                |
+      | parse spec -> GAM research -> scenario generation -> adaptive selection  |
+      |        isolated execution -> summary -> report -> RL invocation          |
+      +-------------------------+-----------------------------+------------------+
+                                |                             |
+                                |                             v
+                                |        +--------------------+------------------+
+                                |        |      Isolation Plane                   |
+                                |        | DynamicMockServer + FastAPI TestClient |
+                                |        +----------------------------------------+
+                                |
+                                v
+      +-------------------------+------------------+        +--------------------+------------------+
+      |      Memory Plane (GAM)                    |<------>| Learning Plane (Current Implementation) |
+      | sessions / pages / memo / retrieval        |        | AgentLightningTrainer                     |
+      +--------------------------------------------+        | + ObservabilityCollector                  |
+                                                            | + CreditAssignmentModule                  |
+                                                            | + LightningRLAlgorithm (replay buffer)   |
+                                                            +--------------------+------------------+
+                                                                                 |
+                                                                                 v
+                                                            +--------------------+------------------+
+                                                            | Observability / Governance / Reporting |
+                                                            | metrics, JSON+MD reports, learning log |
+                                                            +----------------------------------------+
 ```
+
+Official Agent Lightning target alignment:
+`Algorithm <-> Runner <-> LightningStore`
 
 ## 4. Runtime Flow (Single Run)
 
@@ -53,15 +64,83 @@ Input(spec, tenant, prompt)
   -> start GAM session
   -> GAM deep research (plan/search/integrate/reflect)
   -> scenario generation (human-style QA)
+  -> runtime tracing (spans + resources for learning context)
+  -> adaptive policy selection (contextual linear-UCB)
   -> multi-language test artifact generation
   -> isolated execution against dynamic mock API
   -> collect per-scenario results
   -> summarize pass/fail, latency, failures
+  -> update adaptive policy state from rewards/penalties
+  -> build RL task payload + reward
+  -> Agent Lightning runner-equivalent processes traces and transitions
+  -> Algorithm trains from replay/store-backed transitions
   -> store transcript + artifacts + memo in GAM
-  -> send run summary into Agent Lightning trainer
   -> receive RL training stats
   -> emit JSON + Markdown report
 ```
+
+### 4.1 Runtime Sequence (Mermaid)
+
+```mermaid
+sequenceDiagram
+    participant U as User/CLI
+    participant A as QASpecialistAgent
+    participant G as GAM Memory
+    participant P as Adaptive Policy
+    participant S as Isolation Sandbox
+    participant L as Agent Lightning
+    participant R as Report Writer
+
+    U->>A: run(spec_path, tenant_id, prompt, limits)
+    A->>A: load_spec()
+    A->>G: start_session(tenant_id, metadata)
+    A->>G: research(spec_context)
+    A->>A: think_like_tester(prompt + memory excerpts)
+    A->>P: score/rank candidates + select top-K
+    A->>A: generate multi-language tests
+    A->>S: execute scenarios on dynamic mock API
+    S-->>A: per-scenario status, duration, response/error
+    A->>A: build summary + compute run/decision rewards
+    A->>P: update policy state from decision signals
+    A->>L: train_agent(task_payload, learning_reward_score)
+    L-->>A: training_result + training_stats
+    A->>G: add run artifacts + end_session_with_memo()
+    A->>R: write JSON/Markdown report + learning_state.json
+    R-->>U: output file paths + run summary
+```
+
+### 4.2 Step-by-Step Input/Output Contract
+
+| Step | Component | Inputs | Processing | Outputs | Persisted State |
+|---|---|---|---|---|---|
+| 1 | Control Plane (CLI) | `spec_path`, `tenant_id`, `prompt`, `max_scenarios`, `pass_threshold`, `output_dir` | Initializes run configuration and paths | Agent instance with runtime config | None |
+| 2 | Spec Loader | OpenAPI YAML/JSON file bytes | Parses + validates top-level object | Parsed `spec` dictionary | Optional copied spec in run folder (`openapi_under_test.yaml`) |
+| 3 | GAM Session Start | `tenant_id`, spec metadata | Opens tenant-scoped session and records init event | `session_id` | GAM session transcript pages |
+| 4 | GAM Research | Spec title, auth type, endpoint metadata, tenant context | plan -> search -> integrate -> reflect | Research plan, reflection, memory excerpts | GAM research traces and pages |
+| 5 | Scenario Generation | Parsed spec + effective prompt (user prompt + memory excerpts) | HumanTesterSimulator generates candidate scenarios | Candidate `TestScenario[]` | None |
+| 6 | Adaptive Selection | Candidate scenarios, policy state (`A`, `b`, scenario stats), RL risk estimate | Scores candidates (expected reward + uncertainty + failure focus + novelty + diversity penalties) and selects top-K | Selected scenarios + selection trace | `learning_state.json` fields: `adaptive_policy`, `scenario_stats`, `selection_trace` |
+| 7 | Test Artifact Generation | Selected scenarios + `base_url` | Generates Python/JS/Java/cURL tests | `generated_tests/*` files | Generated test artifacts in output directory |
+| 8 | Isolation Execution | Selected scenarios + copied spec | Builds dynamic FastAPI mock server and executes each scenario via TestClient | Per-scenario results (`expected_status`, `actual_status`, `passed`, `duration`, `error`) | Scenario execution results in report |
+| 9 | Summary + Reward | Scenario results + endpoint count + thresholds | Computes pass-rate metrics, quality gate, run reward, decision rewards | Summary object + decision learning signals | Included in report (`learning.feedback`) |
+| 10 | Learning State Update | Decision signals + previous weights/stats | Updates test-type weights, endpoint weights, scenario stats, policy posterior (`A`, `b`) | Updated learning snapshot | `learning_state.json` persisted to disk |
+| 11 | Agent Lightning Training | `task_payload` (`pass_rate`, `failed_scenarios`, summary, `learning_reward_score`) | Collects traces, assigns credit, creates transitions, executes RL `train_step` | `training_result`, `training_stats` | In-process RL replay/model state; reported in JSON/MD |
+| 12 | Report + Memo Finalization | Summary, learning, GAM, RL stats, generated file map | Writes report files and final memo, links artifacts | `qa_execution_report.json`, `qa_execution_report.md` | Report files + GAM memo/lossless pages |
+
+### 4.3 Learning Plane I/O (Focused)
+
+1. Input to learning plane:
+   - run-level quality signals (`pass_rate`, failed count, threshold)
+   - decision-level signals (per scenario reward/penalty)
+   - execution traces (action/observation)
+2. Internal transformations:
+   - credit assignment over traces
+   - transition construction for replay
+   - value update (`train_step`)
+   - policy-state update for scenario selection (`A`, `b`, scenario stats)
+3. Output from learning plane:
+   - RL training stats (`buffer_size`, `training_steps`, loss)
+   - updated adaptive selection behavior in next run
+   - persisted `learning_state.json` (policy/state snapshot)
 
 ## 5. Component Responsibilities
 
@@ -125,11 +204,33 @@ Responsibilities:
 3. Convert traces into RL transitions.
 4. Update value/policy models.
 
+Official model from Microsoft docs/GitHub:
+1. Core components are `Algorithm`, `Runner`, and `LightningStore`.
+2. `LightningStore` is the source of truth for `Rollout`, `Attempt`, `Span`, `Resource`, and train tickets.
+3. `Runner` bridges algorithm and store, drives execution lifecycle, and triggers training loops.
+4. Runtime instrumentation writes spans/resources (for example via tracer context and OpenTelemetry span helpers).
+5. Training is typically triggered via trainer/runner APIs (`fit(...)`, `run(...)`), with clear separation between runtime and trainer.
+
+Current repo mapping:
+1. `AgentLightningTrainer` in `spec_test_pilot/agent_lightning_v2.py` acts as trainer/runner coordinator.
+2. `ObservabilityCollector` is used as an in-memory trace collector for action/observation spans.
+3. `CreditAssignmentModule` performs trajectory credit assignment.
+4. `LightningRLAlgorithm` holds replay buffer and runs `train_step`.
+5. QA agent invokes RL each run (`train_agent`) and writes training stats to reports.
+6. This is aligned conceptually with Agent Lightning disaggregation, but not yet a full adoption of the official `LightningStore` data model APIs.
+
+### 5.6 Adaptive Selection Policy
+Responsibilities:
+1. Rank candidate scenarios using learned expected reward and uncertainty.
+2. Balance exploitation (known weak areas) with exploration (uncertain areas).
+3. Persist scenario-level learning signals across runs.
+4. Expose explainable selection traces in reports.
+
 Current implementation:
-1. `ObservabilityCollector` captures per-session traces.
-2. `CreditAssignmentModule` distributes reward backward.
-3. `LightningRLAlgorithm` stores transitions and runs `train_step`.
-4. QA agent keeps a persistent trainer instance for within-process accumulation.
+1. Contextual linear-UCB policy in `spec_test_pilot/adaptive_policy.py`.
+2. Features include test type, method, endpoint shape, expected status, request-shape flags.
+3. Selection score combines expected reward, exploration bonus, failure-focus bonus, RL risk, novelty bonus, and diversity penalty.
+4. Policy state (`A`, `b`, scenario stats) persists in `learning_state.json`.
 
 ## 6. Data Contracts
 
@@ -170,14 +271,17 @@ Report includes:
 ### 7.2 Medium-term Improvement (RL)
 1. Outcome summary becomes reward signal.
 2. Sidecar traces become transitions.
-3. Replay buffer grows.
+3. Replay buffer grows during process lifetime.
 4. Value loss trends indicate model fitting progress.
+5. Without model checkpointing, CLI restarts reset replay buffer/model weights.
+6. Full official-store parity (Rollout/Attempt/Span/Resource persistence) is not yet implemented.
 
-### 7.3 Long-term Improvement (Needed)
-Current gap: RL weights are not yet directly steering scenario generation policy in a strong closed loop.
-
-Required next step:
-1. Add explicit policy adapter where generation choices (test type mix, endpoint prioritization, retry strategy) are chosen from RL outputs.
+### 7.3 Policy-Controlled Learning (Implemented)
+Current state:
+1. Scenario selection is now driven by a contextual linear-UCB policy, not only static rules.
+2. The policy uses learned expected reward, uncertainty (exploration), failure-focus bonus, and RL risk to rank candidates.
+3. Per-scenario outcomes update persistent policy state (`A`, `b`, scenario stats) across runs.
+4. Selection decisions are emitted into run reports for explainability.
 
 ## 8. Current State Assessment
 
@@ -185,15 +289,17 @@ Required next step:
 1. End-to-end pipeline runs successfully.
 2. Reports are generated (JSON + Markdown).
 3. GAM sessions/memos/pages are created and searchable.
-4. Agent Lightning training executes and accumulates within-process.
-5. Test suite passes.
+4. Agent Lightning training executes on each run and exposes training stats.
+5. Adaptive policy learns from per-scenario reward/penalty and persists across runs.
+6. Test suite passes.
 
 ### 8.2 Improvement Needed
-1. Persistent RL checkpoints across separate process runs.
+1. Persistent Agent Lightning model/replay checkpoints across separate process runs.
 2. Stronger reward shaping (coverage deltas, severity-weighted failures, flake penalty).
 3. Real SUT mode in addition to mock mode.
-4. Policy-action linkage from RL to generator decisions.
+4. Multi-step policy actions (workflow chains, retries, recovery scenarios) beyond one-pass ranking.
 5. Trend analytics across runs (run-to-run quality regression detection).
+6. Migrate learning data plane to official `LightningStore` entities and runner workflow.
 
 ## 9. Target Production Architecture (Recommended)
 
@@ -203,8 +309,8 @@ Required next step:
 3. Add run registry DB for report indexing.
 
 ### Phase 2: True Learning Control
-1. Add policy gateway in scenario planner.
-2. Feed RL output into scenario selection weights.
+1. Extend the policy gateway with multi-pass planning and adaptive retry generation.
+2. Expand RL-to-policy linkage from ranking to action sequencing.
 3. Add A/B policy rollout support.
 
 ### Phase 3: Enterprise Hardening
@@ -244,15 +350,23 @@ Required next step:
 4. Isolated mock runtime: `agent_lightning_server.py`
 5. Memory subsystem: `spec_test_pilot/memory/gam.py`
 6. RL subsystem: `spec_test_pilot/agent_lightning_v2.py`
+7. Adaptive policy subsystem: `spec_test_pilot/adaptive_policy.py`
 
 ## 14. Recommended Next Technical Changes
 1. Add `model_store/` for RL checkpoint save/load.
 2. Add `reward_service.py` with explainable reward components.
 3. Add `run_registry` persistence (SQLite/Postgres).
-4. Add policy-action API between RL and scenario planner.
+4. Add policy-action API for multi-step planning (selection + retry + remediation).
 5. Add dashboard-ready metrics export (Prometheus/OpenTelemetry).
+6. Add an adapter layer that maps QA run events to official Agent Lightning store objects (`Rollout`, `Attempt`, `Span`, `Resource`) and uses official runner lifecycle.
 
-## 15. Summary
-The current architecture is a strong v1: it executes the entire QA workflow with isolation, memory, and RL instrumentation.
+## 15. Agent Lightning Reference Alignment
+1. Microsoft project page: Agent Lightning is positioned as a framework to train arbitrary AI agents with reinforcement learning and near-zero code changes.
+2. GitHub/docs define three primary runtime-training components: `Algorithm`, `Runner`, `LightningStore`.
+3. GitHub/docs define store-native objects: `Rollout`, `Attempt`, `Span`, `Resource`.
+4. Your architecture now reflects these terms explicitly and marks where current code is conceptual alignment vs full official API adoption.
 
-To reach full autonomous improvement, the highest-value step is to connect RL outputs directly to generation decisions and persist model state across independent runs.
+## 16. Summary
+The current architecture is a stronger v2: it executes the full QA workflow with isolation, memory, RL instrumentation, and an adaptive selection policy.
+
+The highest-value next step is persistence and governance at scale: durable Agent Lightning checkpointing, run registry, and policy rollout controls.

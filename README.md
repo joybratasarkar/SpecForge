@@ -46,7 +46,47 @@ python run_agent.py examples/banking_api.yaml
 python test_complete_system.py
 ```
 
-## 🏗️ Detailed System Architecture Flow
+## ✅ Current QA Specialist Architecture (Authoritative)
+
+This section reflects the current implementation in `spec_test_pilot/qa_specialist_agent.py`.
+
+```mermaid
+flowchart TD
+    A[Input: spec_path tenant_id prompt thresholds] --> B[Parse OpenAPI Spec]
+    B --> C[Start GAM Session + Research]
+    C --> D[Generate Candidate QA Scenarios]
+    D --> E[Adaptive Selection Policy<br/>contextual linear-UCB + RL risk]
+    E --> F[Generate Multi-language Test Files]
+    F --> G[Execute in Isolated Dynamic Mock API]
+    G --> H[Compute Summary + Rewards]
+    H --> I[Update learning_state.json<br/>weights + scenario stats + policy state]
+    I --> J[Invoke Agent Lightning train_agent]
+    J --> K[Write JSON/Markdown Reports + GAM Memo]
+```
+
+### Step Inputs and Outputs (Current)
+
+| Step | Inputs | Output |
+|---|---|---|
+| Parse Spec | OpenAPI YAML/JSON path | Parsed spec object |
+| GAM Research | Spec context + tenant_id | Memory excerpts and plan/reflection |
+| Scenario Generation | Spec + effective prompt | Candidate scenarios |
+| Adaptive Selection | Candidates + policy state + RL risk | Selected scenarios + selection trace |
+| Artifact Generation | Selected scenarios + base URL | Python/JS/Java/cURL test files |
+| Isolated Execution | Selected scenarios + copied spec | Per-scenario execution results |
+| Reward Computation | Summary metrics + execution results | Run reward + decision learning signals |
+| Learning Update | Decision signals + prior learning state | Updated policy/test-type/endpoint weights |
+| Agent Lightning Training | Run summary payload + learning reward score | RL training result + stats |
+| Reporting | Summary + learning + GAM + RL stats | `qa_execution_report.json` and `.md` |
+
+### Agent Lightning Status in Current Codebase
+
+1. Agent Lightning training is executed in each QA run via `train_agent(...)`.
+2. RL training stats are embedded in the run report.
+3. Adaptive scenario policy uses RL risk estimation during selection.
+4. Full official `LightningStore` parity is a planned next step (current implementation is conceptually aligned, not full store API adoption).
+
+## 🏗️ Legacy Conceptual Architecture Flow (Historical Reference)
 
 ### **🎯 High-Level Architecture Overview**
 
