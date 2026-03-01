@@ -993,26 +993,35 @@ class AgentLightningTrainer:
         openapi_spec: str,
         spec_title: str = "API",
         tenant_id: Optional[str] = None,
-        output_format: str = "pytest"
+        output_format: str = "pytest",
+        nlp_prompt: Optional[str] = None,
+        enable_error_fixing: bool = False,
+        enable_workflow_chains: bool = False
     ) -> Dict[str, Any]:
         """
-        Train agent on a single task.
+        Train agent on a single task with enhanced Postman-like capabilities.
         
         Args:
             openapi_spec: OpenAPI specification
             spec_title: API title
             tenant_id: Tenant identifier
             output_format: Output format
+            nlp_prompt: Natural language prompt for test generation
+            enable_error_fixing: Enable automatic error analysis and fixing
+            enable_workflow_chains: Enable workflow orchestration
             
         Returns:
-            Training result
+            Training result with enhanced features
         """
         
         input_data = {
             "openapi_spec": openapi_spec,
             "spec_title": spec_title,
             "output_format": output_format,
-            "tenant_id": tenant_id
+            "tenant_id": tenant_id,
+            "nlp_prompt": nlp_prompt,  # Enhanced: NLP prompt support
+            "enable_error_fixing": enable_error_fixing,  # Enhanced: Error fixing
+            "enable_workflow_chains": enable_workflow_chains  # Enhanced: Workflows
         }
         
         result = self.client.submit_and_train(

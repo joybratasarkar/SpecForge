@@ -32,18 +32,60 @@ from spec_test_pilot.agent_lightning import AgentLightningTrainer
 
 
 def load_training_data(data_path: str) -> List[Dict[str, Any]]:
-    """Load training data from JSONL file."""
+    """Load training data from JSON lines file."""
     if not os.path.exists(data_path):
-        print(f"⚠️  Training data not found at {data_path}")
         return []
     
     data = []
-    with open(data_path, 'r') as f:
-        for line in f:
-            if line.strip():
+    try:
+        with open(data_path, 'r') as f:
+            for line in f:
                 data.append(json.loads(line.strip()))
+    except Exception as e:
+        print(f"Warning: Could not load training data: {e}")
     
     return data
+
+
+def train_with_nlp_prompt(
+    trainer: AgentLightningTrainer,
+    nlp_prompt: str,
+    openapi_spec: str = "examples/banking_api.yaml",
+    tenant_id: str = "nlp_prompt_corp"
+) -> Dict[str, Any]:
+    """
+    Enhanced training with natural language prompts like Postman AI.
+    
+    Examples:
+    - "Generate tests to validate status codes and response times" 
+    - "Create security tests for authentication endpoints"
+    - "Test error handling with automatic fixes"
+    """
+    print(f"🤖 Training with NLP prompt: '{nlp_prompt}'")
+    
+    # Enhanced task data with prompt
+    enhanced_task_data = {
+        "openapi_spec": openapi_spec,
+        "spec_title": f"NLP Generated Tests",
+        "output_format": "pytest", 
+        "tenant_id": tenant_id,
+        "nlp_prompt": nlp_prompt,  # New: Natural language prompt
+        "enable_error_fixing": True,  # New: Enable automatic error fixes
+        "enable_workflow_chains": True  # New: Enable workflow orchestration
+    }
+    
+    # Run enhanced training
+    result = trainer.train_on_task(**enhanced_task_data)
+    
+    # Add prompt-specific metrics
+    result["nlp_prompt"] = nlp_prompt
+    result["enhanced_features"] = {
+        "error_fixing": True,
+        "workflow_orchestration": True, 
+        "natural_language_prompts": True
+    }
+    
+    return result
 
 
 def create_training_tasks_from_data(data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -254,13 +296,28 @@ def main():
     parser = argparse.ArgumentParser(description="Agent Lightning + GAM Training")
     parser.add_argument("--data", default="data/train.jsonl", help="Training data path")
     parser.add_argument("--epochs", type=int, default=5, help="Training epochs")
-    parser.add_argument("--mock", action="store_true", help="Enable mock mode")
-    parser.add_argument("--workers", type=int, default=1, help="Max workers")
+    parser.add_argument("--mock", action="store_true", help="Use mock mode for testing")
     parser.add_argument("--output", default="lightning_checkpoints", help="Output directory")
+    parser.add_argument("--prompt", type=str, help="Natural language prompt for test generation (like Postman AI)")
+    parser.add_argument("--workers", type=int, default=2, help="Max workers for training")
     
     args = parser.parse_args()
     
-    # Run training
+    # Enhanced training with NLP prompt if provided
+    if args.prompt:
+        print(f"🤖 Using natural language prompt: '{args.prompt}'")
+        gam = GAMMemorySystem(use_vector_search=False)
+        trainer = AgentLightningTrainer(
+            gam_memory_system=gam,
+            max_workers=args.workers,
+            enable_torch=not args.mock,
+            sandbox_mode=args.mock
+        )
+        result = train_with_nlp_prompt(trainer, args.prompt)
+        print(f"✅ Enhanced training complete: {result.get('task_result', {}).get('success', False)}")
+        return
+    
+    # Standard training
     trainer, stats = run_agent_lightning_training(
         training_data_path=args.data,
         epochs=args.epochs,

@@ -218,10 +218,13 @@ class MockSpecTestPilotAgent:
         processing_time = random.uniform(0.1, 0.5)
         time.sleep(processing_time)
         
-        # Extract input parameters
+        # Extract input parameters (enhanced with Postman-like capabilities)
         openapi_spec = input_data.get("openapi_spec", "")
         spec_title = input_data.get("spec_title", "Mock API")
         output_format = input_data.get("output_format", "pytest")
+        nlp_prompt = input_data.get("nlp_prompt")  # New: Natural language prompt
+        enable_error_fixing = input_data.get("enable_error_fixing", False)  # New: Error fixing
+        enable_workflow_chains = input_data.get("enable_workflow_chains", False)  # New: Workflows
         
         # Simulate different success rates for RL training
         success_probability = min(0.1 + (self.execution_count * 0.01), 0.8)

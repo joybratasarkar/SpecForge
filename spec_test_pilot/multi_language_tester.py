@@ -74,14 +74,16 @@ class APIEndpoint:
 
 
 class HumanTesterSimulator:
-    """Simulates how a human tester would approach API testing."""
+    """Simulates how a human tester would analyze and test an API with NLP prompts."""
     
-    def __init__(self, api_spec: Dict[str, Any], base_url: str = "https://api.example.com"):
-        """Initialize with API specification."""
+    def __init__(self, api_spec: Dict[str, Any], base_url: str):
+        """Initialize with API specification and base URL."""
         self.api_spec = api_spec
-        self.base_url = base_url
+        self.base_url = base_url.rstrip('/')
         self.endpoints = self._parse_endpoints()
         self.test_scenarios = []
+        self.error_fixes = {}  # Store automatic fixes for errors
+        self.workflow_chains = []  # Store workflow orchestrations
         
     def _parse_endpoints(self) -> List[APIEndpoint]:
         """Parse OpenAPI spec like a human tester would analyze it."""
@@ -119,32 +121,413 @@ class HumanTesterSimulator:
         
         return endpoints
     
-    def think_like_tester(self) -> List[TestScenario]:
-        """Think like a human tester and generate comprehensive test scenarios."""
+    def think_like_tester(self, nlp_prompt: Optional[str] = None) -> List[TestScenario]:
+        """
+        Think like a human tester with optional natural language prompt.
+        
+        Examples:
+        - "Generate tests to validate status codes and response times"
+        - "Create security tests for user authentication endpoints"
+        - "Test error handling for invalid input data"
+        - "Generate comprehensive test suite with boundary testing"
+        """
+        scenarios = []
+        
+        if nlp_prompt:
+            print(f"🤖 AI Tester analyzing prompt: '{nlp_prompt}'")
+            scenarios = self._generate_from_nlp_prompt(nlp_prompt)
+        else:
+            # Default comprehensive testing
+            for endpoint in self.endpoints:
+                # 1. Happy path testing (what should work)
+                scenarios.extend(self._create_happy_path_tests(endpoint))
+                
+                # 2. Error handling (what should fail gracefully)
+                scenarios.extend(self._create_error_tests(endpoint))
+                
+                # 3. Authentication/Authorization testing
+                if endpoint.auth_required:
+                    scenarios.extend(self._create_auth_tests(endpoint))
+                
+                # 4. Input validation testing
+                scenarios.extend(self._create_validation_tests(endpoint))
+                
+                # 5. Boundary testing
+                scenarios.extend(self._create_boundary_tests(endpoint))
+                
+                # 6. Security testing
+                scenarios.extend(self._create_security_tests(endpoint))
+                
+                # 7. Edge cases
+                scenarios.extend(self._create_edge_case_tests(endpoint))
+        
+        self.test_scenarios = scenarios
+        return scenarios
+    
+    def _generate_from_nlp_prompt(self, prompt: str) -> List[TestScenario]:
+        """Generate tests based on natural language prompt like Postman AI."""
+        scenarios = []
+        prompt_lower = prompt.lower()
+        
+        print(f"   🧠 Analyzing intent: {prompt}")
+        
+        # Parse what user wants to test
+        if 'status code' in prompt_lower or 'response time' in prompt_lower:
+            print("   📊 Generating status code and performance tests")
+            scenarios.extend(self._create_status_and_performance_tests())
+            
+        if 'security' in prompt_lower or 'sql inject' in prompt_lower or 'xss' in prompt_lower:
+            print("   🔒 Generating security vulnerability tests")
+            scenarios.extend(self._create_comprehensive_security_tests())
+            
+        if 'auth' in prompt_lower or 'login' in prompt_lower or 'token' in prompt_lower:
+            print("   🔐 Generating authentication and authorization tests")
+            scenarios.extend(self._create_comprehensive_auth_tests())
+            
+        if 'error' in prompt_lower or 'invalid' in prompt_lower or 'fail' in prompt_lower:
+            print("   💥 Generating error handling and edge case tests")
+            scenarios.extend(self._create_comprehensive_error_tests())
+            
+        if 'validation' in prompt_lower or 'input' in prompt_lower:
+            print("   🛡️ Generating input validation tests")
+            scenarios.extend(self._create_comprehensive_validation_tests())
+            
+        if 'boundary' in prompt_lower or 'limit' in prompt_lower or 'edge' in prompt_lower:
+            print("   🎯 Generating boundary and limit tests")
+            scenarios.extend(self._create_comprehensive_boundary_tests())
+            
+        # If no specific intent, generate comprehensive suite
+        if not scenarios:
+            print("   🎯 No specific intent detected, generating comprehensive test suite")
+            return self.think_like_tester()  # Recursive call without prompt
+            
+        print(f"   ✅ Generated {len(scenarios)} test scenarios from prompt")
+        return scenarios
+    
+    def analyze_error_and_suggest_fix(self, error_response: Dict[str, Any], original_scenario: TestScenario) -> Dict[str, Any]:
+        """
+        Analyze API errors and suggest automatic fixes like Postman AI.
+        
+        Handles common errors:
+        - 401 Unauthorized: Suggests adding authentication
+        - 403 Forbidden: Suggests checking permissions/scope  
+        - 400 Bad Request: Analyzes and fixes request data
+        - 404 Not Found: Suggests valid resource IDs
+        """
+        status_code = error_response.get('status_code', 0)
+        error_body = error_response.get('body', {})
+        
+        print(f"🔍 AI Error Analysis: HTTP {status_code}")
+        
+        analysis = {
+            'error_type': status_code,
+            'root_cause': '',
+            'suggested_fixes': [],
+            'auto_fix_available': False,
+            'fixed_scenario': None,
+            'confidence': 0.0
+        }
+        
+        if status_code == 401:
+            analysis.update({
+                'root_cause': 'Missing or invalid authentication token',
+                'suggested_fixes': [
+                    'Add Authorization header with Bearer token',
+                    'Include API key in request headers',
+                    'Verify authentication endpoint is working'
+                ],
+                'auto_fix_available': True,
+                'confidence': 0.9
+            })
+            
+            # Auto-fix: Add authentication
+            fixed_scenario = TestScenario(
+                name=f"{original_scenario.name}_with_auth",
+                description=f"{original_scenario.description} (with authentication)",
+                test_type=original_scenario.test_type,
+                endpoint=original_scenario.endpoint,
+                method=original_scenario.method,
+                headers={'Authorization': 'Bearer {{auth_token}}'},
+                params=original_scenario.params.copy(),
+                body=original_scenario.body.copy() if original_scenario.body else None,
+                expected_status=200
+            )
+            analysis['fixed_scenario'] = fixed_scenario
+            
+        elif status_code == 403:
+            analysis.update({
+                'root_cause': 'Valid authentication but insufficient permissions',
+                'suggested_fixes': [
+                    'Use token with elevated permissions',
+                    'Check required scopes for this endpoint',
+                    'Verify resource ownership'
+                ],
+                'auto_fix_available': True,
+                'confidence': 0.8
+            })
+            
+            # Auto-fix: Use admin token
+            fixed_scenario = TestScenario(
+                name=f"{original_scenario.name}_with_admin",
+                description=f"{original_scenario.description} (with admin permissions)",
+                test_type=original_scenario.test_type,
+                endpoint=original_scenario.endpoint,
+                method=original_scenario.method,
+                headers={'Authorization': 'Bearer {{admin_token}}'},
+                params=original_scenario.params.copy(),
+                body=original_scenario.body.copy() if original_scenario.body else None,
+                expected_status=200
+            )
+            analysis['fixed_scenario'] = fixed_scenario
+            
+        elif status_code == 400:
+            analysis.update({
+                'root_cause': 'Invalid request data or missing required fields',
+                'suggested_fixes': [
+                    'Check required fields are present',
+                    'Validate data types match API spec',
+                    'Remove invalid fields',
+                    'Fix JSON formatting'
+                ],
+                'auto_fix_available': True,
+                'confidence': 0.7
+            })
+            
+            # Auto-fix: Add required fields
+            fixed_body = original_scenario.body.copy() if original_scenario.body else {}
+            if not fixed_body and original_scenario.method in ['POST', 'PUT', 'PATCH']:
+                fixed_body = {'name': 'Test Item', 'description': 'Auto-generated test data'}
+            elif fixed_body:
+                # Add common required fields if missing
+                if 'name' not in fixed_body:
+                    fixed_body['name'] = 'Auto-fixed Name'
+                if 'email' not in fixed_body and 'user' in original_scenario.endpoint.lower():
+                    fixed_body['email'] = 'test@example.com'
+                    
+            fixed_scenario = TestScenario(
+                name=f"{original_scenario.name}_fixed_data",
+                description=f"{original_scenario.description} (with valid data)",
+                test_type=original_scenario.test_type,
+                endpoint=original_scenario.endpoint,
+                method=original_scenario.method,
+                headers=original_scenario.headers.copy(),
+                params=original_scenario.params.copy(),
+                body=fixed_body,
+                expected_status=200
+            )
+            analysis['fixed_scenario'] = fixed_scenario
+            
+        elif status_code == 404:
+            analysis.update({
+                'root_cause': 'Resource not found or invalid ID',
+                'suggested_fixes': [
+                    'Use valid resource ID that exists',
+                    'Create resource first if needed',
+                    'Check URL path is correct'
+                ],
+                'auto_fix_available': True,
+                'confidence': 0.85
+            })
+            
+            # Auto-fix: Use valid ID
+            fixed_endpoint = original_scenario.endpoint.replace('/999', '/123').replace('/invalid', '/1')
+            fixed_scenario = TestScenario(
+                name=f"{original_scenario.name}_valid_id",
+                description=f"{original_scenario.description} (with valid ID)",
+                test_type=original_scenario.test_type,
+                endpoint=fixed_endpoint,
+                method=original_scenario.method,
+                headers=original_scenario.headers.copy(),
+                params=original_scenario.params.copy(),
+                body=original_scenario.body.copy() if original_scenario.body else None,
+                expected_status=200
+            )
+            analysis['fixed_scenario'] = fixed_scenario
+            
+        else:
+            analysis.update({
+                'root_cause': f'Unexpected HTTP {status_code} error',
+                'suggested_fixes': ['Check API documentation', 'Verify server status', 'Review request format'],
+                'auto_fix_available': False,
+                'confidence': 0.3
+            })
+        
+        # Store fix for reuse
+        self.error_fixes[f"{status_code}_{original_scenario.name}"] = analysis
+        
+        print(f"   📋 Root cause: {analysis['root_cause']}")
+        print(f"   🔧 Auto-fix available: {analysis['auto_fix_available']}")
+        print(f"   📊 Confidence: {analysis['confidence']:.1%}")
+        
+        return analysis
+    
+    def _create_status_and_performance_tests(self) -> List[TestScenario]:
+        """Create tests focused on status codes and response times."""
         scenarios = []
         
         for endpoint in self.endpoints:
-            # 1. Happy path testing (what should work)
-            scenarios.extend(self._create_happy_path_tests(endpoint))
-            
-            # 2. Error handling (what should fail gracefully)
-            scenarios.extend(self._create_error_tests(endpoint))
-            
-            # 3. Authentication/Authorization testing
+            # Status code validation test
+            scenario = TestScenario(
+                name=f"test_{endpoint.method.lower()}_{endpoint.path.replace('/', '_')}_status_validation",
+                description=f"Validate status codes and response times for {endpoint.method} {endpoint.path}",
+                test_type=TestType.PERFORMANCE,
+                endpoint=endpoint.path,
+                method=endpoint.method,
+                expected_status=200,
+                headers={'Accept': 'application/json'},
+                body=None
+            )
+            scenarios.append(scenario)
+        
+        return scenarios
+    
+    def _create_comprehensive_security_tests(self) -> List[TestScenario]:
+        """Create comprehensive security tests including SQL injection, XSS."""
+        scenarios = []
+        
+        for endpoint in self.endpoints:
+            # SQL injection test
+            if endpoint.method in ['POST', 'PUT', 'PATCH']:
+                sql_injection_scenario = TestScenario(
+                    name=f"test_{endpoint.method.lower()}_{endpoint.path.replace('/', '_')}_sql_injection",
+                    description=f"Test SQL injection protection on {endpoint.method} {endpoint.path}",
+                    test_type=TestType.SECURITY,
+                    endpoint=endpoint.path,
+                    method=endpoint.method,
+                    expected_status=400,
+                    body={'name': "'; DROP TABLE users; --", 'description': 'SQL injection attempt'}
+                )
+                scenarios.append(sql_injection_scenario)
+                
+            # XSS test
+            if endpoint.method in ['POST', 'PUT', 'PATCH']:
+                xss_scenario = TestScenario(
+                    name=f"test_{endpoint.method.lower()}_{endpoint.path.replace('/', '_')}_xss_protection",
+                    description=f"Test XSS protection on {endpoint.method} {endpoint.path}",
+                    test_type=TestType.SECURITY,
+                    endpoint=endpoint.path,
+                    method=endpoint.method,
+                    expected_status=400,
+                    body={'comment': '<script>alert("xss")</script>', 'content': 'XSS attempt'}
+                )
+                scenarios.append(xss_scenario)
+        
+        return scenarios
+    
+    def _create_comprehensive_auth_tests(self) -> List[TestScenario]:
+        """Create comprehensive authentication and authorization tests."""
+        scenarios = []
+        
+        for endpoint in self.endpoints:
             if endpoint.auth_required:
-                scenarios.extend(self._create_auth_tests(endpoint))
+                # No auth test
+                no_auth_scenario = TestScenario(
+                    name=f"test_{endpoint.method.lower()}_{endpoint.path.replace('/', '_')}_no_auth",
+                    description=f"Test {endpoint.method} {endpoint.path} without authentication",
+                    test_type=TestType.AUTHENTICATION,
+                    endpoint=endpoint.path,
+                    method=endpoint.method,
+                    expected_status=401,
+                    headers={},  # No auth headers
+                    body=None
+                )
+                scenarios.append(no_auth_scenario)
+                
+                # Invalid auth test
+                invalid_auth_scenario = TestScenario(
+                    name=f"test_{endpoint.method.lower()}_{endpoint.path.replace('/', '_')}_invalid_auth",
+                    description=f"Test {endpoint.method} {endpoint.path} with invalid token",
+                    test_type=TestType.AUTHENTICATION,
+                    endpoint=endpoint.path,
+                    method=endpoint.method,
+                    expected_status=401,
+                    headers={'Authorization': 'Bearer invalid_token'},
+                    body=None
+                )
+                scenarios.append(invalid_auth_scenario)
+        
+        return scenarios
+    
+    def _create_comprehensive_error_tests(self) -> List[TestScenario]:
+        """Create comprehensive error handling tests."""
+        scenarios = []
+        
+        for endpoint in self.endpoints:
+            # Invalid method test
+            invalid_method_scenario = TestScenario(
+                name=f"test_{endpoint.path.replace('/', '_')}_invalid_method",
+                description=f"Test invalid method on {endpoint.path}",
+                test_type=TestType.ERROR_HANDLING,
+                endpoint=endpoint.path,
+                method='DELETE' if endpoint.method != 'DELETE' else 'PATCH',
+                expected_status=405
+            )
+            scenarios.append(invalid_method_scenario)
             
-            # 4. Input validation testing
-            scenarios.extend(self._create_validation_tests(endpoint))
-            
-            # 5. Boundary testing
-            scenarios.extend(self._create_boundary_tests(endpoint))
-            
-            # 6. Security testing
-            scenarios.extend(self._create_security_tests(endpoint))
-            
-            # 7. Edge cases
-            scenarios.extend(self._create_edge_case_tests(endpoint))
+            # Malformed request test
+            if endpoint.method in ['POST', 'PUT', 'PATCH']:
+                malformed_scenario = TestScenario(
+                    name=f"test_{endpoint.method.lower()}_{endpoint.path.replace('/', '_')}_malformed_request",
+                    description=f"Test malformed request data on {endpoint.method} {endpoint.path}",
+                    test_type=TestType.ERROR_HANDLING,
+                    endpoint=endpoint.path,
+                    method=endpoint.method,
+                    expected_status=400,
+                    body={'invalid_json': 'missing_quotes: true, broken: }'}
+                )
+                scenarios.append(malformed_scenario)
+        
+        return scenarios
+    
+    def _create_comprehensive_validation_tests(self) -> List[TestScenario]:
+        """Create comprehensive input validation tests."""
+        scenarios = []
+        
+        for endpoint in self.endpoints:
+            if endpoint.method in ['POST', 'PUT', 'PATCH']:
+                # Empty body test
+                empty_body_scenario = TestScenario(
+                    name=f"test_{endpoint.method.lower()}_{endpoint.path.replace('/', '_')}_empty_body",
+                    description=f"Test empty request body on {endpoint.method} {endpoint.path}",
+                    test_type=TestType.INPUT_VALIDATION,
+                    endpoint=endpoint.path,
+                    method=endpoint.method,
+                    expected_status=400,
+                    body={}
+                )
+                scenarios.append(empty_body_scenario)
+                
+                # Type mismatch test
+                type_mismatch_scenario = TestScenario(
+                    name=f"test_{endpoint.method.lower()}_{endpoint.path.replace('/', '_')}_type_mismatch", 
+                    description=f"Test type mismatch on {endpoint.method} {endpoint.path}",
+                    test_type=TestType.INPUT_VALIDATION,
+                    endpoint=endpoint.path,
+                    method=endpoint.method,
+                    expected_status=400,
+                    body={'age': 'not_a_number', 'count': 'invalid_integer'}
+                )
+                scenarios.append(type_mismatch_scenario)
+        
+        return scenarios
+    
+    def _create_comprehensive_boundary_tests(self) -> List[TestScenario]:
+        """Create comprehensive boundary and limit tests."""
+        scenarios = []
+        
+        for endpoint in self.endpoints:
+            if endpoint.method == 'GET':
+                # Pagination limit test  
+                limit_scenario = TestScenario(
+                    name=f"test_get_{endpoint.path.replace('/', '_')}_pagination_limit",
+                    description=f"Test pagination limits on GET {endpoint.path}",
+                    test_type=TestType.BOUNDARY_TESTING,
+                    endpoint=endpoint.path,
+                    method='GET',
+                    expected_status=400,
+                    params={'limit': 99999, 'page': -1}  # Invalid pagination
+                )
+                scenarios.append(limit_scenario)
         
         return scenarios
     

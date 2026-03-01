@@ -305,103 +305,150 @@ python test_complete_system.py
 
 ### **🔗 Component Interaction Details**
 
-#### **1. Agent Lightning Server ⚡**
+#### **1. Agent Lightning Server ⚡** (ACTUAL IMPLEMENTATION)
 ```python
-# Server initialization and task processing
+# REAL server initialization and task processing
 class AgentLightningServer:
-    def __init__(self, max_workers=4):
-        self.task_queue = TaskQueue()
-        self.sidecar_monitor = SidecarMonitor()
-        self.rl_algorithm = LightningRLAlgorithm()
+    def __init__(
+        self, 
+        max_workers: int = 4,
+        credit_assignment_config: Optional[Dict] = None,
+        rl_config: Optional[Dict] = None
+    ):
+        self.max_workers = max_workers
+        self.executor = ThreadPoolExecutor(max_workers=max_workers)
+        self.monitor = SidecarMonitor()  # NOT sidecar_monitor
+        self.rl_algorithm = LightningRLAlgorithm(**(rl_config or {}))
+        self.task_queue = deque()  # Simple deque, not TaskQueue class
         
-    def process_task(self, task):
-        # 1. Validate and queue task
-        task_id = self.task_queue.enqueue(task)
+    def submit_task(self, task: Task) -> str:  # NOT process_task
+        """Submit task to execution queue."""
+        self.task_queue.append(task)
+        return task.task_id
         
-        # 2. Start monitoring
-        self.sidecar_monitor.start_monitoring(task_id)
+    async def execute_agent_with_monitoring(  # NOT execute_agent
+        self, task: Task, agent_id: str
+    ) -> Tuple[Dict[str, Any], List[ExecutionTrace]]:
+        """Execute agent with monitoring and trace collection."""
+        # 1. Start monitoring
+        self.monitor.start_task_monitoring(task)
         
-        # 3. Execute agent (sandbox or real)
-        result = self.execute_agent(task)
+        # 2. Execute with tracing
+        result = await self._execute_with_tracing(agent_function, task, agent_id)
         
-        # 4. Collect traces and train
-        traces = self.sidecar_monitor.get_traces(task_id)
-        self.rl_algorithm.train_on_traces(traces, result)
+        # 3. End monitoring and collect traces
+        traces = self.monitor.end_task_monitoring(task.task_id, reward, success, result)
         
-        return result
+        return result, traces
 ```
 
-#### **2. Multi-Language Test Generator 🌍**
+#### **2. Multi-Language Test Generator 🌍** (ACTUAL IMPLEMENTATION)
 ```python
-# Professional test generation across languages
-class MultiLanguageTestGenerator:
-    def think_like_tester(self, api_spec):
+# REAL professional test generation - CORRECTED
+class HumanTesterSimulator:  # NOT MultiLanguageTestGenerator
+    def think_like_tester(self) -> List[TestScenario]:
+        """AI thinks like professional tester - REAL METHOD"""
         scenarios = []
         
-        # Professional test categories
-        for endpoint in self.parse_endpoints(api_spec):
-            scenarios.extend(self.create_happy_path_tests(endpoint))
-            scenarios.extend(self.create_security_tests(endpoint))
-            scenarios.extend(self.create_auth_tests(endpoint))
+        for endpoint in self.endpoints:  # Already parsed in __init__
+            scenarios.extend(self._create_happy_path_tests(endpoint))
+            scenarios.extend(self._create_error_tests(endpoint))
+            scenarios.extend(self._create_auth_tests(endpoint))
+            scenarios.extend(self._create_security_tests(endpoint))
             # ... 8 total categories
             
         return scenarios
+
+class MultiLanguageTestGenerator:  # Separate class for generation
+    def __init__(self, scenarios: List[TestScenario], base_url: str):
+        self.scenarios = scenarios
+        self.base_url = base_url
     
-    def generate_all_languages(self, scenarios):
-        return {
-            'python': self.generate_python_tests(scenarios),
-            'javascript': self.generate_js_tests(scenarios), 
-            'java': self.generate_java_tests(scenarios),
-            'curl': self.generate_curl_tests(scenarios)
-        }
+    # ACTUAL methods that exist:
+    def generate_python_tests(self) -> str:
+        """Generate pytest tests - REAL METHOD"""
+    def generate_javascript_tests(self) -> str:  
+        """Generate Jest tests - REAL METHOD"""
+    def generate_java_tests(self) -> str:
+        """Generate RestAssured tests - REAL METHOD"""
+    def generate_curl_tests(self) -> str:
+        """Generate cURL commands - REAL METHOD"""
 ```
 
-#### **3. GAM Memory Integration 🧠**
+#### **3. GAM Memory Integration 🧠** (ACTUAL IMPLEMENTATION)
 ```python
-# Intelligent memory with session management
+# REAL GAM memory with session management
 class GAMMemorySystem:
-    def intelligent_session_flow(self, task):
-        # Start session with tenant isolation
-        session_id = self.start_session(tenant_id=task.tenant_id)
+    # ACTUAL methods that exist:
+    def start_session(self, tenant_id: Optional[str] = None) -> str:
+        """Start new session - REAL METHOD"""
+        return self.memorizer.start_session(tenant_id=tenant_id)
         
-        # Track all interactions
-        self.add_to_session(session_id, "user", task.description)
-        self.add_to_session(session_id, "assistant", result.content, 
-                          artifacts=result.generated_files)
+    def add_to_session(
+        self, session_id: str, role: str, content: str,
+        tool_outputs: Optional[List[Dict]] = None,
+        artifacts: Optional[List[Dict]] = None
+    ):
+        """Add to session - REAL METHOD"""
+        return self.memorizer.add_to_session(session_id, role, content, tool_outputs, artifacts)
         
-        # Create dual memory: lossless + contextual
-        lossless_pages, memo = self.end_session_with_memo(
-            session_id, 
-            title=task.title,
-            decisions=["OAuth 2.0 PKCE", "pytest framework"],
-            technologies=["Python", "REST API"]
+    def end_session_with_memo(
+        self, session_id: str, spec_title: str, endpoints_count: int,
+        tests_generated: int, key_decisions: List[str], issues_found: List[str]
+    ) -> Tuple[List[Page], Page]:
+        """End session with memo - REAL METHOD"""
+        return self.memorizer.end_session_with_memo(
+            session_id, spec_title, endpoints_count, tests_generated, key_decisions, issues_found
         )
         
-        return session_id, memo.id
+    def search(self, query: str, top_k: int = 5, tenant_id: Optional[str] = None):
+        """Search with tenant scoping - REAL METHOD"""  
+        return self.page_store.hybrid_search(query, top_k, tenant_id=tenant_id)
 ```
 
-#### **4. Reinforcement Learning Pipeline ⚡**
+#### **4. Reinforcement Learning Pipeline ⚡** (ACTUAL IMPLEMENTATION)
 ```python
-# RL training on test generation quality
+# REAL RL training implementation
 class LightningRLAlgorithm:
-    def train_on_traces(self, traces, final_result):
-        # Convert execution traces to RL transitions
-        transitions = self.organize_trajectory(traces, final_result)
+    def __init__(self, learning_rate=0.0001, batch_size=32, buffer_size=10000):
+        self.learning_rate = learning_rate
+        self.batch_size = batch_size
+        self.experience_buffer = deque(maxlen=buffer_size)  # REAL buffer
         
-        # Apply temporal credit assignment
-        rewards = self.credit_assignment.assign_credit(
-            traces, final_result.quality_score, final_result.success
+        # REAL PyTorch network - this actually exists:
+        self.value_net = nn.Sequential(
+            nn.Linear(512, 256), nn.ReLU(),
+            nn.Linear(256, 128), nn.ReLU(), 
+            nn.Linear(128, 1)  # Value estimation
         )
+        self.optimizer = optim.Adam(self.value_net.parameters(), lr=learning_rate)
+        self.criterion = nn.MSELoss()
         
-        # Train neural network
-        for transition, reward in zip(transitions, rewards):
-            self.experience_buffer.add(transition, reward)
+    def add_transition(self, transition: TransitionTuple):
+        """Add transition - REAL METHOD"""
+        self.experience_buffer.append(transition)
+    
+    def train_step(self) -> Dict[str, float]:  # NOT train_on_traces
+        """Execute training step - REAL METHOD"""
+        if len(self.experience_buffer) < self.batch_size:
+            return {"status": "skipped", "reason": "insufficient_data"}
             
-        # Update policy
-        if len(self.experience_buffer) >= self.batch_size:
-            batch = self.experience_buffer.sample(self.batch_size)
-            loss = self.compute_loss(batch)
-            self.optimizer.step()
+        # Sample batch and train - REAL IMPLEMENTATION
+        batch_indices = np.random.choice(len(self.experience_buffer), self.batch_size, replace=False)
+        batch = [self.experience_buffer[i] for i in batch_indices]
+        
+        # Convert to tensors and train
+        states_tensor = torch.FloatTensor([self._state_to_vector(t.state) for t in batch])
+        rewards_tensor = torch.FloatTensor([t.reward for t in batch])
+        
+        predicted_values = self.value_net(states_tensor).squeeze()
+        loss = self.criterion(predicted_values, rewards_tensor)
+        
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+        
+        return {"loss": loss.item(), "batch_size": len(batch)}
 ```
 
 ## 🔄 Complete Training Flow
