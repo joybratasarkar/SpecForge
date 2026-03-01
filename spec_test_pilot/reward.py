@@ -376,6 +376,51 @@ def reward_generate_tests(state: Dict[str, Any]) -> float:
     return min(1.0, ratio * 0.3)
 
 
+def reward_finalize(state: Dict[str, Any]) -> float:
+    """Intermediate reward for finalization/validation node."""
+    if state.get("validated_output"):
+        return 1.0
+    return 0.0
+
+
+def compute_intermediate_reward(node_name: str, state: Dict[str, Any]) -> float:
+    """
+    Compute node-level intermediate reward using canonical node names.
+
+    Accepts both graph node names and legacy aliases.
+    """
+    normalized_name = node_name.strip().lower()
+
+    reward_by_node = {
+        # Parse + detect
+        "parse_spec": reward_parse_spec,
+        "parse_spec_node": reward_parse_spec,
+        "detect_endpoints": reward_detect_endpoints,
+        "detect_endpoints_node": reward_detect_endpoints,
+        # Research
+        "research_plan": reward_deep_research,
+        "deep_research_plan": reward_deep_research,
+        "research_search": reward_deep_research,
+        "deep_research_search": reward_deep_research,
+        "research_integrate": reward_deep_research,
+        "deep_research_integrate": reward_deep_research,
+        "research_reflect": reward_deep_research,
+        "deep_research_reflect": reward_deep_research,
+        # Generation + finalize
+        "generate_tests": reward_generate_tests,
+        "generate_tests_node": reward_generate_tests,
+        "finalize": reward_finalize,
+        "finalize_and_validate": reward_finalize,
+        "finalize_and_validate_node": reward_finalize,
+        "finalize_and_validate_json": reward_finalize,
+    }
+
+    reward_fn = reward_by_node.get(normalized_name)
+    if not reward_fn:
+        return 0.0
+    return reward_fn(state)
+
+
 # ========== REWARD FROM GOLD COMPARISON ==========
 
 def compute_reward_with_gold(

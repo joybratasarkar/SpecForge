@@ -1,0 +1,94 @@
+openapi: "3.0.3"
+info:
+  title: "Banking API"
+  version: "2.1.0"
+  description: "Secure banking operations API"
+servers:
+  - url: "https://api.bank.com/v2"
+security:
+  - bearerAuth: []
+paths:
+  /accounts:
+    get:
+      operationId: listAccounts
+      summary: List customer accounts
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: List of accounts
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  accounts:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        account_id:
+                          type: string
+                        balance:
+                          type: number
+                        currency:
+                          type: string
+  /transfers:
+    post:
+      operationId: createTransfer
+      summary: Create money transfer
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - from_account
+                - to_account
+                - amount
+              properties:
+                from_account:
+                  type: string
+                to_account:
+                  type: string
+                amount:
+                  type: number
+                  minimum: 0.01
+                currency:
+                  type: string
+                  default: "USD"
+      responses:
+        "201":
+          description: Transfer created
+        "400":
+          description: Invalid transfer data
+        "401":
+          description: Unauthorized
+        "403":
+          description: Insufficient funds
+  /transactions/{transactionId}:
+    get:
+      operationId: getTransaction
+      summary: Get transaction details
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: transactionId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Transaction details
+        "404":
+          description: Transaction not found
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT

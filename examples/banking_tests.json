@@ -1,0 +1,346 @@
+{
+  "spec_summary": {
+    "title": "Banking API",
+    "version": "2.1.0",
+    "base_url": "https://api.bank.com/v2",
+    "auth": {
+      "type": "bearer",
+      "details": "Bearer token authentication"
+    },
+    "endpoints_detected": [
+      {
+        "method": "GET",
+        "path": "/accounts",
+        "operation_id": "listAccounts"
+      },
+      {
+        "method": "POST",
+        "path": "/transfers",
+        "operation_id": "createTransfer"
+      },
+      {
+        "method": "GET",
+        "path": "/transactions/{transactionId}",
+        "operation_id": "getTransaction"
+      }
+    ]
+  },
+  "deep_research": {
+    "plan": [
+      "Search for REST API testing conventions",
+      "Search for bearer authentication testing patterns",
+      "Search for request validation testing patterns",
+      "Search for pagination testing patterns"
+    ],
+    "memory_excerpts": [
+      {
+        "source": "convention",
+        "excerpt": "1. Every endpoint needs at least one happy path test with valid inputs.\n2. Include negative tests for validation errors (400), auth failures (401/403), and not found (404).\n3. Test idempotency for PUT..."
+      },
+      {
+        "source": "convention",
+        "excerpt": "1. Test missing required fields returns 400 with field name in error.\n2. Test invalid field types (string vs int) returns 400.\n3. Test boundary values for numeric fields."
+      },
+      {
+        "source": "convention",
+        "excerpt": "1. Test default pagination returns limited results.\n2. Test page/offset parameters work correctly.\n3. Test invalid pagination params return 400."
+      },
+      {
+        "source": "convention",
+        "excerpt": "1. Test with valid credentials returns expected response.\n2. Test with missing auth header returns 401.\n3. Test with invalid/expired token returns 401 or 403."
+      }
+    ],
+    "reflection": "Research complete after 1 iteration(s). Found 4 relevant excerpts from 1 sources."
+  },
+  "test_suite": [
+    {
+      "test_id": "T001",
+      "name": "GET /accounts happy path",
+      "endpoint": {
+        "method": "GET",
+        "path": "/accounts"
+      },
+      "objective": "Verify GET /accounts returns success with valid inputs",
+      "preconditions": [
+        "Valid authentication"
+      ],
+      "request": {
+        "headers": {
+          "Content-Type": "application/json",
+          "Authorization": "Bearer <token>"
+        },
+        "path_params": {},
+        "query_params": {},
+        "body": {}
+      },
+      "assertions": [
+        {
+          "type": "status_code",
+          "expected": 200,
+          "path": null,
+          "rule": null
+        },
+        {
+          "type": "schema",
+          "expected": "response_schema",
+          "path": null,
+          "rule": null
+        }
+      ],
+      "data_variants": [],
+      "notes": ""
+    },
+    {
+      "test_id": "T002",
+      "name": "GET /accounts missing auth",
+      "endpoint": {
+        "method": "GET",
+        "path": "/accounts"
+      },
+      "objective": "Verify GET /accounts returns 401 without authentication",
+      "preconditions": [
+        "No authentication provided"
+      ],
+      "request": {
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "path_params": {},
+        "query_params": {},
+        "body": {}
+      },
+      "assertions": [
+        {
+          "type": "status_code",
+          "expected": 401,
+          "path": null,
+          "rule": null
+        }
+      ],
+      "data_variants": [],
+      "notes": "Tests authentication requirement"
+    },
+    {
+      "test_id": "T003",
+      "name": "POST /transfers happy path",
+      "endpoint": {
+        "method": "POST",
+        "path": "/transfers"
+      },
+      "objective": "Verify POST /transfers returns success with valid inputs",
+      "preconditions": [
+        "Valid authentication"
+      ],
+      "request": {
+        "headers": {
+          "Content-Type": "application/json",
+          "Authorization": "Bearer <token>"
+        },
+        "path_params": {},
+        "query_params": {},
+        "body": {
+          "from_account": "<from_account>",
+          "to_account": "<to_account>",
+          "amount": "<amount>"
+        }
+      },
+      "assertions": [
+        {
+          "type": "status_code",
+          "expected": 201,
+          "path": null,
+          "rule": null
+        },
+        {
+          "type": "schema",
+          "expected": "response_schema",
+          "path": null,
+          "rule": null
+        }
+      ],
+      "data_variants": [],
+      "notes": ""
+    },
+    {
+      "test_id": "T004",
+      "name": "POST /transfers missing required field",
+      "endpoint": {
+        "method": "POST",
+        "path": "/transfers"
+      },
+      "objective": "Verify POST /transfers returns 400 when required field is missing",
+      "preconditions": [
+        "Valid authentication"
+      ],
+      "request": {
+        "headers": {
+          "Content-Type": "application/json",
+          "Authorization": "Bearer <token>"
+        },
+        "path_params": {},
+        "query_params": {},
+        "body": {}
+      },
+      "assertions": [
+        {
+          "type": "status_code",
+          "expected": 400,
+          "path": null,
+          "rule": null
+        },
+        {
+          "type": "field",
+          "expected": "error message",
+          "path": "$.error",
+          "rule": "exists"
+        }
+      ],
+      "data_variants": [],
+      "notes": "Tests missing required field validation"
+    },
+    {
+      "test_id": "T005",
+      "name": "POST /transfers missing auth",
+      "endpoint": {
+        "method": "POST",
+        "path": "/transfers"
+      },
+      "objective": "Verify POST /transfers returns 401 without authentication",
+      "preconditions": [
+        "No authentication provided"
+      ],
+      "request": {
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "path_params": {},
+        "query_params": {},
+        "body": {}
+      },
+      "assertions": [
+        {
+          "type": "status_code",
+          "expected": 401,
+          "path": null,
+          "rule": null
+        }
+      ],
+      "data_variants": [],
+      "notes": "Tests authentication requirement"
+    },
+    {
+      "test_id": "T006",
+      "name": "GET /transactions/{transactionId} happy path",
+      "endpoint": {
+        "method": "GET",
+        "path": "/transactions/{transactionId}"
+      },
+      "objective": "Verify GET /transactions/{transactionId} returns success with valid inputs",
+      "preconditions": [
+        "Valid authentication"
+      ],
+      "request": {
+        "headers": {
+          "Content-Type": "application/json",
+          "Authorization": "Bearer <token>"
+        },
+        "path_params": {
+          "transactionId": "<transactionId>"
+        },
+        "query_params": {},
+        "body": {}
+      },
+      "assertions": [
+        {
+          "type": "status_code",
+          "expected": 200,
+          "path": null,
+          "rule": null
+        },
+        {
+          "type": "schema",
+          "expected": "response_schema",
+          "path": null,
+          "rule": null
+        }
+      ],
+      "data_variants": [],
+      "notes": ""
+    },
+    {
+      "test_id": "T007",
+      "name": "GET /transactions/{transactionId} missing auth",
+      "endpoint": {
+        "method": "GET",
+        "path": "/transactions/{transactionId}"
+      },
+      "objective": "Verify GET /transactions/{transactionId} returns 401 without authentication",
+      "preconditions": [
+        "No authentication provided"
+      ],
+      "request": {
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "path_params": {
+          "transactionId": "<transactionId>"
+        },
+        "query_params": {},
+        "body": {}
+      },
+      "assertions": [
+        {
+          "type": "status_code",
+          "expected": 401,
+          "path": null,
+          "rule": null
+        }
+      ],
+      "data_variants": [],
+      "notes": "Tests authentication requirement"
+    },
+    {
+      "test_id": "T008",
+      "name": "GET /transactions/{transactionId} not found",
+      "endpoint": {
+        "method": "GET",
+        "path": "/transactions/{transactionId}"
+      },
+      "objective": "Verify GET /transactions/{transactionId} returns 404 for non-existent resource",
+      "preconditions": [
+        "Valid authentication"
+      ],
+      "request": {
+        "headers": {
+          "Content-Type": "application/json",
+          "Authorization": "Bearer <token>"
+        },
+        "path_params": {
+          "transactionId": "nonexistent_id_12345"
+        },
+        "query_params": {},
+        "body": {}
+      },
+      "assertions": [
+        {
+          "type": "status_code",
+          "expected": 404,
+          "path": null,
+          "rule": null
+        }
+      ],
+      "data_variants": [],
+      "notes": "Tests not found handling"
+    }
+  ],
+  "coverage_checklist": {
+    "happy_paths": "true",
+    "validation_negative": "true",
+    "auth_negative": "true",
+    "error_contract": "true",
+    "idempotency": "unknown",
+    "pagination_filtering": "unknown",
+    "rate_limit": "unknown"
+  },
+  "missing_info": []
+}

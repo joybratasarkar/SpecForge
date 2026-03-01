@@ -1,0 +1,24 @@
+{
+  "config": {
+    "epochs": 1,
+    "tasks_per_epoch": 500,
+    "mock_mode": true
+  },
+  "epoch_stats": [
+    {
+      "epoch": 1,
+      "avg_reward": 1.216,
+      "success_rate": 1.0,
+      "execution_time": 161.3630621433258,
+      "tasks_completed": 500
+    }
+  ],
+  "final_stats": {
+    "total_transitions": 500,
+    "buffer_size": 500,
+    "training_steps": 469,
+    "recent_avg_reward": 1.1685,
+    "recent_max_reward": 1.4249999999999998
+  },
+  "pytorch_available": true
+}

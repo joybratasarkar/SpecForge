@@ -9,7 +9,7 @@ Implements the following nodes:
 - deep_research_integrate
 - deep_research_reflect (loop controller)
 - generate_tests
-- finalize_and_validate_json
+- finalize_and_validate
 """
 
 from typing import Dict, List, Any, Optional, TypedDict, Annotated, Literal
@@ -755,3 +755,14 @@ def run_agent(spec_text: str, run_id: str = "", verbose: bool = False) -> Dict[s
         "intermediate_rewards": final_state.get("intermediate_rewards", {}),
         "run_id": final_state.get("run_id", "")
     }
+
+
+# Backward-compatible aliases for older integrations.
+parse_spec = parse_spec_node
+detect_endpoints = detect_endpoints_node
+deep_research_plan = deep_research_plan_node
+deep_research_search = deep_research_search_node
+deep_research_integrate = deep_research_integrate_node
+deep_research_reflect = deep_research_reflect_node
+generate_tests = generate_tests_node
+finalize_and_validate_json = finalize_and_validate_node

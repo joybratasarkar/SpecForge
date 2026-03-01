@@ -15,6 +15,7 @@ import hashlib
 import time
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Optional, Tuple, Literal
+import uuid
 from datetime import datetime
 import numpy as np
 
@@ -79,6 +80,86 @@ DEFAULT_CONVENTIONS = [
 
 
 @dataclass
+class Session:
+    """Represents a GAM session with clear boundaries."""
+    session_id: str
+    tenant_id: Optional[str] = None
+    start_time: float = field(default_factory=time.time)
+    end_time: Optional[float] = None
+    transcript: List[Dict[str, Any]] = field(default_factory=list)
+    tool_outputs: List[Dict[str, Any]] = field(default_factory=list)
+    artifacts: List[Dict[str, Any]] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    
+    def add_transcript_entry(self, role: str, content: str, timestamp: Optional[float] = None):
+        """Add entry to session transcript."""
+        self.transcript.append({
+            "role": role,
+            "content": content,
+            "timestamp": timestamp or time.time()
+        })
+    
+    def add_tool_output(self, tool_name: str, output: Any, timestamp: Optional[float] = None):
+        """Add tool output to session."""
+        self.tool_outputs.append({
+            "tool": tool_name,
+            "output": output,
+            "timestamp": timestamp or time.time()
+        })
+    
+    def add_artifact(self, name: str, content: str, artifact_type: str, timestamp: Optional[float] = None):
+        """Add code/log artifact to session."""
+        self.artifacts.append({
+            "name": name,
+            "content": content,
+            "type": artifact_type,
+            "timestamp": timestamp or time.time()
+        })
+    
+    def end_session(self):
+        """Mark session as ended."""
+        self.end_time = time.time()
+    
+    def get_full_content(self) -> str:
+        """Get lossless session content for page storage."""
+        content_parts = []
+        
+        # Session metadata
+        content_parts.append(f"Session ID: {self.session_id}")
+        if self.tenant_id:
+            content_parts.append(f"Tenant ID: {self.tenant_id}")
+        content_parts.append(f"Duration: {(self.end_time or time.time()) - self.start_time:.2f}s")
+        content_parts.append("")
+        
+        # Transcript
+        if self.transcript:
+            content_parts.append("=== TRANSCRIPT ===")
+            for entry in self.transcript:
+                timestamp = datetime.fromtimestamp(entry["timestamp"]).strftime("%H:%M:%S")
+                content_parts.append(f"[{timestamp}] {entry['role']}: {entry['content']}")
+            content_parts.append("")
+        
+        # Tool outputs
+        if self.tool_outputs:
+            content_parts.append("=== TOOL OUTPUTS ===")
+            for output in self.tool_outputs:
+                timestamp = datetime.fromtimestamp(output["timestamp"]).strftime("%H:%M:%S")
+                content_parts.append(f"[{timestamp}] {output['tool']}: {str(output['output'])[:500]}...")
+            content_parts.append("")
+        
+        # Artifacts  
+        if self.artifacts:
+            content_parts.append("=== ARTIFACTS ===")
+            for artifact in self.artifacts:
+                timestamp = datetime.fromtimestamp(artifact["timestamp"]).strftime("%H:%M:%S")
+                content_parts.append(f"[{timestamp}] {artifact['name']} ({artifact['type']}):")
+                content_parts.append(artifact['content'])
+                content_parts.append("")
+        
+        return "\n".join(content_parts)
+
+
+@dataclass
 class Page:
     """A page in the memory store."""
     id: str
@@ -87,6 +168,7 @@ class Page:
     content: str
     timestamp: float = field(default_factory=time.time)
     source: Literal["convention", "existing_tests", "runbook", "validator", "memo"] = "memo"
+    tenant_id: Optional[str] = None  # Add tenant isolation
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
@@ -96,7 +178,8 @@ class Page:
             "tags": self.tags,
             "content": self.content,
             "timestamp": self.timestamp,
-            "source": self.source
+            "source": self.source,
+            "tenant_id": self.tenant_id
         }
     
     @classmethod
@@ -181,7 +264,8 @@ class PageStore:
         title: str,
         tags: List[str],
         content: str,
-        source: Literal["convention", "existing_tests", "runbook", "validator", "memo"] = "memo"
+        source: Literal["convention", "existing_tests", "runbook", "validator", "memo"] = "memo",
+        tenant_id: Optional[str] = None
     ) -> Page:
         """
         Add a new page to the store.
@@ -191,6 +275,7 @@ class PageStore:
             tags: List of tags
             content: Page content
             source: Source type
+            tenant_id: Tenant ID for isolation
             
         Returns:
             Created Page
@@ -201,7 +286,8 @@ class PageStore:
             title=title,
             tags=tags,
             content=content,
-            source=source
+            source=source,
+            tenant_id=tenant_id
         )
         
         idx = len(self.pages)
@@ -226,13 +312,14 @@ class PageStore:
             return self.pages[idx]
         return None
     
-    def search_bm25(self, query: str, top_k: int = 5) -> List[Tuple[Page, float]]:
+    def search_bm25(self, query: str, top_k: int = 5, tenant_id: Optional[str] = None) -> List[Tuple[Page, float]]:
         """
         Search pages using BM25.
         
         Args:
             query: Search query
             top_k: Number of results
+            tenant_id: Filter by tenant ID for isolation
             
         Returns:
             List of (Page, score) tuples
@@ -249,17 +336,21 @@ class PageStore:
         results = []
         for idx in top_indices:
             if scores[idx] > 0:
-                results.append((self.pages[idx], float(scores[idx])))
+                page = self.pages[idx]
+                # Apply tenant filtering
+                if tenant_id is None or page.tenant_id is None or page.tenant_id == tenant_id:
+                    results.append((page, float(scores[idx])))
         
         return results
     
-    def search_vector(self, query: str, top_k: int = 5) -> List[Tuple[Page, float]]:
+    def search_vector(self, query: str, top_k: int = 5, tenant_id: Optional[str] = None) -> List[Tuple[Page, float]]:
         """
         Search pages using vector similarity.
         
         Args:
             query: Search query
             top_k: Number of results
+            tenant_id: Filter by tenant ID for isolation
             
         Returns:
             List of (Page, score) tuples
@@ -276,7 +367,10 @@ class PageStore:
         results = []
         for score, idx in zip(scores[0], indices[0]):
             if idx >= 0 and score > 0:
-                results.append((self.pages[idx], float(score)))
+                page = self.pages[idx]
+                # Apply tenant filtering
+                if tenant_id is None or page.tenant_id is None or page.tenant_id == tenant_id:
+                    results.append((page, float(score)))
         
         return results
     
@@ -284,7 +378,8 @@ class PageStore:
         self,
         query: str,
         top_k: int = 5,
-        bm25_weight: float = 0.5
+        bm25_weight: float = 0.5,
+        tenant_id: Optional[str] = None
     ) -> List[Tuple[Page, float]]:
         """
         Hybrid search combining BM25 and vector search.
@@ -293,12 +388,13 @@ class PageStore:
             query: Search query
             top_k: Number of results
             bm25_weight: Weight for BM25 scores (1 - bm25_weight for vector)
+            tenant_id: Filter by tenant ID for isolation
             
         Returns:
             List of (Page, score) tuples
         """
-        bm25_results = self.search_bm25(query, top_k * 2)
-        vector_results = self.search_vector(query, top_k * 2)
+        bm25_results = self.search_bm25(query, top_k * 2, tenant_id=tenant_id)
+        vector_results = self.search_vector(query, top_k * 2, tenant_id=tenant_id)
         
         # Normalize and combine scores
         page_scores: Dict[str, float] = {}
@@ -344,6 +440,7 @@ class PageStore:
 class Memorizer:
     """
     Produces memos from agent runs and stores artifacts as pages.
+    Supports session-based lossless storage with contextual headers.
     """
     
     def __init__(self, page_store: PageStore):
@@ -354,6 +451,229 @@ class Memorizer:
             page_store: PageStore instance
         """
         self.page_store = page_store
+        self._active_sessions: Dict[str, Session] = {}
+    
+    def start_session(self, tenant_id: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> str:
+        """
+        Start a new GAM session with clear boundaries.
+        
+        Args:
+            tenant_id: Tenant ID for isolation
+            metadata: Optional session metadata
+            
+        Returns:
+            Session ID
+        """
+        session_id = str(uuid.uuid4())
+        session = Session(
+            session_id=session_id,
+            tenant_id=tenant_id,
+            metadata=metadata or {}
+        )
+        self._active_sessions[session_id] = session
+        return session_id
+    
+    def add_to_session(
+        self, 
+        session_id: str, 
+        role: str, 
+        content: str, 
+        tool_outputs: Optional[List[Dict[str, Any]]] = None,
+        artifacts: Optional[List[Dict[str, Any]]] = None
+    ):
+        """
+        Add content to an active session.
+        
+        Args:
+            session_id: Session ID
+            role: Role (user, assistant, system, tool)
+            content: Content to add
+            tool_outputs: Tool outputs to record
+            artifacts: Code/log artifacts to record
+        """
+        if session_id not in self._active_sessions:
+            raise ValueError(f"Session {session_id} not found")
+        
+        session = self._active_sessions[session_id]
+        session.add_transcript_entry(role, content)
+        
+        if tool_outputs:
+            for tool_output in tool_outputs:
+                session.add_tool_output(tool_output["tool"], tool_output["output"])
+        
+        if artifacts:
+            for artifact in artifacts:
+                session.add_artifact(artifact["name"], artifact["content"], artifact["type"])
+    
+    def end_session_with_memo(
+        self,
+        session_id: str,
+        spec_title: str,
+        endpoints_count: int,
+        tests_generated: int,
+        key_decisions: List[str],
+        issues_found: List[str]
+    ) -> Tuple[List[Page], Page]:
+        """
+        End session and create memo with lossless page storage.
+        
+        Args:
+            session_id: Session ID to end
+            spec_title: Spec title for memo
+            endpoints_count: Number of endpoints processed
+            tests_generated: Number of tests generated  
+            key_decisions: Key decisions made
+            issues_found: Issues discovered
+            
+        Returns:
+            (lossless_pages, memo_page) tuple
+        """
+        if session_id not in self._active_sessions:
+            raise ValueError(f"Session {session_id} not found")
+        
+        session = self._active_sessions[session_id]
+        session.end_session()
+        
+        # Create lossless page(s) from session content
+        lossless_pages = self._create_session_pages(session, spec_title)
+        
+        # Create contextual memo with page_id pointers
+        memo_page = self._create_contextual_memo(
+            session, spec_title, endpoints_count, tests_generated, 
+            key_decisions, issues_found, lossless_pages
+        )
+        
+        # Clean up session
+        del self._active_sessions[session_id]
+        
+        return lossless_pages, memo_page
+    
+    def _create_session_pages(self, session: Session, spec_title: str) -> List[Page]:
+        """Create lossless pages from session content with chunking."""
+        full_content = session.get_full_content()
+        
+        # Implement chunking strategy for long sessions (~2048 tokens ≈ 8192 chars)
+        MAX_CHUNK_SIZE = 8192
+        
+        if len(full_content) <= MAX_CHUNK_SIZE:
+            # Single page for short sessions
+            page = self.page_store.add_page(
+                title=f"Session: {spec_title} ({session.session_id[:8]})",
+                tags=["session", "lossless", spec_title.lower().replace(" ", "_")],
+                content=full_content,
+                source="memo",
+                tenant_id=session.tenant_id
+            )
+            return [page]
+        else:
+            # Multiple pages for long sessions (chunking)
+            pages = []
+            chunks = self._chunk_content(full_content, MAX_CHUNK_SIZE)
+            
+            for i, chunk in enumerate(chunks):
+                page = self.page_store.add_page(
+                    title=f"Session: {spec_title} ({session.session_id[:8]}) - Part {i+1}",
+                    tags=["session", "lossless", "chunked", spec_title.lower().replace(" ", "_")],
+                    content=chunk,
+                    source="memo", 
+                    tenant_id=session.tenant_id
+                )
+                pages.append(page)
+            
+            return pages
+    
+    def _chunk_content(self, content: str, max_size: int) -> List[str]:
+        """Chunk content intelligently at natural boundaries."""
+        if len(content) <= max_size:
+            return [content]
+        
+        chunks = []
+        lines = content.split('\n')
+        current_chunk = []
+        current_size = 0
+        
+        for line in lines:
+            line_size = len(line) + 1  # +1 for newline
+            
+            if current_size + line_size > max_size and current_chunk:
+                # Finish current chunk
+                chunks.append('\n'.join(current_chunk))
+                current_chunk = [line]
+                current_size = line_size
+            else:
+                current_chunk.append(line)
+                current_size += line_size
+        
+        # Add final chunk
+        if current_chunk:
+            chunks.append('\n'.join(current_chunk))
+        
+        return chunks
+    
+    def _create_contextual_memo(
+        self, 
+        session: Session, 
+        spec_title: str, 
+        endpoints_count: int,
+        tests_generated: int, 
+        key_decisions: List[str],
+        issues_found: List[str],
+        lossless_pages: List[Page]
+    ) -> Page:
+        """Create contextual memo using prior memory and page_id pointers."""
+        
+        # Generate contextual header using prior memory
+        contextual_header = self._generate_contextual_header(spec_title, session.tenant_id)
+        
+        # Build memo content with page_id pointers
+        content_parts = [
+            f"Context: {contextual_header}",
+            f"Spec: {spec_title}",
+            f"Endpoints: {endpoints_count}, Tests: {tests_generated}",
+        ]
+        
+        if key_decisions:
+            content_parts.append(f"Decisions: {'; '.join(key_decisions[:3])}")
+        
+        if issues_found:
+            content_parts.append(f"Issues: {'; '.join(issues_found[:3])}")
+        
+        # Add page_id pointers to lossless pages
+        if lossless_pages:
+            page_refs = [f"page_id:{page.id}" for page in lossless_pages]
+            content_parts.append(f"Full session data: {', '.join(page_refs)}")
+        
+        content = "\n".join(content_parts)
+        
+        return self.page_store.add_page(
+            title=f"{contextual_header}: {spec_title} ({session.session_id[:8]})",
+            tags=["memo", "run", "contextual", spec_title.lower().replace(" ", "_")],
+            content=content,
+            source="memo",
+            tenant_id=session.tenant_id
+        )
+    
+    def _generate_contextual_header(self, spec_title: str, tenant_id: Optional[str]) -> str:
+        """Generate contextual header using prior memory."""
+        # Search for related previous sessions
+        related_results = self.page_store.search_bm25(
+            spec_title, top_k=3, tenant_id=tenant_id
+        )
+        
+        if not related_results:
+            return "Initial Run"
+        
+        # Analyze prior runs for context
+        prior_runs = [r[0] for r in related_results if "memo" in r[0].tags]
+        
+        if len(prior_runs) == 0:
+            return "First API Analysis"
+        elif len(prior_runs) == 1:
+            return "Follow-up Analysis" 
+        elif any("v2" in r.title.lower() or "enhanced" in r.content.lower() for r in prior_runs):
+            return "Enhanced Version Analysis"
+        else:
+            return f"Iteration {len(prior_runs) + 1} Analysis"
     
     def create_memo(
         self,
@@ -668,14 +988,48 @@ class GAMMemorySystem:
         """Execute research loop."""
         return self.researcher.research(context)
     
+    # Legacy API (backward compatibility)
     def create_memo(self, **kwargs) -> Page:
-        """Create a run memo."""
+        """Create a run memo (legacy method)."""
         return self.memorizer.create_memo(**kwargs)
     
     def add_page(self, **kwargs) -> Page:
         """Add a page to the store."""
         return self.page_store.add_page(**kwargs)
     
-    def search(self, query: str, top_k: int = 5) -> List[Tuple[Page, float]]:
-        """Hybrid search."""
-        return self.page_store.hybrid_search(query, top_k)
+    def search(self, query: str, top_k: int = 5, tenant_id: Optional[str] = None) -> List[Tuple[Page, float]]:
+        """Hybrid search with optional tenant scoping."""
+        return self.page_store.hybrid_search(query, top_k, tenant_id=tenant_id)
+    
+    # Enhanced session-based API
+    def start_session(self, tenant_id: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> str:
+        """Start a new GAM session."""
+        return self.memorizer.start_session(tenant_id=tenant_id, metadata=metadata)
+    
+    def add_to_session(
+        self, 
+        session_id: str, 
+        role: str, 
+        content: str,
+        tool_outputs: Optional[List[Dict[str, Any]]] = None,
+        artifacts: Optional[List[Dict[str, Any]]] = None
+    ):
+        """Add content to active session."""
+        return self.memorizer.add_to_session(
+            session_id, role, content, tool_outputs, artifacts
+        )
+    
+    def end_session_with_memo(
+        self,
+        session_id: str,
+        spec_title: str,
+        endpoints_count: int,
+        tests_generated: int,
+        key_decisions: List[str],
+        issues_found: List[str]
+    ) -> Tuple[List[Page], Page]:
+        """End session and create lossless pages + contextual memo."""
+        return self.memorizer.end_session_with_memo(
+            session_id, spec_title, endpoints_count, tests_generated,
+            key_decisions, issues_found
+        )
