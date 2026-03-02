@@ -16,6 +16,14 @@ This document lists the current working file layout and which files are used at 
 - `official_agent_lightning_runner.py`
 - uses `spec_test_pilot/agent_lightning_official.py`
 
+4. Customer web UI runner:
+- `qa_customer_ui.py`
+- FastAPI UI for multi-domain click-to-run execution and report viewing
+
+5. Next.js customer web UI:
+- `customer-ui-next/`
+- Next.js app with API routes that run `run_qa_domain.sh` and stream job/report state
+
 ## 2. Core Runtime Files
 
 ## 2.1 QA pipeline

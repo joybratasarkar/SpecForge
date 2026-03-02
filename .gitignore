@@ -29,3 +29,10 @@ checkpoints/
 # OS
 .DS_Store
 Thumbs.db
+
+# Frontend build/deps
+customer-ui-next/node_modules/
+customer-ui-next/.next/
+
+# Local stray temp folder
+~/

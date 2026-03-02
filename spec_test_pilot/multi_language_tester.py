@@ -93,33 +93,62 @@ class HumanTesterSimulator:
             return endpoints
             
         for path, path_info in self.api_spec['paths'].items():
+            if not isinstance(path_info, dict):
+                continue
+            path_parameters = path_info.get('parameters', [])
             for method, method_info in path_info.items():
                 if method.lower() in ['get', 'post', 'put', 'delete', 'patch']:
+                    operation_info = method_info if isinstance(method_info, dict) else {}
                     
                     # Extract parameters
-                    parameters = method_info.get('parameters', [])
+                    parameters = self._merge_operation_parameters(
+                        path_parameters,
+                        operation_info.get('parameters', []),
+                    )
                     
                     # Check authentication
-                    auth_required = 'security' in method_info or 'security' in self.api_spec
+                    auth_required = 'security' in operation_info or 'security' in self.api_spec
                     auth_type = None
                     if auth_required:
-                        security = method_info.get('security', self.api_spec.get('security', []))
+                        security = operation_info.get('security', self.api_spec.get('security', []))
                         if security:
                             auth_type = list(security[0].keys())[0] if security[0] else None
                     
                     endpoint = APIEndpoint(
                         path=path,
                         method=method.upper(),
-                        summary=method_info.get('summary', f"{method.upper()} {path}"),
+                        summary=operation_info.get('summary', f"{method.upper()} {path}"),
                         parameters=parameters,
-                        request_body=method_info.get('requestBody'),
-                        responses=method_info.get('responses', {}),
+                        request_body=operation_info.get('requestBody'),
+                        responses=operation_info.get('responses', {}),
                         auth_required=auth_required,
                         auth_type=auth_type
                     )
                     endpoints.append(endpoint)
         
         return endpoints
+
+    def _merge_operation_parameters(
+        self,
+        path_parameters: Any,
+        operation_parameters: Any,
+    ) -> List[Dict[str, Any]]:
+        """Merge path-level and operation-level OpenAPI parameters."""
+        merged: Dict[Tuple[str, str], Dict[str, Any]] = {}
+
+        for source in (path_parameters, operation_parameters):
+            if not isinstance(source, list):
+                continue
+            for param in source:
+                if not isinstance(param, dict):
+                    continue
+                location = str(param.get("in", "")).lower()
+                name = str(param.get("name", ""))
+                if not location or not name:
+                    continue
+                merged[(location, name)] = param
+
+        return list(merged.values())
     
     def think_like_tester(self, nlp_prompt: Optional[str] = None) -> List[TestScenario]:
         """
@@ -516,18 +545,64 @@ class HumanTesterSimulator:
         scenarios = []
         
         for endpoint in self.endpoints:
-            if endpoint.method == 'GET':
-                # Pagination limit test  
-                limit_scenario = TestScenario(
-                    name=f"test_get_{endpoint.path.replace('/', '_')}_pagination_limit",
-                    description=f"Test pagination limits on GET {endpoint.path}",
-                    test_type=TestType.BOUNDARY_TESTING,
-                    endpoint=endpoint.path,
-                    method='GET',
-                    expected_status=400,
-                    params={'limit': 99999, 'page': -1}  # Invalid pagination
-                )
-                scenarios.append(limit_scenario)
+            if endpoint.method != 'GET':
+                continue
+
+            query_params = [
+                p for p in endpoint.parameters
+                if str((p or {}).get("in", "")).lower() == "query"
+            ]
+            if not query_params:
+                # Avoid hallucinated pagination checks on endpoints without query parameters.
+                continue
+
+            query_name_map = {
+                str((p or {}).get("name", "")).lower(): str((p or {}).get("name", ""))
+                for p in query_params
+                if str((p or {}).get("name", ""))
+            }
+            pagination_aliases = {
+                "limit",
+                "page",
+                "offset",
+                "per_page",
+                "perpage",
+                "page_size",
+                "pagesize",
+            }
+            if not (set(query_name_map.keys()) & pagination_aliases):
+                # Skip pagination boundary cases if the endpoint does not expose pagination params.
+                continue
+
+            invalid_params: Dict[str, Any] = {}
+            if "limit" in query_name_map:
+                invalid_params[query_name_map["limit"]] = 99999
+            if "page" in query_name_map:
+                invalid_params[query_name_map["page"]] = -1
+            if "offset" in query_name_map:
+                invalid_params[query_name_map["offset"]] = -1
+            if "per_page" in query_name_map:
+                invalid_params[query_name_map["per_page"]] = 0
+            if "perpage" in query_name_map:
+                invalid_params[query_name_map["perpage"]] = 0
+            if "page_size" in query_name_map:
+                invalid_params[query_name_map["page_size"]] = 0
+            if "pagesize" in query_name_map:
+                invalid_params[query_name_map["pagesize"]] = 0
+
+            if not invalid_params:
+                continue
+
+            limit_scenario = TestScenario(
+                name=f"test_get_{endpoint.path.replace('/', '_')}_pagination_limit",
+                description=f"Test pagination limits on GET {endpoint.path}",
+                test_type=TestType.BOUNDARY_TESTING,
+                endpoint=endpoint.path,
+                method='GET',
+                expected_status=400,
+                params=invalid_params,
+            )
+            scenarios.append(limit_scenario)
         
         return scenarios
     

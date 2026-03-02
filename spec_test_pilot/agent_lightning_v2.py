@@ -12,6 +12,7 @@ Key Features:
 """
 
 import asyncio
+import hashlib
 import json
 import time
 import uuid
@@ -209,6 +210,8 @@ class LightningRLAlgorithm:
         self.hidden_dim = hidden_dim
         self.learning_rate = learning_rate
         self.batch_size = batch_size
+        self.state_encoder = "stable_sha256_v2"
+        self.logger = logging.getLogger(__name__)
         
         # Experience replay buffer
         self.replay_buffer: deque[TrainingTransition] = deque(maxlen=buffer_size)
@@ -218,7 +221,6 @@ class LightningRLAlgorithm:
         if TORCH_AVAILABLE:
             self._init_networks()
         else:
-            self.logger = logging.getLogger(__name__)
             self.logger.warning("PyTorch not available - RL training disabled")
     
     def _init_networks(self):
@@ -246,14 +248,15 @@ class LightningRLAlgorithm:
         self.policy_optimizer = optim.Adam(self.policy_net.parameters(), lr=self.learning_rate)
         
         # Loss functions
-        self.value_loss_fn = nn.MSELoss()
+        # Huber loss is more stable than pure MSE on noisy rewards.
+        self.value_loss_fn = nn.SmoothL1Loss()
         self.policy_loss_fn = nn.CrossEntropyLoss()
     
     def add_transition(self, transition: TrainingTransition) -> None:
         """Add training transition to replay buffer."""
         self.replay_buffer.append(transition)
     
-    def train_step(self) -> Dict[str, float]:
+    def train_step(self) -> Dict[str, Any]:
         """
         Execute one RL training step using proper Agent Lightning methodology.
         
@@ -263,77 +266,115 @@ class LightningRLAlgorithm:
         if not TORCH_AVAILABLE:
             return {"status": "skipped", "reason": "pytorch_unavailable"}
         
-        # Agent Lightning: Use smaller batch size for more frequent training
-        min_batch_size = min(4, len(self.replay_buffer))  # Start training with just 4 samples
+        # Require a minimum batch to reduce high-variance updates.
+        min_batch_size = max(4, min(self.batch_size, 8))
         
         if len(self.replay_buffer) < min_batch_size:
             return {"status": "skipped", "reason": f"need_{min_batch_size}_samples"}
         
-        # Sample batch (use smaller size for more frequent training)
         actual_batch_size = min(self.batch_size, len(self.replay_buffer))
-        
-        if actual_batch_size < len(self.replay_buffer):
-            batch_indices = np.random.choice(len(self.replay_buffer), actual_batch_size, replace=False)
-            batch = [self.replay_buffer[i] for i in batch_indices]
-        else:
-            batch = list(self.replay_buffer)
-        
-        # Convert to tensors
-        states = torch.FloatTensor([self._encode_state(t.state) for t in batch])
-        rewards = torch.FloatTensor([t.reward for t in batch])
-        next_states = torch.FloatTensor([self._encode_state(t.next_state) for t in batch])
-        dones = torch.BoolTensor([t.done for t in batch])
-        
-        # Agent Lightning: Train value network with proper TD learning
-        current_values = self.value_net(states).squeeze(-1)
-        
-        with torch.no_grad():
-            next_values = self.value_net(next_states).squeeze(-1)
-            # TD targets with Generalized Advantage Estimation (GAE)
-            target_values = rewards + 0.99 * next_values * (~dones)
-        
-        # Compute value loss
-        value_loss = self.value_loss_fn(current_values, target_values)
-        
-        # Backpropagation
-        self.value_optimizer.zero_grad()
-        value_loss.backward()
-        
-        # Gradient clipping for stability
-        torch.nn.utils.clip_grad_norm_(self.value_net.parameters(), 0.5)
-        
-        self.value_optimizer.step()
+
+        # Run a few mini-updates when replay memory is sufficiently large.
+        gradient_steps = 1
+        if len(self.replay_buffer) >= actual_batch_size * 2:
+            gradient_steps = 2
+        if len(self.replay_buffer) >= actual_batch_size * 4:
+            gradient_steps = 4
+
+        losses: List[float] = []
+        for _ in range(gradient_steps):
+            batch = self._sample_batch(actual_batch_size)
+
+            # Convert to tensors
+            states = torch.FloatTensor([self._encode_state(t.state) for t in batch])
+            rewards = torch.FloatTensor([t.reward for t in batch])
+            next_states = torch.FloatTensor([self._encode_state(t.next_state) for t in batch])
+            dones = torch.BoolTensor([t.done for t in batch])
+
+            # Normalize rewards to stabilize training across domains.
+            reward_mean = rewards.mean()
+            reward_std = rewards.std()
+            if float(reward_std.item()) > 1e-6:
+                rewards = (rewards - reward_mean) / (reward_std + 1e-8)
+            else:
+                rewards = rewards - reward_mean
+
+            current_values = self.value_net(states).squeeze(-1)
+            with torch.no_grad():
+                next_values = self.value_net(next_states).squeeze(-1)
+                target_values = rewards + 0.99 * next_values * (~dones)
+
+            value_loss = self.value_loss_fn(current_values, target_values)
+            self.value_optimizer.zero_grad()
+            value_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.value_net.parameters(), 0.5)
+            self.value_optimizer.step()
+            losses.append(float(value_loss.item()))
+
         self.training_steps += 1
+        mean_loss = float(sum(losses) / max(1, len(losses)))
         
         # Log training progress every 10 steps
         if self.training_steps % 10 == 0:
-            print(f"🧠 RL Training Step {self.training_steps}: Loss={value_loss.item():.4f}")
+            print(f"🧠 RL Training Step {self.training_steps}: Loss={mean_loss:.4f}")
         
         return {
             "status": "trained",
-            "value_loss": float(value_loss.item()),
-            "batch_size": len(batch),
+            "value_loss": mean_loss,
+            "batch_size": actual_batch_size,
+            "gradient_steps": gradient_steps,
+            "min_batch_size": min_batch_size,
             "training_steps": self.training_steps,
             "buffer_size": len(self.replay_buffer),
             "learning_rate": self.learning_rate,
             "weights_updated": True
         }
+
+    def _sample_batch(self, batch_size: int) -> List[TrainingTransition]:
+        if batch_size >= len(self.replay_buffer):
+            return list(self.replay_buffer)
+        batch_indices = np.random.choice(
+            len(self.replay_buffer),
+            batch_size,
+            replace=False,
+        )
+        return [self.replay_buffer[i] for i in batch_indices]
     
     def _encode_state(self, state: Dict[str, Any]) -> List[float]:
         """Encode state dictionary to fixed-size vector."""
-        # Simple encoding - in practice would use more sophisticated methods
         vector = [0.0] * self.state_dim
-        
-        # Hash-based feature encoding
-        for i, (key, value) in enumerate(state.items()):
-            if i >= self.state_dim:
-                break
-            
-            # Simple hashing to vector positions
-            hash_val = hash(f"{key}:{value}") % self.state_dim
-            vector[hash_val] = 1.0
-        
+        if not isinstance(state, dict):
+            return vector
+
+        # Stable hashing keeps RL feature mapping consistent across process restarts.
+        for key, value in sorted(state.items(), key=lambda kv: str(kv[0])):
+            payload = self._stable_json({"k": key, "v": value})
+            digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+            index = int(digest[:16], 16) % self.state_dim
+            vector[index] += 1.0
+
+        norm = float(np.linalg.norm(vector))
+        if norm > 0:
+            vector = [float(v / norm) for v in vector]
         return vector
+
+    def _stable_json(self, value: Any) -> str:
+        try:
+            return json.dumps(value, sort_keys=True, ensure_ascii=True, default=str)
+        except Exception:
+            return str(value)
+
+    def predict_state_value(self, state: Dict[str, Any]) -> Optional[float]:
+        """Predict scalar value for a state; returns None when model is unavailable."""
+        if not TORCH_AVAILABLE or not hasattr(self, "value_net"):
+            return None
+        try:
+            encoded = self._encode_state(state)
+            with torch.no_grad():
+                value = self.value_net(torch.FloatTensor([encoded])).squeeze().item()
+            return float(value)
+        except Exception:
+            return None
     
     def _encode_action(self, action: Dict[str, Any]) -> List[float]:
         """Encode action dictionary to vector."""
@@ -413,6 +454,7 @@ class LightningRLAlgorithm:
                 "batch_size": self.batch_size,
                 "training_steps": int(self.training_steps),
                 "buffer_size": len(self.replay_buffer),
+                "state_encoder": self.state_encoder,
                 "checkpoint_time": time.time(),
             },
             "replay_buffer": [self._transition_to_dict(t) for t in transitions],
@@ -433,6 +475,13 @@ class LightningRLAlgorithm:
 
         meta = payload.get("metadata", {})
         self.training_steps = int(meta.get("training_steps", self.training_steps))
+        loaded_encoder = str(meta.get("state_encoder", "legacy_python_hash"))
+        if loaded_encoder != self.state_encoder:
+            self.logger.warning(
+                "Loaded checkpoint with state encoder '%s' into '%s'.",
+                loaded_encoder,
+                self.state_encoder,
+            )
 
         replay_items = payload.get("replay_buffer", [])
         loaded_replay = 0
@@ -468,6 +517,7 @@ class LightningRLAlgorithm:
             "training_steps": self.training_steps,
             "replay_loaded": loaded_replay,
             "models_loaded": loaded_models,
+            "state_encoder": loaded_encoder,
         }
 
     def save_checkpoint(
@@ -855,15 +905,19 @@ class AgentLightningTrainer:
     
     def get_training_stats(self) -> Dict[str, Any]:
         """Get current training statistics."""
+        rl_buffer_size = len(self.rl_algorithm.replay_buffer)
+        rl_training_steps = self.rl_algorithm.training_steps
         return {
             "registered_agents": len(self.agents),
             "total_traces": len(self.collector.traces),
             "active_sessions": len(self.collector.active_sessions),
-            "rl_buffer_size": len(self.rl_algorithm.replay_buffer),
-            "rl_training_steps": self.rl_algorithm.training_steps,
+            "rl_buffer_size": rl_buffer_size,
+            "rl_training_steps": rl_training_steps,
             "training_enabled": self.training_enabled,
             "checkpoint_path": self.checkpoint_path,
             "checkpoint_autosave": self.checkpoint_autosave,
+            "rl_model_ready": bool(rl_training_steps >= 3 and rl_buffer_size >= 32),
+            "state_encoder": getattr(self.rl_algorithm, "state_encoder", "unknown"),
         }
 
 

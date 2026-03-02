@@ -259,18 +259,38 @@ class DynamicMockServer:
         
         # Create routes for each path and method
         for path, path_config in self.paths.items():
+            if not isinstance(path_config, dict):
+                continue
+            path_level_parameters = path_config.get("parameters", [])
             for method, operation in path_config.items():
                 if method.upper() in ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]:
-                    self._create_dynamic_route(path, method.upper(), operation)
+                    self._create_dynamic_route(
+                        path,
+                        method.upper(),
+                        operation,
+                        path_level_parameters=path_level_parameters,
+                    )
         
         logger.info(f"📍 Created {self._count_operations()} dynamic routes")
     
-    def _create_dynamic_route(self, path: str, method: str, operation: Dict):
+    def _create_dynamic_route(
+        self,
+        path: str,
+        method: str,
+        operation: Dict,
+        path_level_parameters: Optional[List[Dict]] = None,
+    ):
         """Create a single dynamic route."""
         operation_id = operation.get("operationId", f"{method.lower()}_{path.replace('/', '_').replace('{', '').replace('}', '')}")
         
         async def dynamic_handler(request: Request):
-            return await self._handle_dynamic_request(request, path, method, operation)
+            return await self._handle_dynamic_request(
+                request,
+                path,
+                method,
+                operation,
+                path_level_parameters=path_level_parameters,
+            )
         
         # Register the route with FastAPI
         if method == "GET":
@@ -286,7 +306,14 @@ class DynamicMockServer:
         
         logger.info(f"   📌 {method} {path} ({operation_id})")
     
-    async def _handle_dynamic_request(self, request: Request, path: str, method: str, operation: Dict) -> Any:
+    async def _handle_dynamic_request(
+        self,
+        request: Request,
+        path: str,
+        method: str,
+        operation: Dict,
+        path_level_parameters: Optional[List[Dict]] = None,
+    ) -> Any:
         """Handle any dynamic request based on OpenAPI operation."""
         try:
             # Check authentication if required
@@ -294,6 +321,11 @@ class DynamicMockServer:
             
             # Validate path parameters
             path_params = self._extract_path_params(request.url.path, path)
+            await self._validate_query_params(
+                request=request,
+                operation=operation,
+                path_level_parameters=path_level_parameters,
+            )
             
             # Handle special test cases (404s, etc.)
             await self._handle_special_cases(request, path, method, path_params)
@@ -312,6 +344,196 @@ class DynamicMockServer:
         except Exception as e:
             logger.error(f"❌ Error in {method} {path}: {e}")
             raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+    def _collect_operation_parameters(
+        self,
+        operation: Dict,
+        path_level_parameters: Optional[List[Dict]],
+    ) -> List[Dict]:
+        merged: Dict[tuple, Dict] = {}
+
+        if isinstance(path_level_parameters, list):
+            for param in path_level_parameters:
+                if not isinstance(param, dict):
+                    continue
+                location = str(param.get("in", "")).lower()
+                name = str(param.get("name", ""))
+                if location and name:
+                    merged[(location, name)] = param
+
+        operation_params = operation.get("parameters", [])
+        if isinstance(operation_params, list):
+            for param in operation_params:
+                if not isinstance(param, dict):
+                    continue
+                location = str(param.get("in", "")).lower()
+                name = str(param.get("name", ""))
+                if location and name:
+                    merged[(location, name)] = param
+
+        return list(merged.values())
+
+    async def _validate_query_params(
+        self,
+        request: Request,
+        operation: Dict,
+        path_level_parameters: Optional[List[Dict]] = None,
+    ) -> None:
+        parameters = self._collect_operation_parameters(operation, path_level_parameters)
+        query_specs = [
+            p for p in parameters if str((p or {}).get("in", "")).lower() == "query"
+        ]
+        query_spec_map = {
+            str((p or {}).get("name", "")): p
+            for p in query_specs
+            if str((p or {}).get("name", ""))
+        }
+        incoming = dict(request.query_params)
+
+        if incoming and not query_spec_map:
+            unknown = ", ".join(sorted(incoming.keys())[:5])
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unexpected query parameter(s): {unknown}",
+            )
+
+        for name in incoming.keys():
+            if name not in query_spec_map:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Unexpected query parameter: {name}",
+                )
+
+        for name, param in query_spec_map.items():
+            if bool(param.get("required", False)) and name not in incoming:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Missing required query parameter: {name}",
+                )
+            if name in incoming:
+                self._validate_query_param_value(name, incoming[name], param)
+
+    def _validate_query_param_value(self, name: str, raw_value: str, param: Dict) -> None:
+        schema = param.get("schema", {})
+        if not isinstance(schema, dict):
+            return
+
+        enum_values = schema.get("enum", [])
+        if isinstance(enum_values, list) and enum_values:
+            allowed = {str(v) for v in enum_values}
+            if str(raw_value) not in allowed:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid value for query parameter '{name}': {raw_value}",
+                )
+
+        value_type = str(schema.get("type", "string")).lower()
+        minimum = schema.get("minimum")
+        maximum = schema.get("maximum")
+        exclusive_minimum = schema.get("exclusiveMinimum")
+        exclusive_maximum = schema.get("exclusiveMaximum")
+
+        if value_type == "integer":
+            try:
+                parsed = int(str(raw_value))
+            except Exception:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Query parameter '{name}' must be an integer",
+                )
+            self._validate_numeric_boundaries(
+                name,
+                parsed,
+                minimum,
+                maximum,
+                exclusive_minimum,
+                exclusive_maximum,
+            )
+            return
+
+        if value_type == "number":
+            try:
+                parsed = float(str(raw_value))
+            except Exception:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Query parameter '{name}' must be a number",
+                )
+            self._validate_numeric_boundaries(
+                name,
+                parsed,
+                minimum,
+                maximum,
+                exclusive_minimum,
+                exclusive_maximum,
+            )
+            return
+
+        if value_type == "boolean":
+            if str(raw_value).lower() not in {"true", "false", "1", "0"}:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Query parameter '{name}' must be a boolean",
+                )
+            return
+
+        if value_type == "string":
+            text = str(raw_value)
+            min_length = schema.get("minLength")
+            max_length = schema.get("maxLength")
+            if min_length is not None and len(text) < int(min_length):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Query parameter '{name}' is shorter than minLength={min_length}",
+                )
+            if max_length is not None and len(text) > int(max_length):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Query parameter '{name}' is longer than maxLength={max_length}",
+                )
+            return
+
+    def _validate_numeric_boundaries(
+        self,
+        name: str,
+        value: Union[int, float],
+        minimum: Any,
+        maximum: Any,
+        exclusive_minimum: Any,
+        exclusive_maximum: Any,
+    ) -> None:
+        if minimum is not None and value < float(minimum):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Query parameter '{name}' must be >= {minimum}",
+            )
+        if maximum is not None and value > float(maximum):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Query parameter '{name}' must be <= {maximum}",
+            )
+        if isinstance(exclusive_minimum, (int, float)):
+            if value <= float(exclusive_minimum):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Query parameter '{name}' must be > {exclusive_minimum}",
+                )
+        elif exclusive_minimum is True and minimum is not None and value <= float(minimum):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Query parameter '{name}' must be > {minimum}",
+            )
+        if isinstance(exclusive_maximum, (int, float)):
+            if value >= float(exclusive_maximum):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Query parameter '{name}' must be < {exclusive_maximum}",
+                )
+        elif exclusive_maximum is True and maximum is not None and value >= float(maximum):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Query parameter '{name}' must be < {maximum}",
+            )
     
     async def _check_auth_if_required(self, request: Request, operation: Dict):
         """Check authentication if required by operation."""

@@ -106,6 +106,7 @@ class QASpecialistAgent:
         max_scenarios: int = 200,
         pass_threshold: float = 0.70,
         rl_checkpoint_path: Optional[str] = None,
+        learning_state_path: Optional[str] = None,
     ):
         self.spec_path = str(spec_path)
         self.nlp_prompt = nlp_prompt
@@ -131,7 +132,9 @@ class QASpecialistAgent:
             checkpoint_autosave=True,
         )
         self.rl_trainer.register_agent("qa_specialist", self._qa_agent_feedback)
-        self.learning_state_path = self.output_dir / "learning_state.json"
+        self.learning_state_path = self._resolve_learning_state_path(
+            learning_state_path
+        )
         self.learning_state = self._load_learning_state()
         self.adaptive_policy = AdaptiveScenarioPolicy.from_state(
             self.learning_state.get("adaptive_policy"),
@@ -142,6 +145,18 @@ class QASpecialistAgent:
         self._last_selection_trace: List[Dict[str, Any]] = []
         self._last_selection_summary: Dict[str, Any] = {}
         self._auth_required_ops: set[str] = set()
+
+    def _resolve_learning_state_path(self, learning_state_path: Optional[str]) -> Path:
+        if learning_state_path:
+            resolved = Path(learning_state_path).expanduser().resolve()
+            resolved.parent.mkdir(parents=True, exist_ok=True)
+            return resolved
+
+        checkpoint_path = Path(self.rl_checkpoint_path).expanduser().resolve()
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        return checkpoint_path.with_name(
+            f"{checkpoint_path.stem}_learning_state.json"
+        )
 
     def run(self) -> Dict[str, Any]:
         """Run the full QA specialist workflow."""
@@ -678,10 +693,15 @@ class QASpecialistAgent:
 
     def _predict_rl_state_risk(self, scenario: TestScenario) -> float:
         rl_algo = self.rl_trainer.rl_algorithm
-        if not hasattr(rl_algo, "value_net"):
+        if not hasattr(rl_algo, "predict_state_value"):
             return 0.0
         try:
-            import torch  # Local import to avoid hard dependency when disabled.
+            stats = self.rl_trainer.get_training_stats()
+            rl_steps = int(stats.get("rl_training_steps", 0))
+            rl_buffer = int(stats.get("rl_buffer_size", 0))
+            # Ignore noisy predictions until we have enough replay + updates.
+            if rl_steps < 3 or rl_buffer < 32:
+                return 0.0
 
             state = {
                 "type": scenario.test_type.value,
@@ -691,16 +711,18 @@ class QASpecialistAgent:
                 "has_body": bool(scenario.body),
                 "has_params": bool(scenario.params),
             }
-            encoded = rl_algo._encode_state(state)
-            with torch.no_grad():
-                predicted_value = float(
-                    rl_algo.value_net(torch.FloatTensor([encoded])).squeeze().item()
-                )
+            predicted_value = rl_algo.predict_state_value(state)
+            if predicted_value is None:
+                return 0.0
 
             # Convert value into risk in [0,1]; lower value => higher risk.
             confidence = 1.0 / (1.0 + math.exp(-predicted_value))
             risk = 1.0 - confidence
-            return 0.30 * risk
+
+            # Increase RL influence as model maturity increases.
+            maturity = min(1.0, (rl_steps / 25.0) + (rl_buffer / 400.0))
+            risk_scale = 0.15 + (0.45 * maturity)
+            return max(0.0, min(0.60, risk_scale * risk))
         except Exception:
             return 0.0
 
@@ -1787,6 +1809,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Path to Agent Lightning checkpoint file (default: <output-dir>/agent_lightning_checkpoint.pt)",
     )
+    parser.add_argument(
+        "--learning-state",
+        default=None,
+        help="Path to persistent QA learning state JSON (default: beside --rl-checkpoint)",
+    )
     return parser
 
 
@@ -1803,6 +1830,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         max_scenarios=args.max_scenarios,
         pass_threshold=args.pass_threshold,
         rl_checkpoint_path=args.rl_checkpoint,
+        learning_state_path=args.learning_state,
     )
 
     report = agent.run()

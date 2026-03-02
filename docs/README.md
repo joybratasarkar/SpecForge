@@ -29,19 +29,98 @@ This README reflects the current code paths and verified runtime behavior as of 
 venv/bin/pip install -r requirements.txt
 ```
 
-2. Run one domain end-to-end:
+2. Customer-facing one-command run (recommended):
 ```bash
-./run_qa_domain.sh --domain ecommerce --action both
+./run_qa_domain.sh --domain ecommerce --customer-mode --verify-persistence
 ```
 
-3. Re-run same domain with same checkpoint (to verify persistence):
+3. Classic advanced mode (manual control):
 ```bash
 ./run_qa_domain.sh \
   --domain ecommerce \
-  --action run \
-  --spec-path /tmp/openapi_ecommerce.yaml \
+  --action both \
+  --output-dir /tmp/qa_ecommerce_run \
   --rl-checkpoint /tmp/agent_lightning_ecommerce.pt
 ```
+
+Customer mode behavior:
+
+1. keeps persistent spec/checkpoint workspace per tenant+domain
+2. runs end-to-end in one command
+3. if `--verify-persistence` is set, auto-runs a second pass and prints RL step/buffer delta
+4. no manual second command needed
+
+## Customer Web UI
+
+Run the button-based UI:
+
+```bash
+venv/bin/python qa_customer_ui.py
+```
+
+Open:
+
+```text
+http://127.0.0.1:8787
+```
+
+UI capabilities:
+
+1. select multiple domains in one run
+2. click-run full QA process
+3. stream live logs from each domain execution
+4. auto-check persistence (optional checkbox)
+5. inspect JSON/Markdown reports directly in browser
+
+## Next.js Customer UI (Non-Python)
+
+If you want the customer UI in Next.js instead of Python:
+
+1. Go to [customer-ui-next/README.md](/Users/sjoybrata/Desktop/reinforcement-agent/customer-ui-next/README.md)
+2. Install and run:
+```bash
+cd customer-ui-next
+npm install
+npm run dev
+```
+3. Open `http://localhost:3001`
+4. UI/backend connection uses Next API routes + SSE stream for live job updates
+5. UI includes:
+- interactive report viewer (summary metrics + scenario table + raw report)
+- generated script explorer (pytest/jest/curl/restassured preview)
+- Agent R&D panel (selection decisions + reward breakdown + weakest patterns)
+- customer API contract panel (all endpoints and payload shape)
+- runtime flow panel (step-by-step input/output mapping)
+
+One-command launcher from repo root:
+
+```bash
+./run_customer_ui_next.sh
+```
+
+## Split Mode: FastAPI Backend + Next.js Frontend
+
+If you want backend explicitly in FastAPI:
+
+Terminal 1 (backend):
+```bash
+cd /Users/sjoybrata/Desktop/reinforcement-agent
+./run_customer_backend_fastapi.sh
+```
+
+Terminal 2 (frontend):
+```bash
+cd /Users/sjoybrata/Desktop/reinforcement-agent
+NEXT_PUBLIC_BACKEND_BASE_URL=http://127.0.0.1:8787 ./run_customer_frontend_next.sh
+```
+
+Open:
+
+```text
+http://localhost:3001
+```
+
+The UI automatically switches to direct FastAPI calls when `NEXT_PUBLIC_BACKEND_BASE_URL` is set.
 
 ## Verified Multi-Domain Run (March 2, 2026)
 
@@ -110,4 +189,7 @@ If network/package index is restricted, this install must be done in an environm
 
 1. `docs/qa-agent-architecture.md`: architecture and runtime sequence.
 2. `docs/qa-agent-learning-data-flow.md`: learning payloads and RL flow in depth.
-3. `docs/project-file-organization.md`: file map and execution entrypoints.
+3. `docs/qa-agent-runtime-step-map.md`: per-step input/output mapping with runtime diagrams.
+4. `docs/project-file-organization.md`: file map and execution entrypoints.
+5. `docs/customer-ui-api-flow.md`: customer UI API contract and runtime sequence.
+6. `docs/qa-agent-glass-box-deep-dive.md`: full black-box transparency guide (formulas, payloads, persistence, and report field mapping).
