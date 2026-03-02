@@ -4,7 +4,7 @@ This folder is the backend entrypoint layer for the QA agent system.
 
 Backend runtime code is now physically located in this folder:
 
-1. FastAPI app: `qa_customer_ui.py`
+1. FastAPI app: `qa_customer_api.py`
 2. Domain runner: `run_qa_domain.sh`
 3. QA agent core: `spec_test_pilot/qa_specialist_agent.py`
 4. RL trainer: `spec_test_pilot/agent_lightning_v2.py`

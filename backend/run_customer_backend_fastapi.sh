@@ -26,7 +26,7 @@ echo "[CFG] BACKEND_RELOAD=${BACKEND_RELOAD}"
 
 export QA_UI_ALLOWED_ORIGINS="${ALLOWED_ORIGINS}"
 if [[ "${BACKEND_RELOAD}" == "1" ]]; then
-  exec "${PYTHON_BIN}" -m uvicorn qa_customer_ui:app --host "${BACKEND_HOST}" --port "${BACKEND_PORT}" --reload
+  exec "${PYTHON_BIN}" -m uvicorn qa_customer_api:app --host "${BACKEND_HOST}" --port "${BACKEND_PORT}" --reload
 else
-  exec "${PYTHON_BIN}" -m uvicorn qa_customer_ui:app --host "${BACKEND_HOST}" --port "${BACKEND_PORT}"
+  exec "${PYTHON_BIN}" -m uvicorn qa_customer_api:app --host "${BACKEND_HOST}" --port "${BACKEND_PORT}"
 fi

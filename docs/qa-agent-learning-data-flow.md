@@ -12,7 +12,7 @@ Scope:
 ## 1. Learning Loop Entry Points
 
 1. Run entry:
-- `qa_specialist_runner.py`
+- `qa_agent_runner.py`
 - `spec_test_pilot/qa_specialist_agent.py:main`
 
 2. Core orchestrator:

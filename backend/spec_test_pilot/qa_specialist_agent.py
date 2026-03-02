@@ -1245,7 +1245,7 @@ class QASpecialistAgent:
         self, spec: Dict[str, Any], scenarios: List[TestScenario]
     ) -> List[ScenarioExecutionResult]:
         # Imported lazily so this module can be used without server startup paths.
-        from agent_lightning_server import DynamicMockServer
+        from dynamic_mock_server import DynamicMockServer
 
         spec_copy = self.output_dir / "openapi_under_test.yaml"
         spec_copy.write_text(yaml.safe_dump(spec, sort_keys=False), encoding="utf-8")

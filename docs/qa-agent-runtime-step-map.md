@@ -9,7 +9,7 @@ This is a run-time map of the QA specialist pipeline, with each step showing:
 
 Primary runtime path covered here:
 
-1. `qa_specialist_runner.py`
+1. `qa_agent_runner.py`
 2. `spec_test_pilot/qa_specialist_agent.py`
 3. `spec_test_pilot/adaptive_policy.py`
 4. `spec_test_pilot/agent_lightning_v2.py`
@@ -45,7 +45,7 @@ flowchart TD
 
 ```mermaid
 sequenceDiagram
-    participant CLI as qa_specialist_runner.py
+    participant CLI as qa_agent_runner.py
     participant QA as QASpecialistAgent
     participant GAM as GAMMemorySystem
     participant POL as AdaptiveScenarioPolicy
@@ -404,6 +404,6 @@ jq '.run_count, .adaptive_policy.feature_dim, (.scenario_stats | length), (.scen
 
 ## 7. Known Separation: Current vs Official Path
 
-1. `qa_specialist_runner.py` uses `agent_lightning_v2.py` runtime.
-2. `official_agent_lightning_runner.py` uses `spec_test_pilot/agent_lightning_official.py` (official package adapter).
+1. `qa_agent_runner.py` uses `agent_lightning_v2.py` runtime.
+2. `qa_official_lightning_runner.py` uses `spec_test_pilot/agent_lightning_official.py` (official package adapter).
 3. They are separate execution paths; this document maps the QA production path.

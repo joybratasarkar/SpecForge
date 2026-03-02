@@ -13,13 +13,13 @@ This README reflects the current code paths and verified runtime behavior as of 
 
 ## Current Runtime Modes
 
-1. Production QA pipeline (used by `backend/qa_specialist_runner.py`):
+1. Production QA pipeline (used by `backend/qa_agent_runner.py`):
 - `backend/spec_test_pilot/qa_specialist_agent.py`
 - `backend/spec_test_pilot/agent_lightning_v2.py`
 - `backend/spec_test_pilot/adaptive_policy.py`
 
 2. Official Agent Lightning package integration (separate runner):
-- `backend/official_agent_lightning_runner.py`
+- `backend/qa_official_lightning_runner.py`
 - `backend/spec_test_pilot/agent_lightning_official.py`
 
 ## Quick Start
@@ -176,7 +176,7 @@ Each run writes:
 
 ## Official Runner Status
 
-`official_agent_lightning_runner.py` currently fails in this local environment because APO extras are not installed in the active venv (`poml` missing).
+`qa_official_lightning_runner.py` currently fails in this local environment because APO extras are not installed in the active venv (`poml` missing).
 
 Expected fix:
 

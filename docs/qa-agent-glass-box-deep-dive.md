@@ -10,22 +10,22 @@ It answers:
 4. What is persisted across restarts.
 5. Why RL may improve slowly or non-monotonically.
 
-Scope: current runtime path used by `qa_specialist_runner.py` and `run_qa_domain.sh`.
+Scope: current runtime path used by `qa_agent_runner.py` and `run_qa_domain.sh`.
 
 ## 1. Runtime Boundary
 
 Primary execution path:
 
-1. `qa_specialist_runner.py` -> `spec_test_pilot/qa_specialist_agent.py`
+1. `qa_agent_runner.py` -> `spec_test_pilot/qa_specialist_agent.py`
 2. `spec_test_pilot/multi_language_tester.py`
 3. `spec_test_pilot/adaptive_policy.py`
-4. `agent_lightning_server.py`
+4. `dynamic_mock_server.py`
 5. `spec_test_pilot/agent_lightning_v2.py`
 6. `spec_test_pilot/memory/gam.py`
 
 Customer orchestration wrappers:
 
-1. FastAPI backend: `qa_customer_ui.py`
+1. FastAPI backend: `qa_customer_api.py`
 2. Shell orchestrator: `run_qa_domain.sh`
 3. Next.js customer UI: `customer-ui-next/`
 
@@ -47,7 +47,7 @@ Important: scenario generation is not RL-generated today. RL influences scenario
 
 ```mermaid
 flowchart TD
-  A[run_qa_domain.sh or qa_customer_ui.py] --> B[qa_specialist_runner.py]
+  A[run_qa_domain.sh or qa_customer_api.py] --> B[qa_agent_runner.py]
   B --> C[QASpecialistAgent.run]
   C --> D[Load OpenAPI + auth map]
   D --> E[GAM research context]
@@ -70,7 +70,7 @@ flowchart TD
 Code:
 
 1. `run_qa_domain.sh`
-2. `qa_customer_ui.py` (`_run_job`)
+2. `qa_customer_api.py` (`_run_job`)
 
 Input:
 
@@ -83,7 +83,7 @@ Input:
 
 Output:
 
-1. Command line for `qa_specialist_runner.py`.
+1. Command line for `qa_agent_runner.py`.
 
 Persistence:
 
@@ -531,6 +531,6 @@ Current customer QA runtime uses:
 Separate official package path exists in:
 
 1. `spec_test_pilot/agent_lightning_official.py`
-2. `official_agent_lightning_runner.py`
+2. `qa_official_lightning_runner.py`
 
 Both can coexist. They are different execution/training pipelines today.

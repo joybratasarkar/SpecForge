@@ -5,19 +5,19 @@ This document lists the current working file layout and which files are used at 
 ## 1. Runtime Entry Points
 
 1. QA specialist pipeline:
-- `backend/qa_specialist_runner.py`
+- `backend/qa_agent_runner.py`
 - calls `backend/spec_test_pilot/qa_specialist_agent.py:main`
 
 2. Domain convenience runner:
 - `backend/run_qa_domain.sh`
-- generates preset OpenAPI specs and runs `backend/qa_specialist_runner.py`
+- generates preset OpenAPI specs and runs `backend/qa_agent_runner.py`
 
 3. Official Agent Lightning package runner:
-- `backend/official_agent_lightning_runner.py`
+- `backend/qa_official_lightning_runner.py`
 - uses `backend/spec_test_pilot/agent_lightning_official.py`
 
 4. Customer web UI runner:
-- `backend/qa_customer_ui.py`
+- `backend/qa_customer_api.py`
 - FastAPI UI for multi-domain click-to-run execution and report viewing
 
 5. Next.js customer web UI:
@@ -39,7 +39,7 @@ This document lists the current working file layout and which files are used at 
 3. `backend/spec_test_pilot/multi_language_tester.py`
 - scenario generation + test artifact generation
 
-4. `backend/agent_lightning_server.py`
+4. `backend/dynamic_mock_server.py`
 - dynamic mock API server from OpenAPI
 
 ## 2.2 RL components
@@ -52,7 +52,7 @@ This document lists the current working file layout and which files are used at 
 2. `backend/spec_test_pilot/agent_lightning_official.py`
 - official package adapter layer
 - uses `agentlightning` Trainer/APO APIs
-- used by `official_agent_lightning_runner.py`
+- used by `qa_official_lightning_runner.py`
 
 ## 3. Output Artifacts (Per Run)
 
@@ -81,4 +81,4 @@ Each QA run output directory contains:
 ## 5. Notes
 
 1. Historical root-level markdown files were consolidated into `docs/`.
-2. The QA production path and official package path are both present, but only the QA path is used by `backend/qa_specialist_runner.py`.
+2. The QA production path and official package path are both present, but only the QA path is used by `backend/qa_agent_runner.py`.

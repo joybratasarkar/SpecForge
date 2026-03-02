@@ -820,4 +820,4 @@ def get_generated_test_script(job_id: str, domain: str, kind: str):
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("qa_customer_ui:app", host="127.0.0.1", port=8787, reload=False)
+    uvicorn.run("qa_customer_api:app", host="127.0.0.1", port=8787, reload=False)

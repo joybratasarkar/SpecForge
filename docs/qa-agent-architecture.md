@@ -7,7 +7,7 @@ This document describes how the current codebase executes the QA agent and where
 The runtime is a single orchestrated pipeline inside `QASpecialistAgent.run()`.
 
 ```text
-CLI (qa_specialist_runner.py)
+CLI (qa_agent_runner.py)
   -> QASpecialistAgent.run()
       -> OpenAPI load + auth map
       -> GAM session + research
@@ -24,7 +24,7 @@ CLI (qa_specialist_runner.py)
 ## 2. Main Components
 
 1. Control entrypoint:
-- `qa_specialist_runner.py`
+- `qa_agent_runner.py`
 - delegates to `spec_test_pilot/qa_specialist_agent.py:main`
 
 2. Runtime orchestrator:
@@ -38,7 +38,7 @@ CLI (qa_specialist_runner.py)
 - with `ObservabilityCollector`, `CreditAssignmentModule`, `LightningRLAlgorithm`
 
 5. Isolated execution backend:
-- `agent_lightning_server.py:DynamicMockServer`
+- `dynamic_mock_server.py:DynamicMockServer`
 - used via FastAPI `TestClient`
 
 ## 3. Runtime Sequence With Code Mapping
@@ -114,9 +114,9 @@ This sequence was verified across `ecommerce`, `healthcare`, `logistics`, and `h
 
 ## 6. Architecture Clarification: "Official" vs "Current"
 
-1. Current production path (`qa_specialist_runner.py`) uses `agent_lightning_v2.py`.
-2. Official package path (`official_agent_lightning_runner.py`) uses `spec_test_pilot/agent_lightning_official.py` and `agentlightning` package APIs.
-3. The two paths are separate; running `qa_specialist_runner.py` does not use the official package trainer.
+1. Current production path (`qa_agent_runner.py`) uses `agent_lightning_v2.py`.
+2. Official package path (`qa_official_lightning_runner.py`) uses `spec_test_pilot/agent_lightning_official.py` and `agentlightning` package APIs.
+3. The two paths are separate; running `qa_agent_runner.py` does not use the official package trainer.
 
 ## 7. Verified Multi-Domain Outcomes (March 2, 2026)
 

@@ -516,7 +516,7 @@ if [[ "${ACTION}" == "run" || "${ACTION}" == "both" ]]; then
   fi
 
   cmd=(
-    "${PYTHON_BIN}" qa_specialist_runner.py
+    "${PYTHON_BIN}" qa_agent_runner.py
     --spec "${SPEC_PATH}"
     --tenant-id "${TENANT_ID}"
     --base-url "${BASE_URL}"
@@ -548,7 +548,7 @@ if [[ "${ACTION}" == "run" || "${ACTION}" == "both" ]]; then
 
     echo "[VERIFY] Running automatic persistence check pass..."
     verify_cmd=(
-      "${PYTHON_BIN}" qa_specialist_runner.py
+      "${PYTHON_BIN}" qa_agent_runner.py
       --spec "${SPEC_PATH}"
       --tenant-id "${TENANT_ID}"
       --base-url "${BASE_URL}"
