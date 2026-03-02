@@ -28,7 +28,16 @@ async function loadGeneratedTestsFromReport(reportJsonPath) {
 
 function isPathWithin(parentPath, childPath) {
   const rel = path.relative(parentPath, childPath);
-  return rel && !rel.startsWith('..') && !path.isAbsolute(rel);
+  return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+}
+
+async function resolveComparablePath(rawPath) {
+  const resolved = path.resolve(rawPath);
+  try {
+    return await fs.realpath(resolved);
+  } catch {
+    return resolved;
+  }
 }
 
 export async function GET(_request, { params }) {
@@ -42,13 +51,13 @@ export async function GET(_request, { params }) {
     return Response.json({ error: 'domain result not found' }, { status: 404 });
   }
 
-  const outputDir = path.resolve(String(result.outputDir || ''));
+  const outputDir = await resolveComparablePath(String(result.outputDir || ''));
   const generated = await loadGeneratedTestsFromReport(result.reportJsonPath);
   const items = [];
 
   for (const kind of Object.keys(generated).sort()) {
     const filePathRaw = generated[kind];
-    const resolved = path.resolve(filePathRaw);
+    const resolved = await resolveComparablePath(filePathRaw);
     const safeToRead = isPathWithin(outputDir, resolved);
     let exists = false;
     let sizeBytes = null;

@@ -27,6 +27,12 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 APP_TITLE = "SpecTestPilot Customer QA UI"
 SUPPORTED_DOMAINS = ["ecommerce", "healthcare", "logistics", "hr"]
+SUPPORTED_SCRIPT_KINDS = [
+    "python_pytest",
+    "javascript_jest",
+    "curl_script",
+    "java_restassured",
+]
 REPO_ROOT = Path(__file__).resolve().parent
 JOB_ROOT = Path("/tmp/qa_ui_runs")
 CHECKPOINT_ROOT = Path("/tmp/qa_ui_checkpoints")
@@ -62,6 +68,7 @@ class RunRequest(BaseModel):
     domains: List[str] = Field(default_factory=lambda: ["ecommerce"])
     tenant_id: str = Field(default="customer_default", alias="tenantId")
     prompt: Optional[str] = None
+    script_kind: str = Field(default="python_pytest", alias="scriptKind")
     max_scenarios: int = Field(default=16, alias="maxScenarios")
     pass_threshold: float = Field(default=0.70, alias="passThreshold")
     base_url: str = Field(default="http://localhost:8000", alias="baseUrl")
@@ -88,6 +95,15 @@ class RunRequest(BaseModel):
         if value > 500:
             return 500
         return value
+
+    @field_validator("script_kind")
+    @classmethod
+    def validate_script_kind(cls, value: str) -> str:
+        normalized = str(value).strip().lower().replace("-", "_")
+        if normalized not in SUPPORTED_SCRIPT_KINDS:
+            allowed = ", ".join(SUPPORTED_SCRIPT_KINDS)
+            raise ValueError(f"Unsupported script kind: {value}. Allowed: {allowed}")
+        return normalized
 
     @field_validator("pass_threshold")
     @classmethod
@@ -129,6 +145,7 @@ def _load_report_artifacts(report_json_path: Path) -> Tuple[Dict[str, Any], Dict
         "failed_scenarios": summary.get("failed_scenarios"),
         "pass_rate": summary.get("pass_rate"),
         "meets_quality_gate": summary.get("meets_quality_gate"),
+        "script_kind": payload.get("metadata", {}).get("script_kind"),
         "rl_training_steps": training_stats.get("rl_training_steps"),
         "rl_buffer_size": training_stats.get("rl_buffer_size"),
         "selection_algorithm": payload.get("selection_policy", {}).get("algorithm"),
@@ -180,17 +197,23 @@ def _resolve_generated_tests(result: Dict[str, Any]) -> Dict[str, str]:
     }
 
 
+def _canonical_path(path_value: str | Path) -> Path:
+    # Normalize symlinked tmp paths (/tmp vs /private/tmp) for safe path checks.
+    expanded = os.path.expanduser(str(path_value))
+    return Path(os.path.realpath(expanded))
+
+
 def _resolve_safe_generated_script_path(result: Dict[str, Any], kind: str) -> Path:
     generated = _resolve_generated_tests(result)
     script_path_raw = generated.get(kind)
     if not script_path_raw:
         raise HTTPException(status_code=404, detail=f"generated test script kind not found: {kind}")
 
-    script_path = Path(script_path_raw).resolve()
+    script_path = _canonical_path(script_path_raw)
     output_dir_raw = str(result.get("output_dir", "")).strip()
     if not output_dir_raw:
         raise HTTPException(status_code=500, detail="missing output directory for this run result")
-    output_dir = Path(output_dir_raw).resolve()
+    output_dir = _canonical_path(output_dir_raw)
     if not script_path.is_relative_to(output_dir):
         raise HTTPException(status_code=400, detail="generated script path is outside output directory")
     if not script_path.exists():
@@ -245,6 +268,8 @@ def _run_job(job_id: str) -> None:
             str(req["max_scenarios"]),
             "--pass-threshold",
             str(req["pass_threshold"]),
+            "--script-kind",
+            req["script_kind"],
             "--rl-checkpoint",
             str(checkpoint),
         ]
@@ -290,6 +315,7 @@ def _run_job(job_id: str) -> None:
             job["results"][domain] = {
                 "domain": domain,
                 "return_code": return_code,
+                "script_kind": req["script_kind"],
                 "output_dir": str(output_dir),
                 "checkpoint": str(checkpoint),
                 "report_json": str(report_json),
@@ -370,7 +396,7 @@ def index() -> str:
     }
     .field { margin-bottom: 10px; }
     label { display: block; font-size: 12px; margin-bottom: 4px; color: var(--muted); }
-    input[type=text], input[type=number], textarea {
+    input[type=text], input[type=number], select, textarea {
       width: 100%;
       border: 1px solid var(--line);
       border-radius: 8px;
@@ -468,6 +494,15 @@ def index() -> str:
         <input id=\"tenant\" type=\"text\" value=\"customer_default\" />
       </div>
       <div class=\"field\">
+        <label>Script Language</label>
+        <select id=\"scriptKind\">
+          <option value=\"python_pytest\" selected>Python / Pytest</option>
+          <option value=\"javascript_jest\">JavaScript / Jest</option>
+          <option value=\"curl_script\">cURL Script</option>
+          <option value=\"java_restassured\">Java / RestAssured</option>
+        </select>
+      </div>
+      <div class=\"field\">
         <label>Max Scenarios</label>
         <input id=\"max\" type=\"number\" value=\"16\" min=\"1\" max=\"500\" />
       </div>
@@ -548,6 +583,7 @@ def index() -> str:
       const body = {
         domains,
         tenant_id: document.getElementById('tenant').value.trim() || 'customer_default',
+        script_kind: document.getElementById('scriptKind').value || 'python_pytest',
         prompt: document.getElementById('prompt').value.trim() || null,
         max_scenarios: Number(document.getElementById('max').value || 16),
         pass_threshold: Number(document.getElementById('threshold').value || 0.7),
@@ -784,11 +820,11 @@ def list_generated_tests(job_id: str, domain: str) -> Dict[str, Any]:
     generated = _resolve_generated_tests(result)
 
     output_dir_raw = str(result.get("output_dir", "")).strip()
-    output_dir = Path(output_dir_raw).resolve() if output_dir_raw else None
+    output_dir = _canonical_path(output_dir_raw) if output_dir_raw else None
     items: List[Dict[str, Any]] = []
     for kind in sorted(generated.keys()):
         raw_path = generated[kind]
-        resolved = Path(raw_path).resolve()
+        resolved = _canonical_path(raw_path)
         is_within_output = bool(output_dir and resolved.is_relative_to(output_dir))
         exists = resolved.exists()
         size_bytes = resolved.stat().st_size if exists else None

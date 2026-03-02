@@ -1,5 +1,11 @@
 const MAX_LOG_LINES = 7000;
 const STORE_KEY = '__QA_UI_NEXT_STORE__';
+const SUPPORTED_SCRIPT_KINDS = new Set([
+  'python_pytest',
+  'javascript_jest',
+  'curl_script',
+  'java_restassured'
+]);
 
 function getStore() {
   if (!globalThis[STORE_KEY]) {
@@ -16,6 +22,11 @@ function sanitizeToken(value, fallback = 'default') {
   return token || fallback;
 }
 
+function normalizeScriptKind(value) {
+  const token = sanitizeToken(value, 'python_pytest');
+  return SUPPORTED_SCRIPT_KINDS.has(token) ? token : 'python_pytest';
+}
+
 export function normalizeRequest(input = {}) {
   const rawDomains = Array.isArray(input.domains) ? input.domains : ['ecommerce'];
   const domains = [...new Set(rawDomains.map((d) => sanitizeToken(d)).filter(Boolean))].filter((d) =>
@@ -25,6 +36,7 @@ export function normalizeRequest(input = {}) {
   return {
     domains: domains.length ? domains : ['ecommerce'],
     tenantId: sanitizeToken(input.tenantId ?? input.tenant_id ?? 'customer_default'),
+    scriptKind: normalizeScriptKind(input.scriptKind ?? input.script_kind ?? 'python_pytest'),
     prompt: typeof input.prompt === 'string' && input.prompt.trim() ? input.prompt.trim() : null,
     maxScenarios: Math.min(500, Math.max(1, Number(input.maxScenarios ?? input.max_scenarios ?? 16) || 16)),
     passThreshold: Math.min(1, Math.max(0, Number(input.passThreshold ?? input.pass_threshold ?? 0.7) || 0.7)),
@@ -73,7 +85,8 @@ export function listJobs() {
     startedAt: job.startedAt,
     completedAt: job.completedAt,
     currentDomain: job.currentDomain,
-    domains: job.request.domains
+    domains: job.request.domains,
+    scriptKind: job.request.scriptKind
   }));
 }
 

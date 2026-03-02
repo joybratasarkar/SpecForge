@@ -17,6 +17,7 @@ Options:
   --prompt <text>           QA prompt override
   --max-scenarios <n>       Max scenarios to execute (default: 16)
   --pass-threshold <float>  Quality gate threshold (default: 0.70)
+  --script-kind <kind>      One generated script kind: python_pytest|javascript_jest|curl_script|java_restassured (default: python_pytest)
   --base-url <url>          Base URL for generated tests (default: http://localhost:8000)
   --rl-checkpoint <path>    Agent Lightning checkpoint file path (default: /tmp/agent_lightning_<domain>.pt)
   --customer-mode           Customer UX mode: persistent workspace/checkpoint under ~/.spec_test_pilot
@@ -49,6 +50,7 @@ OUTPUT_DIR=""
 PROMPT="Generate comprehensive QA tests for authentication, validation, error handling, and boundary scenarios."
 MAX_SCENARIOS="16"
 PASS_THRESHOLD="0.70"
+SCRIPT_KIND="python_pytest"
 BASE_URL="http://localhost:8000"
 RL_CHECKPOINT=""
 CUSTOMER_MODE="0"
@@ -88,6 +90,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --pass-threshold)
       PASS_THRESHOLD="${2:-}"
+      shift 2
+      ;;
+    --script-kind)
+      SCRIPT_KIND="${2:-}"
       shift 2
       ;;
     --base-url)
@@ -509,6 +515,7 @@ if [[ "${ACTION}" == "run" || "${ACTION}" == "both" ]]; then
   echo "  tenant_id:     ${TENANT_ID}"
   echo "  output_dir:    ${OUTPUT_DIR}"
   echo "  max_scenarios: ${MAX_SCENARIOS}"
+  echo "  script_kind:   ${SCRIPT_KIND}"
   echo "  rl_checkpoint: ${RL_CHECKPOINT}"
   if [[ "${CUSTOMER_MODE}" == "1" ]]; then
     echo "  customer_mode: enabled"
@@ -524,6 +531,7 @@ if [[ "${ACTION}" == "run" || "${ACTION}" == "both" ]]; then
     --prompt "${PROMPT}"
     --max-scenarios "${MAX_SCENARIOS}"
     --pass-threshold "${PASS_THRESHOLD}"
+    --script-kind "${SCRIPT_KIND}"
   )
   if [[ -n "${RL_CHECKPOINT}" ]]; then
     cmd+=(--rl-checkpoint "${RL_CHECKPOINT}")
@@ -556,6 +564,7 @@ if [[ "${ACTION}" == "run" || "${ACTION}" == "both" ]]; then
       --prompt "${PROMPT}"
       --max-scenarios "${MAX_SCENARIOS}"
       --pass-threshold "${PASS_THRESHOLD}"
+      --script-kind "${SCRIPT_KIND}"
     )
     if [[ -n "${RL_CHECKPOINT}" ]]; then
       verify_cmd+=(--rl-checkpoint "${RL_CHECKPOINT}")

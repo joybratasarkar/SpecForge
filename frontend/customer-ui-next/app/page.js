@@ -22,7 +22,7 @@ const FLOW_STEPS = [
     id: 'request_accepted',
     name: '1) Request Accepted',
     marker: '[RUN] QA specialist agent',
-    input: 'domains, tenant, baseUrl, thresholds',
+    input: 'domains, tenant, baseUrl, thresholds, script kind',
     output: 'job_id and queued execution'
   },
   {
@@ -66,7 +66,7 @@ const CUSTOMER_APIS = [
     method: 'POST',
     path: '/api/jobs',
     purpose: 'Start one multi-domain agent run',
-    body: '{ domains[], tenantId, maxScenarios, passThreshold, verifyPersistence, ... }'
+    body: '{ domains[], tenantId, scriptKind, maxScenarios, passThreshold, verifyPersistence, ... }'
   },
   {
     method: 'GET',
@@ -114,6 +114,7 @@ const SCRIPT_KIND_LABELS = {
   curl_script: 'cURL Script',
   java_restassured: 'Java / RestAssured'
 };
+const SCRIPT_KINDS = ['python_pytest', 'javascript_jest', 'curl_script', 'java_restassured'];
 
 function getField(obj, keys, fallback = null) {
   if (!obj) {
@@ -138,6 +139,20 @@ function toPct(value) {
 function toNumberOrNull(value) {
   const n = Number(value);
   return Number.isFinite(n) ? n : null;
+}
+
+function formatBytes(value) {
+  const size = Number(value);
+  if (!Number.isFinite(size) || size < 0) {
+    return 'n/a';
+  }
+  if (size < 1024) {
+    return `${size} B`;
+  }
+  if (size < 1024 * 1024) {
+    return `${(size / 1024).toFixed(1)} KB`;
+  }
+  return `${(size / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 function normalizeGeneratedTestItems(input) {
@@ -165,9 +180,156 @@ function normalizeGeneratedTestItems(input) {
   return [];
 }
 
+function findLastLogMatch(lines, regex) {
+  for (let idx = lines.length - 1; idx >= 0; idx -= 1) {
+    const line = String(lines[idx] || '');
+    const match = line.match(regex);
+    if (match) {
+      return match;
+    }
+  }
+  return null;
+}
+
+function toJsonString(payload) {
+  try {
+    return JSON.stringify(payload, null, 2);
+  } catch {
+    return String(payload);
+  }
+}
+
+function parsePythonScriptInsights(text) {
+  const lines = String(text || '').split(/\r?\n/).filter((line) => line.trim().length > 0);
+  const imports = [];
+  const importRegex = /^\s*import\s+([a-zA-Z_][a-zA-Z0-9_]*)/gm;
+  for (const match of text.matchAll(importRegex)) {
+    imports.push(match[1]);
+  }
+
+  const testNames = [];
+  const testRegex = /^\s*def\s+(test_[a-zA-Z0-9_]+)\s*\(/gm;
+  for (const match of text.matchAll(testRegex)) {
+    testNames.push(match[1]);
+  }
+
+  const endpointPaths = [];
+  const endpointRegex = /BASE_URL\s*\+\s*"([^"]+)"/g;
+  for (const match of text.matchAll(endpointRegex)) {
+    endpointPaths.push(match[1]);
+  }
+
+  const placeholders = endpointPaths.filter((path) => /\{[^}]+\}/.test(path));
+  const placeholderNames = [];
+  for (const path of placeholders) {
+    const tokenMatch = path.match(/\{([^}]+)\}/g) || [];
+    for (const token of tokenMatch) {
+      placeholderNames.push(token);
+    }
+  }
+
+  const methodCounts = { get: 0, post: 0, put: 0, patch: 0, delete: 0 };
+  const methodRegex = /requests\.(get|post|put|patch|delete)\(/g;
+  for (const match of text.matchAll(methodRegex)) {
+    const key = String(match[1] || '').toLowerCase();
+    if (Object.prototype.hasOwnProperty.call(methodCounts, key)) {
+      methodCounts[key] += 1;
+    }
+  }
+  const requestCount = Object.values(methodCounts).reduce((sum, value) => sum + value, 0);
+
+  const statusCodes = [];
+  const statusRegex = /assert\s+response\.status_code\s*==\s*(\d{3})/g;
+  for (const match of text.matchAll(statusRegex)) {
+    const code = Number(match[1]);
+    if (Number.isFinite(code)) {
+      statusCodes.push(code);
+    }
+  }
+  const statusBuckets = { success_2xx: 0, client_4xx: 0, server_5xx: 0, other: 0 };
+  for (const code of statusCodes) {
+    if (code >= 200 && code < 300) {
+      statusBuckets.success_2xx += 1;
+    } else if (code >= 400 && code < 500) {
+      statusBuckets.client_4xx += 1;
+    } else if (code >= 500 && code < 600) {
+      statusBuckets.server_5xx += 1;
+    } else {
+      statusBuckets.other += 1;
+    }
+  }
+
+  let focus = 'Mixed coverage.';
+  if (statusBuckets.client_4xx > 0 && statusBuckets.success_2xx === 0 && statusBuckets.server_5xx === 0) {
+    focus = 'Negative testing focused (auth, validation, and error handling).';
+  } else if (statusBuckets.success_2xx > 0 && statusBuckets.client_4xx === 0 && statusBuckets.server_5xx === 0) {
+    focus = 'Happy-path focused.';
+  } else if (statusBuckets.success_2xx > 0 && statusBuckets.client_4xx > 0) {
+    focus = 'Mixed happy-path + negative testing.';
+  }
+
+  const warnings = [];
+  if (placeholders.length > 0) {
+    warnings.push(
+      `Path template placeholders detected (${placeholders.length}): ${[...new Set(placeholderNames)].join(', ')}`
+    );
+  }
+  if (imports.includes('pytest') && !/\bpytest\./.test(text) && !/@pytest\b/.test(text)) {
+    warnings.push("`import pytest` appears unused in this script.");
+  }
+  if (imports.includes('json') && !/\bjson\./.test(text)) {
+    warnings.push("`import json` appears unused in this script.");
+  }
+  if (statusBuckets.success_2xx === 0 && statusBuckets.client_4xx > 0) {
+    warnings.push('No happy-path 2xx assertions found in current selected script.');
+  }
+
+  return {
+    language: 'python_pytest',
+    lineCount: lines.length,
+    testCount: testNames.length,
+    requestCount,
+    endpointCount: endpointPaths.length,
+    methodCounts,
+    statusBuckets,
+    focus,
+    warnings,
+    sampleEndpoints: endpointPaths.slice(0, 4)
+  };
+}
+
+function parseGeneratedScriptInsights(kind, text) {
+  const raw = String(text || '').trim();
+  if (!raw || raw.startsWith('Select a generated test script')) {
+    return null;
+  }
+  if (kind === 'python_pytest') {
+    return parsePythonScriptInsights(raw);
+  }
+
+  const lines = raw.split(/\r?\n/).filter((line) => line.trim().length > 0);
+  const genericWarnings = [];
+  if (/\{[^}]+\}/.test(raw)) {
+    genericWarnings.push('Path template placeholders detected (example: {id}).');
+  }
+  return {
+    language: kind || 'unknown',
+    lineCount: lines.length,
+    testCount: 0,
+    requestCount: 0,
+    endpointCount: 0,
+    methodCounts: {},
+    statusBuckets: {},
+    focus: 'Preview this script content directly below.',
+    warnings: genericWarnings,
+    sampleEndpoints: []
+  };
+}
+
 export default function HomePage() {
   const [domains, setDomains] = useState(['ecommerce']);
   const [tenantId, setTenantId] = useState('customer_default');
+  const [runScriptKind, setRunScriptKind] = useState('python_pytest');
   const [prompt, setPrompt] = useState('');
   const [maxScenarios, setMaxScenarios] = useState(16);
   const [passThreshold, setPassThreshold] = useState(0.7);
@@ -185,6 +347,9 @@ export default function HomePage() {
   const [scenarioSearch, setScenarioSearch] = useState('');
   const [generatedTests, setGeneratedTests] = useState([]);
   const [generatedTestsDomain, setGeneratedTestsDomain] = useState('');
+  const [generatedScriptContents, setGeneratedScriptContents] = useState({});
+  const [generatedScriptsLoading, setGeneratedScriptsLoading] = useState(false);
+  const [generatedScriptsLoadedDomain, setGeneratedScriptsLoadedDomain] = useState('');
   const [selectedScriptKind, setSelectedScriptKind] = useState('');
   const [scriptText, setScriptText] = useState('Select a generated test script to preview.');
   const [outputDomain, setOutputDomain] = useState('');
@@ -199,10 +364,16 @@ export default function HomePage() {
   const logText = useMemo(() => (job?.logs || []).join('\n'), [job]);
   const results = job?.results || {};
   const currentDomain = getField(job, ['currentDomain', 'current_domain'], 'none');
+  const jobScriptKind = String(
+    getField(job, ['request'], {})?.scriptKind ||
+      getField(job, ['request'], {})?.script_kind ||
+      runScriptKind
+  );
   const startedAt = getField(job, ['startedAt', 'started_at'], 'n/a');
   const completedAt = getField(job, ['completedAt', 'completed_at'], 'n/a');
   const jobId = getField(job, ['id'], '');
   const reportSummary = reportJson?.summary || null;
+  const generatedScriptExecution = reportJson?.generated_script_execution || {};
   const trainingStats = reportJson?.agent_lightning?.training_stats || {};
   const learningFeedback = reportJson?.learning?.feedback || {};
   const selectionPolicy = reportJson?.selection_policy || {};
@@ -251,6 +422,17 @@ export default function HomePage() {
     });
   }, [scenarioFilter, scenarioResults, scenarioSearch]);
 
+  const selectedScriptContent = useMemo(() => {
+    if (selectedScriptKind && Object.prototype.hasOwnProperty.call(generatedScriptContents, selectedScriptKind)) {
+      return String(generatedScriptContents[selectedScriptKind] || '');
+    }
+    return String(scriptText || '');
+  }, [generatedScriptContents, scriptText, selectedScriptKind]);
+
+  const selectedScriptInsights = useMemo(() => {
+    return parseGeneratedScriptInsights(selectedScriptKind, selectedScriptContent);
+  }, [selectedScriptContent, selectedScriptKind]);
+
   const reportSelectionSelected = toNumberOrNull(getField(selectionPolicy, ['selected_count', 'selectedCount'], null));
   const reportSelectionCandidates = toNumberOrNull(getField(selectionPolicy, ['candidate_count', 'candidateCount'], null));
   const summarySelectionSelected = resultSummaries
@@ -272,6 +454,149 @@ export default function HomePage() {
     .map((s) => toNumberOrNull(getField(s, ['rl_training_steps', 'rlTrainingSteps'], null)))
     .reduce((acc, value) => (value !== null && (acc === null || value > acc) ? value : acc), null);
   const rlStepValue = rlStepFromReport ?? rlStepFromSummary;
+  const selectedStateDomain = selectedReportDomain || outputDomain || resultDomains[0] || '';
+  const selectedDomainResult = selectedStateDomain ? results[selectedStateDomain] || null : null;
+  const selectedDomainSummary = selectedDomainResult?.summary || {};
+  const outputDirValue = getField(selectedDomainResult, ['outputDir', 'output_dir'], '');
+  const checkpointValue = getField(selectedDomainResult, ['checkpointPath', 'checkpoint'], '');
+  const reportJsonPathValue = getField(selectedDomainResult, ['reportJsonPath', 'report_json'], '');
+  const reportMdPathValue = getField(selectedDomainResult, ['reportMdPath', 'report_md'], '');
+  const openapiPathFromLog = findLastLogMatch(job?.logs || [], /OpenAPI spec written:\s*(.+)$/i)?.[1]?.trim() || '';
+  const commandFromLog = findLastLogMatch(job?.logs || [], /\$\s+bash\s+(.+)$/i)?.[1]?.trim() || '';
+  const reportJsonPathFromLog = findLastLogMatch(job?.logs || [], /JSON report:\s*(.+)$/i)?.[1]?.trim() || '';
+  const reportMdPathFromLog = findLastLogMatch(job?.logs || [], /MD report:\s*(.+)$/i)?.[1]?.trim() || '';
+
+  const stateTrace = useMemo(() => {
+    return [
+      {
+        id: 'api_request',
+        title: '1) API Request Payload',
+        ready: Boolean(job?.request),
+        payload: {
+          request: job?.request || null,
+          job_meta: {
+            id: jobId || null,
+            status: job?.status || null,
+            created_at: getField(job, ['createdAt', 'created_at'], null),
+            started_at: getField(job, ['startedAt', 'started_at'], null),
+            completed_at: getField(job, ['completedAt', 'completed_at'], null),
+            current_domain: currentDomain
+          }
+        }
+      },
+      {
+        id: 'domain_command',
+        title: '2) Domain Command + Runtime Paths',
+        ready: Boolean(commandFromLog || selectedDomainResult),
+        payload: {
+          selected_domain: selectedStateDomain || null,
+          command: commandFromLog || null,
+          script_kind_request: jobScriptKind || null,
+          script_kind_result:
+            getField(selectedDomainResult, ['scriptKind', 'script_kind'], null) ||
+            getField(selectedDomainSummary, ['scriptKind', 'script_kind'], null),
+          output_dir: outputDirValue || null,
+          checkpoint: checkpointValue || null,
+          return_code: getField(selectedDomainResult, ['exitCode', 'return_code'], null),
+          domain_summary: selectedDomainSummary
+        }
+      },
+      {
+        id: 'openapi_prepared',
+        title: '3) OpenAPI Prepared',
+        ready: Boolean(openapiPathFromLog || reportJson?.metadata),
+        payload: {
+          spec_path_from_log: openapiPathFromLog || null,
+          spec_path_from_report: reportJson?.metadata?.spec_path || null,
+          spec_title: reportJson?.metadata?.spec_title || null,
+          spec_version: reportJson?.metadata?.spec_version || null
+        }
+      },
+      {
+        id: 'scenario_selection',
+        title: '4) Scenario Selection Output',
+        ready: Boolean(reportJson?.selection_policy),
+        payload: reportJson?.selection_policy || null
+      },
+      {
+        id: 'generated_tests',
+        title: '5) Generated Test Scripts (API Output)',
+        ready: generatedTests.length > 0 || Boolean(reportJson?.generated_test_files),
+        payload: {
+          selected_domain: generatedTestsDomain || selectedStateDomain || null,
+          scripts_loading: generatedScriptsLoading,
+          scripts_loaded_domain: generatedScriptsLoadedDomain || null,
+          generated_test_files_report: reportJson?.generated_test_files || {},
+          generated_test_files_api: generatedTests,
+          generated_script_contents: generatedScriptContents,
+          generated_script_execution: generatedScriptExecution
+        }
+      },
+      {
+        id: 'scenario_execution',
+        title: '6) Executed Scenario Results',
+        ready: scenarioResults.length > 0,
+        payload: {
+          total: scenarioResults.length,
+          passed: passedScenarioCount,
+          failed: failedScenarioCount,
+          scenarios: scenarioResults
+        }
+      },
+      {
+        id: 'gam_research',
+        title: '7) GAM Deep Research State',
+        ready: Boolean(reportJson?.gam),
+        payload: reportJson?.gam || null
+      },
+      {
+        id: 'rl_training',
+        title: '8) RL Training State',
+        ready: Boolean(reportJson?.agent_lightning || reportJson?.learning),
+        payload: {
+          learning: reportJson?.learning || null,
+          agent_lightning: reportJson?.agent_lightning || null
+        }
+      },
+      {
+        id: 'final_reports',
+        title: '9) Final Report Paths + Payload',
+        ready: Boolean(reportJson || reportJsonPathValue || reportMdPathValue),
+        payload: {
+          report_files: reportJson?.report_files || null,
+          report_json_from_domain_result: reportJsonPathValue || null,
+          report_md_from_domain_result: reportMdPathValue || null,
+          report_json_from_log: reportJsonPathFromLog || null,
+          report_md_from_log: reportMdPathFromLog || null
+        }
+      }
+    ];
+  }, [
+    checkpointValue,
+    commandFromLog,
+    currentDomain,
+    failedScenarioCount,
+    generatedScriptContents,
+    generatedScriptsLoadedDomain,
+    generatedScriptsLoading,
+    generatedTests,
+    generatedTestsDomain,
+    job,
+    jobId,
+    openapiPathFromLog,
+    outputDirValue,
+    passedScenarioCount,
+    reportJson,
+    reportJsonPathFromLog,
+    reportJsonPathValue,
+    reportMdPathFromLog,
+    reportMdPathValue,
+    generatedScriptExecution,
+    scenarioResults,
+    selectedDomainResult,
+    selectedDomainSummary,
+    selectedStateDomain
+  ]);
 
   function isFlowStepDone(stepId) {
     if (stepId === 'request_accepted') {
@@ -401,6 +726,9 @@ export default function HomePage() {
     setSelectedReportFormat('json');
     setGeneratedTests([]);
     setGeneratedTestsDomain('');
+    setGeneratedScriptContents({});
+    setGeneratedScriptsLoadedDomain('');
+    setGeneratedScriptsLoading(false);
     setSelectedScriptKind('');
     setScriptText('Select a generated test script to preview.');
     autoLoadedJobRef.current = '';
@@ -408,6 +736,7 @@ export default function HomePage() {
     const body = {
       domains,
       tenantId,
+      scriptKind: runScriptKind,
       prompt: prompt.trim() || null,
       maxScenarios,
       passThreshold,
@@ -440,6 +769,39 @@ export default function HomePage() {
     connectRealtime(startedJobId);
   }
 
+  async function loadAllGeneratedScripts(domain, items) {
+    if (!job?.id || !domain) {
+      return;
+    }
+    setGeneratedScriptsLoading(true);
+    const next = {};
+    for (const item of items) {
+      const kind = String(item?.kind || '').trim();
+      if (!kind) {
+        continue;
+      }
+      if (item.exists === false || item.safe_to_read === false) {
+        next[kind] = '[unavailable] file is missing or blocked by safety check';
+        continue;
+      }
+      const reqUrl = API_URL(`/api/jobs/${job.id}/generated-tests/${domain}/${kind}`);
+      try {
+        const res = await fetch(reqUrl, { cache: 'no-store' });
+        if (!res.ok) {
+          const errText = await res.text();
+          next[kind] = `[error] failed to fetch script: ${errText}`;
+          continue;
+        }
+        next[kind] = await res.text();
+      } catch (error) {
+        next[kind] = `[error] failed to fetch script: ${String(error)}`;
+      }
+    }
+    setGeneratedScriptContents(next);
+    setGeneratedScriptsLoadedDomain(domain);
+    setGeneratedScriptsLoading(false);
+  }
+
   async function openReport(domain, format) {
     if (!job?.id) {
       return;
@@ -464,6 +826,9 @@ export default function HomePage() {
       const fromReport = normalizeGeneratedTestItems(payload?.generated_test_files);
       setGeneratedTests(fromReport);
       setGeneratedTestsDomain(domain);
+      setGeneratedScriptContents({});
+      setGeneratedScriptsLoadedDomain('');
+      setGeneratedScriptsLoading(false);
       setSelectedScriptKind('');
       setScriptText('Select a generated test script to preview.');
       await loadGeneratedTests(domain, fromReport);
@@ -483,6 +848,7 @@ export default function HomePage() {
         if (fallbackItems.length > 0) {
           setGeneratedTests(fallbackItems);
           setGeneratedTestsDomain(domain);
+          await loadAllGeneratedScripts(domain, fallbackItems);
         }
         return;
       }
@@ -490,10 +856,12 @@ export default function HomePage() {
       const items = normalizeGeneratedTestItems(getField(payload, ['generated_tests', 'generatedTests'], []));
       setGeneratedTests(items);
       setGeneratedTestsDomain(domain);
+      await loadAllGeneratedScripts(domain, items);
     } catch {
       if (fallbackItems.length > 0) {
         setGeneratedTests(fallbackItems);
         setGeneratedTestsDomain(domain);
+        await loadAllGeneratedScripts(domain, fallbackItems);
       }
     }
   }
@@ -503,6 +871,10 @@ export default function HomePage() {
       return;
     }
     setSelectedScriptKind(kind);
+    if (generatedScriptsLoadedDomain === domain && Object.prototype.hasOwnProperty.call(generatedScriptContents, kind)) {
+      setScriptText(generatedScriptContents[kind] || `Script ${kind} is empty.`);
+      return;
+    }
     const reqUrl = API_URL(`/api/jobs/${job.id}/generated-tests/${domain}/${kind}`);
     try {
       const res = await fetch(reqUrl, { cache: 'no-store' });
@@ -512,6 +884,8 @@ export default function HomePage() {
         return;
       }
       const raw = await res.text();
+      setGeneratedScriptContents((prev) => ({ ...prev, [kind]: raw }));
+      setGeneratedScriptsLoadedDomain(domain);
       setScriptText(raw || `Script ${kind} is empty.`);
     } catch (error) {
       setScriptText(`Failed to load script ${kind}: ${String(error)}`);
@@ -636,6 +1010,17 @@ export default function HomePage() {
           </div>
 
           <div className="field">
+            <label>Script Language</label>
+            <select value={runScriptKind} onChange={(e) => setRunScriptKind(e.target.value)}>
+              {SCRIPT_KINDS.map((kind) => (
+                <option key={kind} value={kind}>
+                  {SCRIPT_KIND_LABELS[kind] || kind}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div className="field">
             <label>Max Scenarios</label>
             <input
               type="number"
@@ -706,7 +1091,7 @@ export default function HomePage() {
             </div>
             <div className="meta">
               {job
-                ? `job=${jobId} | current_domain=${currentDomain} | started=${startedAt} | completed=${completedAt}`
+                ? `job=${jobId} | current_domain=${currentDomain} | script_kind=${jobScriptKind} | started=${startedAt} | completed=${completedAt}`
                 : 'No run started yet.'}
             </div>
             <div className="steps">
@@ -775,6 +1160,10 @@ export default function HomePage() {
                 const failedScenarios = getField(s, ['failedScenarios', 'failed_scenarios'], 'n/a');
                 const rlSteps = getField(s, ['rlTrainingSteps', 'rl_training_steps'], 'n/a');
                 const rlBuffer = getField(s, ['rlBufferSize', 'rl_buffer_size'], 'n/a');
+                const scriptKindValue =
+                  getField(result, ['scriptKind', 'script_kind'], null) ||
+                  getField(s, ['scriptKind', 'script_kind'], null) ||
+                  runScriptKind;
                 return (
                   <div className="result" key={domain}>
                     <h3>
@@ -787,6 +1176,8 @@ export default function HomePage() {
                       total={String(totalScenarios)} passed={String(passedScenarios)} failed={String(failedScenarios)}
                       <br />
                       rl_steps={String(rlSteps)} rl_buffer={String(rlBuffer)}
+                      <br />
+                      script_kind={String(scriptKindValue)}
                       <br />
                       return_code={String(code)}
                       <br />
@@ -801,76 +1192,210 @@ export default function HomePage() {
           </div>
 
           <div className="card">
-            <h2>Customer Output</h2>
-            <div className="small">
-              selected_domain={selectedDomainLabel}
-              <br />
-              output_flow=1_scripts {'->'} 2_cases_tested {'->'} 3_final_report
-            </div>
-            <div className="output-toolbar">
-              <select
-                value={outputDomain}
-                onChange={(e) => setOutputDomain(e.target.value)}
-                disabled={resultDomains.length === 0}
-              >
-                {resultDomains.length === 0 && <option value="">No domains yet</option>}
-                {resultDomains.map((domain) => (
-                  <option key={domain} value={domain}>
-                    {DOMAIN_LABELS[domain] || domain}
-                  </option>
+            <details className="advanced" open>
+              <summary>Customer Output (Click to Open/Close)</summary>
+              <div className="small">
+                selected_domain={selectedDomainLabel}
+                <br />
+                output_flow=1_scripts {'->'} 2_cases_tested {'->'} 3_final_report
+              </div>
+              <div className="output-toolbar">
+                <select
+                  value={outputDomain}
+                  onChange={(e) => setOutputDomain(e.target.value)}
+                  disabled={resultDomains.length === 0}
+                >
+                  {resultDomains.length === 0 && <option value="">No domains yet</option>}
+                  {resultDomains.map((domain) => (
+                    <option key={domain} value={domain}>
+                      {DOMAIN_LABELS[domain] || domain}
+                    </option>
+                  ))}
+                </select>
+                <button disabled={!outputDomain} onClick={() => openSelectedDomainOutput('json')}>
+                  Load Output
+                </button>
+                <button disabled={!outputDomain} onClick={() => openSelectedDomainOutput('md')}>
+                  Load Markdown
+                </button>
+                <button onClick={() => copyText('report', reportText)}>Copy Report Text</button>
+              </div>
+              {!selectedReportDomain && resultDomains.length > 0 && (
+                <button onClick={() => openReport(resultDomains[0], 'json')}>Load First Domain Output</button>
+              )}
+            </details>
+          </div>
+
+          <div className="card">
+            <details className="advanced" open>
+              <summary>State-by-State API Output (Glass Box) (Click to Open/Close)</summary>
+              <div className="small">
+                selected_domain={selectedStateDomain || 'none'} | states={stateTrace.length} | scripts_loading=
+                {String(generatedScriptsLoading)}
+              </div>
+              <div className="state-trace-list">
+                {stateTrace.map((state) => (
+                  <details key={state.id} className={`state-trace-item ${state.ready ? 'done' : ''}`} open={state.ready}>
+                    <summary>
+                      <span className="state-trace-title">{state.ready ? '✓' : '•'} {state.title}</span>
+                      <span className={`pill ${state.ready ? 'ok' : 'bad'}`}>{state.ready ? 'ready' : 'waiting'}</span>
+                    </summary>
+                    <pre>{toJsonString(state.payload)}</pre>
+                  </details>
                 ))}
-              </select>
-              <button disabled={!outputDomain} onClick={() => openSelectedDomainOutput('json')}>
-                Load Output
-              </button>
-              <button disabled={!outputDomain} onClick={() => openSelectedDomainOutput('md')}>
-                Load Markdown
-              </button>
-              <button onClick={() => copyText('report', reportText)}>Copy Report Text</button>
-            </div>
-            {!selectedReportDomain && resultDomains.length > 0 && (
-              <button onClick={() => openReport(resultDomains[0], 'json')}>Load First Domain Output</button>
-            )}
+              </div>
+            </details>
           </div>
 
           <div className="card">
             <h2>1) Test Scripts Generated By Agent</h2>
-            <div className="small">
-              selected_domain={generatedTestsDomain || 'none'} | scripts={generatedTests.length}
+            <div className="script-summary-grid">
+              <div className="script-summary-item">
+                <span>Selected Domain</span>
+                <strong>{generatedTestsDomain || 'none'}</strong>
+              </div>
+              <div className="script-summary-item">
+                <span>Scripts Returned</span>
+                <strong>{String(generatedTests.length)}</strong>
+              </div>
+              <div className="script-summary-item">
+                <span>Loading</span>
+                <strong>{generatedScriptsLoading ? 'yes' : 'no'}</strong>
+              </div>
+              <div className="script-summary-item">
+                <span>Execution Status</span>
+                <strong>{String(getField(generatedScriptExecution, ['status'], 'n/a'))}</strong>
+              </div>
+              <div className="script-summary-item">
+                <span>Executed Tests</span>
+                <strong>{String(getField(generatedScriptExecution, ['total_tests'], 'n/a'))}</strong>
+              </div>
+              <div className="script-summary-item">
+                <span>Passed / Failed</span>
+                <strong>
+                  {String(getField(generatedScriptExecution, ['passed_tests'], 'n/a'))} /{' '}
+                  {String(getField(generatedScriptExecution, ['failed_tests'], 'n/a'))}
+                </strong>
+              </div>
             </div>
             {generatedTests.length === 0 && (
-              <div className="small">Open customer output for a domain to view generated scripts.</div>
+              <div className="small">Load customer output for a domain to view generated scripts.</div>
             )}
             {generatedTests.length > 0 && (
-              <div className="script-list">
-                {generatedTests.map((item) => (
-                  <div className="script-item" key={`${generatedTestsDomain}-${item.kind}`}>
-                    <div className="script-head">
-                      <strong>{SCRIPT_KIND_LABELS[item.kind] || item.kind}</strong>
-                      <span className={`pill ${item.exists ? 'ok' : 'bad'}`}>
-                        {item.exists ? 'ready' : 'missing'}
-                      </span>
-                    </div>
-                    <div className="small">kind={item.kind}</div>
-                    <div className="small">path={item.path || 'n/a'}</div>
-                    <div className="small">
-                      size={item.size_bytes ?? 'n/a'} | safe_to_read={String(item.safe_to_read)}
-                    </div>
-                    <button
-                      disabled={!item.exists || !item.safe_to_read || !generatedTestsDomain}
-                      onClick={() => openGeneratedScript(generatedTestsDomain, item.kind)}
-                    >
-                      Preview Script
-                    </button>
-                  </div>
-                ))}
+              <div className="inline-actions">
+                <button
+                  onClick={() => loadGeneratedTests(generatedTestsDomain || selectedStateDomain, generatedTests)}
+                  disabled={generatedScriptsLoading || !(generatedTestsDomain || selectedStateDomain)}
+                >
+                  Reload Script Bundle From API
+                </button>
               </div>
             )}
-            <div className="small">selected_script={selectedScriptKind || 'none'}</div>
-            <div className="inline-actions">
-              <button onClick={() => copyText('script', scriptText)}>Copy Script</button>
+            {generatedTests.length > 0 && (
+              <div className="script-table-wrap">
+                <table className="script-table">
+                  <thead>
+                    <tr>
+                      <th>Language</th>
+                      <th>Kind</th>
+                      <th>Path</th>
+                      <th>Status</th>
+                      <th>Readable</th>
+                      <th>Size</th>
+                      <th>Action</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {generatedTests.map((item) => (
+                      <tr key={`${generatedTestsDomain}-${item.kind}`}>
+                        <td>{SCRIPT_KIND_LABELS[item.kind] || item.kind}</td>
+                        <td><code>{item.kind}</code></td>
+                        <td className="script-path-cell"><code>{item.path || 'n/a'}</code></td>
+                        <td>{item.exists ? 'ready' : 'missing'}</td>
+                        <td>{item.safe_to_read ? 'yes' : 'no'}</td>
+                        <td>{formatBytes(item.size_bytes)}</td>
+                        <td>
+                          <button
+                            disabled={!item.exists || !item.safe_to_read || !generatedTestsDomain}
+                            onClick={() => openGeneratedScript(generatedTestsDomain, item.kind)}
+                          >
+                            Preview
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+            {selectedScriptInsights && (
+              <div className="script-insight-panel">
+                <div className="script-insight-head">
+                  <h3>Script Explanation</h3>
+                  <span className="small">language={SCRIPT_KIND_LABELS[selectedScriptInsights.language] || selectedScriptInsights.language}</span>
+                </div>
+                <div className="script-summary-grid">
+                  <div className="script-summary-item">
+                    <span>Non-empty Lines</span>
+                    <strong>{String(selectedScriptInsights.lineCount)}</strong>
+                  </div>
+                  <div className="script-summary-item">
+                    <span>Test Functions</span>
+                    <strong>{String(selectedScriptInsights.testCount)}</strong>
+                  </div>
+                  <div className="script-summary-item">
+                    <span>HTTP Calls</span>
+                    <strong>{String(selectedScriptInsights.requestCount)}</strong>
+                  </div>
+                  <div className="script-summary-item">
+                    <span>Endpoint Mentions</span>
+                    <strong>{String(selectedScriptInsights.endpointCount)}</strong>
+                  </div>
+                  <div className="script-summary-item">
+                    <span>2xx / 4xx / 5xx</span>
+                    <strong>
+                      {String(selectedScriptInsights.statusBuckets.success_2xx || 0)} /{' '}
+                      {String(selectedScriptInsights.statusBuckets.client_4xx || 0)} /{' '}
+                      {String(selectedScriptInsights.statusBuckets.server_5xx || 0)}
+                    </strong>
+                  </div>
+                  <div className="script-summary-item">
+                    <span>Primary Focus</span>
+                    <strong>{selectedScriptInsights.focus}</strong>
+                  </div>
+                </div>
+                {Object.keys(selectedScriptInsights.methodCounts || {}).length > 0 && (
+                  <div className="small">
+                    methods: GET={String(selectedScriptInsights.methodCounts.get || 0)} POST=
+                    {String(selectedScriptInsights.methodCounts.post || 0)} PUT=
+                    {String(selectedScriptInsights.methodCounts.put || 0)} PATCH=
+                    {String(selectedScriptInsights.methodCounts.patch || 0)} DELETE=
+                    {String(selectedScriptInsights.methodCounts.delete || 0)}
+                  </div>
+                )}
+                {selectedScriptInsights.sampleEndpoints.length > 0 && (
+                  <div className="small script-endpoints">
+                    endpoint samples: {selectedScriptInsights.sampleEndpoints.join(' | ')}
+                  </div>
+                )}
+                {selectedScriptInsights.warnings.length > 0 && (
+                  <div className="script-warning-box">
+                    {selectedScriptInsights.warnings.map((warning) => (
+                      <div key={warning} className="small">
+                        ! {warning}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+            <div className="script-preview-head">
+              <div className="small">Selected Script: {selectedScriptKind || 'none'}</div>
+              <div className="inline-actions">
+                <button onClick={() => copyText('script', scriptText)}>Copy Script</button>
+              </div>
             </div>
-            <pre>{scriptText}</pre>
+            <pre className="script-preview">{scriptText}</pre>
           </div>
 
           <div className="card">

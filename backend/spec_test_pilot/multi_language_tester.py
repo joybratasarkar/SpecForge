@@ -7,6 +7,7 @@ Supports multiple programming languages and testing frameworks
 
 import json
 import os
+import re
 import subprocess
 import tempfile
 import time
@@ -824,6 +825,8 @@ class MultiLanguageTestGenerator:
         """Initialize with test scenarios."""
         self.scenarios = scenarios
         self.base_url = base_url
+        self._python_name_counts: Dict[str, int] = {}
+        self._java_name_counts: Dict[str, int] = {}
     
     def generate_python_tests(self) -> str:
         """Generate Python pytest tests."""
@@ -839,13 +842,14 @@ class TestAPI:
 '''.format(self.base_url)
         
         for scenario in self.scenarios:
-            code += self._generate_python_test_method(scenario)
+            method_name = self._python_method_name_for_scenario(scenario)
+            code += self._generate_python_test_method(scenario, method_name)
         
         return code
     
-    def _generate_python_test_method(self, scenario: TestScenario) -> str:
+    def _generate_python_test_method(self, scenario: TestScenario, method_name: str) -> str:
         """Generate a single Python test method."""
-        method_code = f'''    def {scenario.name}(self):
+        method_code = f'''    def {method_name}(self):
         """{scenario.description}"""
         url = BASE_URL + "{scenario.endpoint}"
         
@@ -892,6 +896,32 @@ class TestAPI:
         
         method_code += "\n"
         return method_code
+
+    def _sanitize_identifier(self, raw_name: str, prefix: str) -> str:
+        cleaned = re.sub(r"[^0-9a-zA-Z_]", "_", str(raw_name or ""))
+        cleaned = re.sub(r"_+", "_", cleaned).strip("_")
+        if not cleaned:
+            cleaned = prefix
+        if cleaned[0].isdigit():
+            cleaned = f"{prefix}_{cleaned}"
+        return cleaned
+
+    def _reserve_name(self, base: str, counter: Dict[str, int]) -> str:
+        count = int(counter.get(base, 0)) + 1
+        counter[base] = count
+        if count == 1:
+            return base
+        return f"{base}_{count}"
+
+    def _python_method_name_for_scenario(self, scenario: TestScenario) -> str:
+        base = self._sanitize_identifier(scenario.name, "test_case")
+        if not base.startswith("test_"):
+            base = f"test_{base}"
+        return self._reserve_name(base, self._python_name_counts)
+
+    def _java_method_name_for_scenario(self, scenario: TestScenario) -> str:
+        base = self._sanitize_identifier(str(scenario.name).replace("test_", ""), "case")
+        return self._reserve_name(base, self._java_name_counts)
     
     def generate_javascript_tests(self) -> str:
         """Generate JavaScript tests using Jest/Axios."""
@@ -990,7 +1020,7 @@ public class APITests {{
     
     def _generate_java_test_method(self, scenario: TestScenario) -> str:
         """Generate Java test method."""
-        method_name = scenario.name.replace("test_", "")
+        method_name = self._java_method_name_for_scenario(scenario)
         method_code = f'''    @Test
     public void {method_name}() {{
         given()

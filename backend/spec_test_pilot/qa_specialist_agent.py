@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import importlib.util
 import json
 import math
 import re
@@ -23,6 +24,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import parse_qsl, urlparse
 
 import yaml
 from fastapi.testclient import TestClient
@@ -56,6 +58,13 @@ DECISION_LEARNING_RATE = 0.20
 LEARNING_HISTORY_LIMIT = 200
 SCENARIO_STATS_LIMIT = 4000
 SELECTION_TRACE_LIMIT = 60
+SUPPORTED_SCRIPT_KINDS = {
+    "python_pytest",
+    "javascript_jest",
+    "curl_script",
+    "java_restassured",
+}
+DEFAULT_SCRIPT_KIND = "python_pytest"
 
 
 @dataclass
@@ -93,6 +102,68 @@ class ScenarioExecutionResult:
     response_excerpt: str = ""
 
 
+class _ScriptResponseProxy:
+    """Minimal requests.Response-like wrapper backed by TestClient responses."""
+
+    def __init__(self, response: Any):
+        self._response = response
+        self.status_code = int(getattr(response, "status_code", 0))
+        self.text = getattr(response, "text", "")
+        self.headers = getattr(response, "headers", {})
+
+    def json(self) -> Any:
+        return self._response.json()
+
+
+class _TestClientRequestsAdapter:
+    """Adapter exposing requests-style APIs over FastAPI TestClient."""
+
+    def __init__(self, client: TestClient):
+        self.client = client
+
+    def request(
+        self,
+        method: str,
+        url: str,
+        headers: Optional[Dict[str, str]] = None,
+        params: Optional[Dict[str, Any]] = None,
+        json: Optional[Dict[str, Any]] = None,
+        **_: Any,
+    ) -> _ScriptResponseProxy:
+        parsed = urlparse(str(url))
+        path = parsed.path or "/"
+
+        merged_params: Dict[str, Any] = {}
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+            merged_params[key] = value
+        if isinstance(params, dict):
+            merged_params.update(params)
+
+        response = self.client.request(
+            method=str(method).upper(),
+            url=path,
+            headers=headers or {},
+            params=merged_params or None,
+            json=json,
+        )
+        return _ScriptResponseProxy(response)
+
+    def get(self, url: str, **kwargs: Any) -> _ScriptResponseProxy:
+        return self.request("GET", url, **kwargs)
+
+    def post(self, url: str, **kwargs: Any) -> _ScriptResponseProxy:
+        return self.request("POST", url, **kwargs)
+
+    def put(self, url: str, **kwargs: Any) -> _ScriptResponseProxy:
+        return self.request("PUT", url, **kwargs)
+
+    def patch(self, url: str, **kwargs: Any) -> _ScriptResponseProxy:
+        return self.request("PATCH", url, **kwargs)
+
+    def delete(self, url: str, **kwargs: Any) -> _ScriptResponseProxy:
+        return self.request("DELETE", url, **kwargs)
+
+
 class QASpecialistAgent:
     """QA-focused orchestrator with isolation, GAM memory, and RL feedback."""
 
@@ -107,6 +178,7 @@ class QASpecialistAgent:
         pass_threshold: float = 0.70,
         rl_checkpoint_path: Optional[str] = None,
         learning_state_path: Optional[str] = None,
+        script_kind: str = DEFAULT_SCRIPT_KIND,
     ):
         self.spec_path = str(spec_path)
         self.nlp_prompt = nlp_prompt
@@ -114,6 +186,13 @@ class QASpecialistAgent:
         self.base_url = base_url.rstrip("/")
         self.max_scenarios = max(1, int(max_scenarios))
         self.pass_threshold = max(0.0, min(1.0, float(pass_threshold)))
+        normalized_script_kind = str(script_kind or DEFAULT_SCRIPT_KIND).strip().lower()
+        if normalized_script_kind not in SUPPORTED_SCRIPT_KINDS:
+            raise ValueError(
+                f"Unsupported --script-kind '{script_kind}'. "
+                + f"Supported: {', '.join(sorted(SUPPORTED_SCRIPT_KINDS))}"
+            )
+        self.script_kind = normalized_script_kind
 
         if output_dir:
             self.output_dir = Path(output_dir).resolve()
@@ -221,8 +300,10 @@ class QASpecialistAgent:
         all_scenarios = simulator.think_like_tester(effective_prompt)
         scenarios = self._select_scenarios_with_learning(all_scenarios)
         scenarios, repair_summary = self._apply_scenario_repairs(spec, scenarios)
+        scenarios = self._prepare_scenarios_for_execution_and_scripts(scenarios)
 
         generated_files = self._generate_test_files(scenarios)
+        generated_script_execution = self._execute_generated_script(spec, generated_files)
         execution_results = self._execute_in_isolated_mock(spec, scenarios)
         summary = self._build_summary(spec, scenarios, execution_results)
         learning_feedback = self._compute_learning_feedback(scenarios, execution_results, summary)
@@ -279,6 +360,7 @@ class QASpecialistAgent:
                 "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "execution_seconds": round(time.time() - started_at, 3),
                 "isolation_mode": "in_memory_fastapi_testclient",
+                "script_kind": self.script_kind,
             },
             "summary": summary,
             "learning": {
@@ -323,6 +405,7 @@ class QASpecialistAgent:
             },
             "repair_policy": repair_summary,
             "generated_test_files": generated_files,
+            "generated_script_execution": generated_script_execution,
             "scenario_results": [asdict(r) for r in execution_results],
             "gam": {
                 "session_id": session_id,
@@ -370,27 +453,150 @@ class QASpecialistAgent:
         tests_dir = self.output_dir / "generated_tests"
         tests_dir.mkdir(parents=True, exist_ok=True)
 
-        file_map = {
-            "python_pytest": tests_dir / "test_api.py",
-            "javascript_jest": tests_dir / "test_api.test.js",
-            "curl_script": tests_dir / "test_api.sh",
-            "java_restassured": tests_dir / "APITests.java",
+        targets = {
+            "python_pytest": {
+                "path": tests_dir / "test_api.py",
+                "render": generator.generate_python_tests,
+            },
+            "javascript_jest": {
+                "path": tests_dir / "test_api.test.js",
+                "render": generator.generate_javascript_tests,
+            },
+            "curl_script": {
+                "path": tests_dir / "test_api.sh",
+                "render": generator.generate_curl_tests,
+            },
+            "java_restassured": {
+                "path": tests_dir / "APITests.java",
+                "render": generator.generate_java_tests,
+            },
         }
 
-        file_map["python_pytest"].write_text(
-            generator.generate_python_tests(), encoding="utf-8"
-        )
-        file_map["javascript_jest"].write_text(
-            generator.generate_javascript_tests(), encoding="utf-8"
-        )
-        file_map["curl_script"].write_text(
-            generator.generate_curl_tests(), encoding="utf-8"
-        )
-        file_map["java_restassured"].write_text(
-            generator.generate_java_tests(), encoding="utf-8"
-        )
+        selected = targets[self.script_kind]
+        output_path = selected["path"]
+        output_path.write_text(selected["render"](), encoding="utf-8")
+        return {self.script_kind: str(output_path)}
 
-        return {k: str(v) for k, v in file_map.items()}
+    def _execute_generated_script(
+        self, spec: Dict[str, Any], generated_files: Dict[str, str]
+    ) -> Dict[str, Any]:
+        script_path_raw = generated_files.get(self.script_kind)
+        if not script_path_raw:
+            return {
+                "kind": self.script_kind,
+                "status": "missing",
+                "executed": False,
+                "error": "Generated script path missing",
+            }
+
+        script_path = Path(script_path_raw).resolve()
+        if not script_path.exists():
+            return {
+                "kind": self.script_kind,
+                "status": "missing",
+                "executed": False,
+                "script_path": str(script_path),
+                "error": "Generated script file not found",
+            }
+
+        if self.script_kind != "python_pytest":
+            return {
+                "kind": self.script_kind,
+                "status": "skipped",
+                "executed": False,
+                "script_path": str(script_path),
+                "reason": "Automatic script execution currently supports python_pytest only",
+            }
+
+        return self._execute_python_script_in_isolated_mock(spec, script_path)
+
+    def _execute_python_script_in_isolated_mock(
+        self, spec: Dict[str, Any], script_path: Path
+    ) -> Dict[str, Any]:
+        # Imported lazily so this module can be used without server startup paths.
+        from dynamic_mock_server import DynamicMockServer
+
+        spec_copy = self.output_dir / "openapi_under_test_script_exec.yaml"
+        spec_copy.write_text(yaml.safe_dump(spec, sort_keys=False), encoding="utf-8")
+
+        started = time.perf_counter()
+        try:
+            with TestClient(DynamicMockServer(str(spec_copy), host="127.0.0.1", port=0).app) as client:
+                module_name = f"generated_python_tests_{int(time.time() * 1000)}"
+                module_spec = importlib.util.spec_from_file_location(module_name, str(script_path))
+                if module_spec is None or module_spec.loader is None:
+                    raise RuntimeError("Unable to load generated python test module")
+
+                module = importlib.util.module_from_spec(module_spec)
+                module_spec.loader.exec_module(module)
+                setattr(module, "requests", _TestClientRequestsAdapter(client))
+                setattr(module, "BASE_URL", "http://testserver")
+
+                test_class = getattr(module, "TestAPI", None)
+                if test_class is None:
+                    raise RuntimeError("Generated python script missing TestAPI class")
+
+                test_instance = test_class()
+                test_methods = sorted(
+                    name
+                    for name in dir(test_instance)
+                    if name.startswith("test_") and callable(getattr(test_instance, name))
+                )
+
+                method_results: List[Dict[str, Any]] = []
+                passed_count = 0
+                for method_name in test_methods:
+                    fn = getattr(test_instance, method_name)
+                    method_started = time.perf_counter()
+                    try:
+                        fn()
+                        passed = True
+                        error_msg = ""
+                    except AssertionError as exc:
+                        passed = False
+                        error_msg = str(exc) or "AssertionError"
+                    except Exception as exc:
+                        passed = False
+                        error_msg = f"{type(exc).__name__}: {exc}"
+
+                    duration_ms = (time.perf_counter() - method_started) * 1000.0
+                    if passed:
+                        passed_count += 1
+                    method_results.append(
+                        {
+                            "name": method_name,
+                            "passed": passed,
+                            "error": error_msg,
+                            "duration_ms": round(duration_ms, 3),
+                        }
+                    )
+
+                total_count = len(method_results)
+                failed_count = total_count - passed_count
+                elapsed_ms = (time.perf_counter() - started) * 1000.0
+
+                return {
+                    "kind": self.script_kind,
+                    "status": "executed",
+                    "executed": True,
+                    "script_path": str(script_path),
+                    "total_tests": total_count,
+                    "passed_tests": passed_count,
+                    "failed_tests": failed_count,
+                    "pass_rate": round((passed_count / total_count), 4) if total_count else 0.0,
+                    "execution_ms": round(elapsed_ms, 3),
+                    "results": method_results,
+                }
+        except Exception as exc:
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            return {
+                "kind": self.script_kind,
+                "status": "error",
+                "executed": False,
+                "script_path": str(script_path),
+                "execution_ms": round(elapsed_ms, 3),
+                "error": str(exc),
+            }
 
     def _load_learning_state(self) -> Dict[str, Any]:
         if self.learning_state_path.exists():
@@ -1259,6 +1465,19 @@ class QASpecialistAgent:
 
         return results
 
+    def _prepare_scenarios_for_execution_and_scripts(
+        self, scenarios: List[TestScenario]
+    ) -> List[TestScenario]:
+        prepared: List[TestScenario] = []
+        for scenario in scenarios:
+            method = str(scenario.method).upper()
+            rendered_headers = self._render_headers(scenario.headers)
+            scenario.headers = self._normalize_auth_headers_for_execution(
+                scenario, method, rendered_headers
+            )
+            prepared.append(scenario)
+        return prepared
+
     def _execute_one_scenario(
         self, client: TestClient, scenario: TestScenario
     ) -> ScenarioExecutionResult:
@@ -1627,6 +1846,7 @@ class QASpecialistAgent:
         state_snapshot = learning.get("state_snapshot", {})
         selection_policy = report.get("selection_policy", {})
         repair_policy = report.get("repair_policy", {})
+        script_execution = report.get("generated_script_execution", {})
 
         lines = [
             "# QA Specialist Execution Report",
@@ -1654,6 +1874,23 @@ class QASpecialistAgent:
             lines.append(
                 f"- `{test_type}`: total={counts['total']}, passed={counts['passed']}, failed={counts['failed']}"
             )
+
+        lines.extend(
+            [
+                "",
+                "## Generated Script Execution",
+                f"- Script Kind: `{metadata.get('script_kind', '')}`",
+                f"- Status: `{script_execution.get('status', 'n/a')}`",
+                f"- Executed: `{script_execution.get('executed', False)}`",
+                f"- Script Path: `{script_execution.get('script_path', '')}`",
+                f"- Total Tests: `{script_execution.get('total_tests', 0)}`",
+                f"- Passed Tests: `{script_execution.get('passed_tests', 0)}`",
+                f"- Failed Tests: `{script_execution.get('failed_tests', 0)}`",
+                f"- Pass Rate: `{script_execution.get('pass_rate', 0)}`",
+            ]
+        )
+        if script_execution.get("error"):
+            lines.append(f"- Error: `{script_execution.get('error')}`")
 
         lines.extend(
             [
@@ -1814,6 +2051,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Path to persistent QA learning state JSON (default: beside --rl-checkpoint)",
     )
+    parser.add_argument(
+        "--script-kind",
+        default=DEFAULT_SCRIPT_KIND,
+        choices=sorted(SUPPORTED_SCRIPT_KINDS),
+        help="Generated script kind to produce and execute (default: python_pytest)",
+    )
     return parser
 
 
@@ -1831,6 +2074,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         pass_threshold=args.pass_threshold,
         rl_checkpoint_path=args.rl_checkpoint,
         learning_state_path=args.learning_state,
+        script_kind=args.script_kind,
     )
 
     report = agent.run()

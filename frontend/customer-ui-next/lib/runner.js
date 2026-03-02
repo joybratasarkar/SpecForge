@@ -75,6 +75,7 @@ async function readSummary(reportJsonPath) {
         failedScenarios: summary.failed_scenarios ?? null,
         passRate: summary.pass_rate ?? null,
         meetsQualityGate: summary.meets_quality_gate ?? null,
+        scriptKind: payload?.metadata?.script_kind ?? null,
         rlTrainingSteps: trainingStats.rl_training_steps ?? null,
         rlBufferSize: trainingStats.rl_buffer_size ?? null,
         selectionAlgorithm: payload?.selection_policy?.algorithm ?? null,
@@ -120,6 +121,8 @@ async function runDomain(jobId, domain) {
     String(job.request.maxScenarios),
     '--pass-threshold',
     String(job.request.passThreshold),
+    '--script-kind',
+    String(job.request.scriptKind || 'python_pytest'),
     '--rl-checkpoint',
     checkpointPath
   ];
@@ -163,6 +166,7 @@ async function runDomain(jobId, domain) {
   setDomainResult(jobId, domain, {
     domain,
     exitCode,
+    scriptKind: String(job.request.scriptKind || 'python_pytest'),
     outputDir,
     checkpointPath,
     reportJsonPath,

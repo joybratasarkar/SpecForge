@@ -28,7 +28,16 @@ async function loadGeneratedTestsFromReport(reportJsonPath) {
 
 function isPathWithin(parentPath, childPath) {
   const rel = path.relative(parentPath, childPath);
-  return rel && !rel.startsWith('..') && !path.isAbsolute(rel);
+  return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+}
+
+async function resolveComparablePath(rawPath) {
+  const resolved = path.resolve(rawPath);
+  try {
+    return await fs.realpath(resolved);
+  } catch {
+    return resolved;
+  }
 }
 
 export async function GET(_request, { params }) {
@@ -48,8 +57,8 @@ export async function GET(_request, { params }) {
     return Response.json({ error: `generated test script kind not found: ${params.kind}` }, { status: 404 });
   }
 
-  const outputDir = path.resolve(String(result.outputDir || ''));
-  const scriptPath = path.resolve(scriptPathRaw);
+  const outputDir = await resolveComparablePath(String(result.outputDir || ''));
+  const scriptPath = await resolveComparablePath(scriptPathRaw);
   if (!isPathWithin(outputDir, scriptPath)) {
     return Response.json({ error: 'generated script path is outside output directory' }, { status: 400 });
   }

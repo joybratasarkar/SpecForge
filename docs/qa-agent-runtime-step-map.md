@@ -78,7 +78,7 @@ sequenceDiagram
 
 | Step | Code | Inputs | Outputs | Persisted |
 |---|---|---|---|---|
-| 0 | `build_arg_parser()/main()` | CLI args (`--spec`, `--prompt`, `--tenant-id`, `--base-url`, `--output-dir`, `--max-scenarios`, `--pass-threshold`, `--rl-checkpoint`) | configured `QASpecialistAgent` | none |
+| 0 | `build_arg_parser()/main()` | CLI args (`--spec`, `--prompt`, `--tenant-id`, `--base-url`, `--output-dir`, `--max-scenarios`, `--pass-threshold`, `--rl-checkpoint`, `--script-kind`) | configured `QASpecialistAgent` | none |
 | 1 | `QASpecialistAgent.__init__` | parsed args | in-memory runtime state (`gam`, `rl_trainer`, `learning_state`, `adaptive_policy`) | output dir created; RL checkpoint loaded if exists |
 | 2 | `_load_spec` | `spec_path` | parsed OpenAPI dict | none |
 | 3 | `_build_auth_requirement_map` | OpenAPI dict | `self._auth_required_ops` set | none |
@@ -86,14 +86,15 @@ sequenceDiagram
 | 5 | `HumanTesterSimulator.think_like_tester` | spec + effective prompt | candidate `TestScenario[]` | none |
 | 6 | `_select_scenarios_with_learning` | candidates + weights + policy state + RL risk | selected scenarios + `selection_trace` + `selection_summary` | stored later in `learning_state.json` + report |
 | 7 | `_apply_scenario_repairs` | selected scenarios + schema + scenario stats | repaired scenarios + repair summary | repair rule state |
-| 8 | `_generate_test_files` | repaired scenarios + base URL | file map for generated tests | `generated_tests/` files |
-| 9 | `_execute_in_isolated_mock` | spec + repaired scenarios | `ScenarioExecutionResult[]` | `openapi_under_test.yaml` |
-| 10 | `_build_summary` | execution results + spec | summary metrics (pass/fail/rate/gate) | in report |
-| 11 | `_compute_learning_feedback` | scenarios + results + summary | `run_reward`, `decision_signals[]` | in report |
-| 12 | `_update_learning_state` | decision signals | updated weights/stats/policy posterior | later saved in `learning_state.json` |
-| 13 | `_save_learning_state` | current learning state | serialized learning snapshot | `learning_state.json` |
-| 14 | `_run_agent_lightning_training` | `spec_title`, `summary`, `report_path`, `learning_feedback` | `training_result`, `training_stats` | RL checkpoint autosave |
-| 15 | `_write_reports` | full report dict | JSON/MD report paths | `qa_execution_report.json`, `qa_execution_report.md` |
+| 8 | `_generate_test_files` | repaired scenarios + base URL + `script_kind` | one generated script file map (`generated_test_files`) | one file under `generated_tests/` |
+| 9 | `_execute_generated_script` | spec + generated script path | generated-script execution summary (`generated_script_execution`) | in report |
+| 10 | `_execute_in_isolated_mock` | spec + repaired scenarios | `ScenarioExecutionResult[]` | `openapi_under_test.yaml` |
+| 11 | `_build_summary` | execution results + spec | summary metrics (pass/fail/rate/gate) | in report |
+| 12 | `_compute_learning_feedback` | scenarios + results + summary | `run_reward`, `decision_signals[]` | in report |
+| 13 | `_update_learning_state` | decision signals | updated weights/stats/policy posterior | later saved in `learning_state.json` |
+| 14 | `_save_learning_state` | current learning state | serialized learning snapshot | `learning_state.json` |
+| 15 | `_run_agent_lightning_training` | `spec_title`, `summary`, `report_path`, `learning_feedback` | `training_result`, `training_stats` | RL checkpoint autosave |
+| 16 | `_write_reports` | full report dict | JSON/MD report paths | `qa_execution_report.json`, `qa_execution_report.md` |
 
 ## 4. Detailed Step Contracts
 
@@ -232,10 +233,14 @@ Applied before execution and summarized as:
 
 Outputs:
 
-1. `generated_tests/test_api.py`
-2. `generated_tests/test_api.test.js`
-3. `generated_tests/test_api.sh`
-4. `generated_tests/APITests.java`
+Exactly one generated script is produced per run, based on `--script-kind`:
+
+1. `python_pytest` -> `generated_tests/test_api.py`
+2. `javascript_jest` -> `generated_tests/test_api.test.js`
+3. `curl_script` -> `generated_tests/test_api.sh`
+4. `java_restassured` -> `generated_tests/APITests.java`
+
+`generated_script_execution` captures execution status and pass/fail counts.
 
 ## Step 9: Isolated Execution Contract
 
@@ -352,11 +357,12 @@ Reported back to QA report:
 4. `selection_policy`
 5. `repair_policy`
 6. `generated_test_files`
-7. `scenario_results`
-8. `gam`
-9. `agent_lightning`
-10. `paper_references`
-11. `report_files`
+7. `generated_script_execution`
+8. `scenario_results`
+9. `gam`
+10. `agent_lightning`
+11. `paper_references`
+12. `report_files`
 
 ## 5. Runtime Log Markers -> Step Mapping
 
@@ -364,11 +370,11 @@ Reported back to QA report:
 |---|---|
 | `[OK] OpenAPI spec written` | pre-step 0 (domain wrapper script) |
 | `[RUN] QA specialist agent` | step 0 |
-| `Started observability session ...` | step 14 start |
-| `RL training executed: Loss=...` | step 14 train step |
-| `RL TRAINING ACTIVE: Step N ...` | step 14 train result |
-| `QA specialist run complete` | step 15 done |
-| `JSON report: ...` | step 15 output |
+| `Started observability session ...` | step 15 start |
+| `RL training executed: Loss=...` | step 15 train step |
+| `RL TRAINING ACTIVE: Step N ...` | step 15 train result |
+| `QA specialist run complete` | step 16 done |
+| `JSON report: ...` | step 16 output |
 
 ## 6. How to Inspect Each Step While Running
 
