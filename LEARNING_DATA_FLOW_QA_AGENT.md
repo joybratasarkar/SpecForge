@@ -445,3 +445,341 @@ Treat learning as confirmed when all are true:
 
 If only steps increase but failures never improve, it means training is happening but feedback mapping is weak.
 If repairs start applying and failures reduce, feedback mapping is effective.
+
+## 14) Visual Wire Diagram (Objects and Payload Handoffs)
+
+### 14.1 Runtime Plane Object Flow
+
+```mermaid
+flowchart LR
+    A[OpenAPI spec file] --> B[spec dict]
+    B --> C[Candidate TestScenario list]
+    C --> D[Selection trace + selection summary]
+    D --> E[Repaired selected TestScenario list]
+    E --> F[ScenarioExecutionResult list]
+    F --> G[summary + learning.feedback]
+    G --> H[learning_state.json update]
+    G --> I[task_payload to AgentLightningTrainer]
+    I --> J[AgentTrace list]
+    J --> K[TrainingTransition replay buffer]
+    K --> L[train_step result + checkpoint]
+    L --> M[qa_execution_report.json/.md]
+```
+
+### 14.2 Agent Lightning Training Internals
+
+```mermaid
+sequenceDiagram
+    participant QA as QASpecialistAgent
+    participant AL as AgentLightningTrainer
+    participant OC as ObservabilityCollector
+    participant CA as CreditAssignmentModule
+    participant RL as LightningRLAlgorithm
+    participant CK as Checkpoint File
+
+    QA->>AL: train_agent(agent_id, task_payload)
+    AL->>OC: start_session(session_id)
+    AL->>OC: collect_trace(type=task_start)
+    AL->>OC: collect_trace(type=scenario_decision) x N
+    AL->>OC: collect_trace(type=task_result)
+    AL->>CA: assign_credit(traces, final_reward)
+    AL->>RL: add_transition(...) x M
+    AL->>RL: train_step()
+    RL-->>AL: {status, value_loss, training_steps, buffer_size}
+    AL->>CK: save_checkpoint(...)
+    AL-->>QA: training_result + training_stats
+```
+
+## 15) Payload Reference (Concrete Shapes)
+
+These are the key payloads in the exact order they appear in runtime.
+
+### 15.1 Run Input (CLI)
+
+```json
+{
+  "spec": "/tmp/openapi_ecommerce_ckpt.yaml",
+  "tenant_id": "qa_demo",
+  "output_dir": "/tmp/qa_demo_run",
+  "max_scenarios": 16,
+  "pass_threshold": 0.70,
+  "rl_checkpoint": "/tmp/agent_lightning_ecommerce.pt"
+}
+```
+
+### 15.2 Selected Scenario Object (`TestScenario`)
+
+```json
+{
+  "name": "test_post__orders_success",
+  "test_type": "happy_path",
+  "endpoint": "/orders",
+  "method": "POST",
+  "headers": {},
+  "params": {},
+  "body": {
+    "productId": "123",
+    "quantity": 1
+  },
+  "expected_status": 201
+}
+```
+
+### 15.3 Selection Trace Item (`selection_policy.top_decisions[]`)
+
+```json
+{
+  "name": "test_post__orders_success",
+  "test_type": "happy_path",
+  "endpoint": "POST /orders",
+  "fingerprint": "POST|/orders|happy_path|201|body=1|params=0",
+  "selection_reason": "uncertainty_coverage",
+  "score": 0.4017,
+  "expected_reward": -0.1558,
+  "uncertainty": 0.2054,
+  "exploration_bonus": 0.0719,
+  "failure_focus_bonus": 0.3529,
+  "historical_reward": -0.9416,
+  "novelty_bonus": 0.0,
+  "diversity_penalty": 0.0
+}
+```
+
+### 15.4 Repair Rule (`learning_state.scenario_repair_rules[fp]`)
+
+```json
+{
+  "fingerprint": "POST|/orders|happy_path|201|body=1|params=0",
+  "method": "POST",
+  "endpoint": "/orders",
+  "test_type": "happy_path",
+  "attempts": 17,
+  "status_observations": 4,
+  "failure_rate": 0.882353,
+  "dominant_actual_status": 400,
+  "dominant_ratio": 0.75,
+  "repair_request_body": true
+}
+```
+
+### 15.5 Execution Result (`scenario_results[]`)
+
+```json
+{
+  "name": "test_post__orders_success",
+  "test_type": "happy_path",
+  "method": "POST",
+  "endpoint_template": "/orders",
+  "endpoint_resolved": "/orders",
+  "expected_status": 201,
+  "actual_status": 201,
+  "passed": true,
+  "duration_ms": 0.828,
+  "error": "",
+  "response_excerpt": "{\"id\":1001,...}"
+}
+```
+
+### 15.6 Decision Learning Signal (`learning.feedback.decision_signals[]`)
+
+```json
+{
+  "name": "test_post__orders_success",
+  "test_type": "happy_path",
+  "method": "POST",
+  "endpoint_template": "/orders",
+  "endpoint_key": "POST /orders",
+  "scenario_fingerprint": "POST|/orders|happy_path|201|body=1|params=0",
+  "has_body": true,
+  "has_params": false,
+  "reward": 0.9998344,
+  "passed": true,
+  "expected_status": 201,
+  "actual_status": 201
+}
+```
+
+### 15.7 RL Task Payload (`_run_agent_lightning_training -> train_agent`)
+
+```json
+{
+  "spec_title": "E-commerce API",
+  "tenant_id": "qa_demo",
+  "pass_rate": 1.0,
+  "pass_threshold": 0.7,
+  "total_scenarios": 16,
+  "failed_scenarios": 0,
+  "report_path": "/private/tmp/qa_demo_run/qa_execution_report.json",
+  "summary": {
+    "...": "summary object"
+  },
+  "learning_reward_score": 1.0,
+  "decision_signals": [
+    {
+      "...": "DecisionLearningSignal entries"
+    }
+  ]
+}
+```
+
+### 15.8 Agent Feedback Return (`_qa_agent_feedback`)
+
+```json
+{
+  "success": true,
+  "quality_score": 1.0,
+  "summary": {
+    "...": "summary object"
+  },
+  "report_path": "/private/tmp/qa_demo_run/qa_execution_report.json"
+}
+```
+
+### 15.9 Trace Content for One Scenario Decision
+
+```json
+{
+  "type": "scenario_decision",
+  "index": 4,
+  "name": "test_post__orders_success",
+  "test_type": "happy_path",
+  "method": "POST",
+  "endpoint_template": "/orders",
+  "endpoint_key": "POST /orders",
+  "has_body": true,
+  "has_params": false,
+  "expected_status": 201,
+  "actual_status": 201,
+  "passed": true,
+  "reward_signal": 0.9998344
+}
+```
+
+### 15.10 Training Transition Stored in Replay Buffer
+
+```json
+{
+  "state": {
+    "...": "AgentTrace.content from current action trace"
+  },
+  "action": {
+    "type": "action",
+    "content": {
+      "...": "same action content"
+    }
+  },
+  "reward": 0.9998344,
+  "next_state": {
+    "...": "AgentTrace.content from next trace"
+  },
+  "done": false,
+  "trace_sequence": [
+    {
+      "...": "AgentTrace #t"
+    },
+    {
+      "...": "AgentTrace #t+1"
+    }
+  ],
+  "session_id": "38ae4963-c1e1-4a03-b070-4d6dd6ead8d5",
+  "agent_id": "qa_specialist"
+}
+```
+
+### 15.11 RL Training Result and Stats (`report.agent_lightning`)
+
+```json
+{
+  "training_result": {
+    "success": true,
+    "execution_time": 0.000016689300537109375,
+    "traces_collected": 18,
+    "rl_training_result": {
+      "status": "trained",
+      "value_loss": 2.412001132965088,
+      "batch_size": 32,
+      "training_steps": 22,
+      "buffer_size": 333,
+      "learning_rate": 0.0003,
+      "weights_updated": true,
+      "checkpoint": {
+        "status": "saved",
+        "path": "/private/tmp/agent_lightning_ecommerce.pt",
+        "training_steps": 22,
+        "buffer_size": 333
+      }
+    }
+  },
+  "training_stats": {
+    "registered_agents": 1,
+    "total_traces": 18,
+    "active_sessions": 0,
+    "rl_buffer_size": 333,
+    "rl_training_steps": 22,
+    "training_enabled": true,
+    "checkpoint_path": "/private/tmp/agent_lightning_ecommerce.pt",
+    "checkpoint_autosave": true
+  }
+}
+```
+
+## 16) Field Ownership Map (Producer -> Consumer)
+
+| Field Path | Produced By | Consumed By | Why It Matters |
+|---|---|---|---|
+| `learning.feedback.decision_signals[]` | `_compute_learning_feedback` | `_update_learning_state`, `_run_agent_lightning_training` | Core per-scenario learning signal |
+| `learning_state.test_type_weights` | `_update_learning_state` | `_select_scenarios_with_learning` | Shifts test-type priority |
+| `learning_state.endpoint_weights` | `_update_learning_state` | `_select_scenarios_with_learning` | Shifts endpoint focus |
+| `learning_state.scenario_stats` | `_update_learning_state` | `_select_scenarios_with_learning`, `_refresh_scenario_repair_rules` | Tracks repeated failure patterns |
+| `learning_state.scenario_repair_rules` | `_refresh_scenario_repair_rules` | `_apply_scenario_repairs` | Applies learned fixes before execution |
+| `selection_policy.top_decisions[]` | `_select_scenarios_with_learning` | Report readers | Explains why each scenario was selected |
+| `repair_policy.*` | `_apply_scenario_repairs` | Report readers | Shows rule activation and applied changes |
+| `task_payload.decision_signals` | `_run_agent_lightning_training` | `AgentLightningTrainer.train_agent` | Dense reward input to RL |
+| `agent_lightning.training_stats.rl_training_steps` | `LightningRLAlgorithm.train_step` | Report readers | Confirms checkpointed learning progress |
+| `agent_lightning.training_stats.rl_buffer_size` | `LightningRLAlgorithm.add_transition` | Report readers | Confirms replay growth |
+
+## 17) One Scenario, Full Lifecycle (Trace Example)
+
+Use this mental model for one scenario like `test_post__orders_success`:
+
+1. Scenario generated with `expected_status=201`.
+2. Selected because score is high enough or uncertainty-covered.
+3. Optional repair modifies body (adds required fields) before execution.
+4. Executed in isolated mock server.
+5. Result object records actual status and duration.
+6. Decision signal converts that outcome into numeric reward.
+7. Learning state updates weights + scenario stats + actual_status_counts.
+8. Same decision signal is sent into RL payload.
+9. Trainer creates `scenario_decision` action trace.
+10. Transition reward is injected from `reward_signal`.
+11. Replay buffer grows and train step updates value net.
+12. Checkpoint saves updated model + replay + counters.
+
+This is why you can inspect the same scenario across:
+
+1. `selection_policy.top_decisions`
+2. `scenario_results`
+3. `learning.feedback.decision_signals`
+4. `learning_state.scenario_stats`
+5. `learning_state.scenario_repair_rules`
+
+## 18) "No Black Box" Audit Checklist
+
+Run this checklist after any training run:
+
+1. RL progressing:
+   - `rl_training_steps` increased vs previous run.
+2. Replay growing:
+   - `rl_buffer_size` increased.
+3. Decision signals present:
+   - `learning.feedback.decision_signals | length > 0`.
+4. Selection explainable:
+   - `selection_policy.top_decisions` has score decomposition.
+5. Repair logic observable:
+   - `repair_policy.active_rules` and `applied_examples` populated for persistent failures.
+6. State persistence working:
+   - `learning_state.run_count` increased.
+7. Weak patterns tracked:
+   - `learning.state_snapshot.weakest_patterns` shows repeated failure fingerprints.
+
+If all 7 are true, the learning pipeline is transparent and functioning end-to-end.
