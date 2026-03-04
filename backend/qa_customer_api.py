@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import subprocess
 import threading
 import uuid
@@ -26,7 +27,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 APP_TITLE = "SpecTestPilot Customer QA UI"
-SUPPORTED_DOMAINS = ["ecommerce", "healthcare", "logistics", "hr"]
+DOMAIN_PRESETS = ["ecommerce", "healthcare", "logistics", "hr"]
+DOMAIN_PRESET_SET = set(DOMAIN_PRESETS)
 SUPPORTED_SCRIPT_KINDS = [
     "python_pytest",
     "javascript_jest",
@@ -39,14 +41,50 @@ CHECKPOINT_ROOT = Path("/tmp/qa_ui_checkpoints")
 JOB_ROOT.mkdir(parents=True, exist_ok=True)
 CHECKPOINT_ROOT.mkdir(parents=True, exist_ok=True)
 
+
+def _bootstrap_runtime_env() -> None:
+    """Best-effort .env loading so API-launched jobs inherit OPENAI_API_KEY."""
+    try:
+        from dotenv import load_dotenv
+    except Exception:
+        return
+
+    candidates = [
+        REPO_ROOT / ".env",
+        REPO_ROOT.parent / ".env",
+        Path.cwd() / ".env",
+    ]
+    seen: set[str] = set()
+    for candidate in candidates:
+        env_path = candidate.expanduser().resolve()
+        key = str(env_path)
+        if key in seen:
+            continue
+        seen.add(key)
+        if env_path.is_file():
+            load_dotenv(dotenv_path=env_path, override=False)
+
+
+_bootstrap_runtime_env()
+
 MAX_LOG_LINES = 6000
 
 app = FastAPI(title=APP_TITLE)
+
+
+def _default_allowed_origins_csv() -> str:
+    origins: List[str] = []
+    for port in range(3000, 3011):
+        origins.append(f"http://localhost:{port}")
+        origins.append(f"http://127.0.0.1:{port}")
+    return ",".join(origins)
+
+
 _allowed_origins = [
     origin.strip()
     for origin in os.getenv(
         "QA_UI_ALLOWED_ORIGINS",
-        "http://localhost:3001,http://127.0.0.1:3001,http://localhost:3000,http://127.0.0.1:3000",
+        _default_allowed_origins_csv(),
     ).split(",")
     if origin.strip()
 ]
@@ -61,15 +99,38 @@ app.add_middleware(
 _jobs_lock = threading.Lock()
 _jobs: Dict[str, Dict[str, Any]] = {}
 
+DOMAIN_TOKEN_PATTERN = re.compile(r"^[a-z0-9_-]{1,64}$")
+
+
+def _sanitize_domain_token(value: Any) -> str:
+    token = str(value or "").strip().lower()
+    token = re.sub(r"[^a-z0-9_-]+", "_", token)
+    token = re.sub(r"_+", "_", token).strip("_")
+    if not token:
+        return ""
+    return token[:64]
+
+
+def _normalize_spec_path(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    return str(Path(raw).expanduser().resolve())
+
 
 class RunRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="ignore")
 
     domains: List[str] = Field(default_factory=lambda: ["ecommerce"])
+    spec_paths: Dict[str, str] = Field(default_factory=dict, alias="specPaths")
     tenant_id: str = Field(default="customer_default", alias="tenantId")
+    workspace_id: Optional[str] = Field(default=None, alias="workspaceId")
     prompt: Optional[str] = None
     script_kind: str = Field(default="python_pytest", alias="scriptKind")
     max_scenarios: int = Field(default=16, alias="maxScenarios")
+    max_runtime_sec: Optional[int] = Field(default=None, alias="maxRuntimeSec")
+    llm_token_cap: Optional[int] = Field(default=None, alias="llmTokenCap")
+    environment_profile: str = Field(default="mock", alias="environmentProfile")
     pass_threshold: float = Field(default=0.70, alias="passThreshold")
     base_url: str = Field(default="http://localhost:8000", alias="baseUrl")
     customer_mode: bool = Field(default=True, alias="customerMode")
@@ -79,13 +140,34 @@ class RunRequest(BaseModel):
     @field_validator("domains")
     @classmethod
     def validate_domains(cls, value: List[str]) -> List[str]:
-        normalized = [str(v).strip().lower() for v in value if str(v).strip()]
+        normalized = [_sanitize_domain_token(v) for v in value if str(v).strip()]
+        normalized = [token for token in normalized if token]
         if not normalized:
             raise ValueError("Select at least one domain")
-        invalid = [v for v in normalized if v not in SUPPORTED_DOMAINS]
+        invalid = [v for v in normalized if not DOMAIN_TOKEN_PATTERN.match(v)]
         if invalid:
-            raise ValueError(f"Unsupported domains: {', '.join(invalid)}")
+            raise ValueError(f"Invalid domain ids: {', '.join(invalid)}")
         return list(dict.fromkeys(normalized))
+
+    @field_validator("spec_paths")
+    @classmethod
+    def validate_spec_paths(cls, value: Dict[str, str]) -> Dict[str, str]:
+        if not isinstance(value, dict):
+            return {}
+        normalized: Dict[str, str] = {}
+        for raw_domain, raw_path in value.items():
+            domain = _sanitize_domain_token(raw_domain)
+            if not domain:
+                continue
+            if not DOMAIN_TOKEN_PATTERN.match(domain):
+                raise ValueError(f"Invalid domain id in specPaths: {raw_domain}")
+            spec_path = _normalize_spec_path(raw_path)
+            if not spec_path:
+                continue
+            if not Path(spec_path).exists():
+                raise ValueError(f"Spec file not found for domain '{domain}': {spec_path}")
+            normalized[domain] = spec_path
+        return normalized
 
     @field_validator("max_scenarios")
     @classmethod
@@ -95,6 +177,34 @@ class RunRequest(BaseModel):
         if value > 500:
             return 500
         return value
+
+    @field_validator("max_runtime_sec")
+    @classmethod
+    def validate_max_runtime_sec(cls, value: Optional[int]) -> Optional[int]:
+        if value is None:
+            return None
+        num = int(value)
+        if num <= 0:
+            return None
+        return min(7200, num)
+
+    @field_validator("llm_token_cap")
+    @classmethod
+    def validate_llm_token_cap(cls, value: Optional[int]) -> Optional[int]:
+        if value is None:
+            return None
+        num = int(value)
+        if num <= 0:
+            return None
+        return min(16000, max(64, num))
+
+    @field_validator("environment_profile")
+    @classmethod
+    def validate_environment_profile(cls, value: str) -> str:
+        profile = str(value or "mock").strip().lower()
+        if profile not in {"mock", "staging", "prod_safe"}:
+            return "mock"
+        return profile
 
     @field_validator("script_kind")
     @classmethod
@@ -145,13 +255,26 @@ def _load_report_artifacts(report_json_path: Path) -> Tuple[Dict[str, Any], Dict
         "failed_scenarios": summary.get("failed_scenarios"),
         "pass_rate": summary.get("pass_rate"),
         "meets_quality_gate": summary.get("meets_quality_gate"),
+        "contract_checks_run": summary.get("contract_checks_run"),
+        "contract_check_failures": summary.get("contract_check_failures"),
+        "corrected_expectations": summary.get("corrected_expectations"),
+        "runtime_cap_hit": summary.get("runtime_cap_hit"),
+        "runtime_skipped_scenarios": summary.get("runtime_skipped_scenarios"),
+        "environment_profile": summary.get("environment_profile"),
         "script_kind": payload.get("metadata", {}).get("script_kind"),
+        "workspace_id": payload.get("metadata", {}).get("workspace_id"),
+        "spec_key": payload.get("metadata", {}).get("spec_key"),
+        "run_id": payload.get("metadata", {}).get("run_id"),
         "rl_training_steps": training_stats.get("rl_training_steps"),
         "rl_buffer_size": training_stats.get("rl_buffer_size"),
         "selection_algorithm": payload.get("selection_policy", {}).get("algorithm"),
         "selection_selected_count": payload.get("selection_policy", {}).get("selected_count"),
         "selection_candidate_count": payload.get("selection_policy", {}).get("candidate_count"),
         "run_reward": payload.get("learning", {}).get("feedback", {}).get("run_reward"),
+        "learning_delta_status": payload.get("learning", {}).get("learning_delta_status"),
+        "gam_context_quality": (payload.get("gam_context_pack", {}) or {}).get("quality_score"),
+        "spec_operations_total": (payload.get("spec_intelligence", {}) or {}).get("operations_total"),
+        "dependency_edge_count": ((payload.get("spec_intelligence", {}) or {}).get("dependency_graph", {}) or {}).get("edge_count"),
     }
     return summary_payload, generated_tests
 
@@ -174,6 +297,20 @@ def _domain_result_or_404(job_id: str, domain: str) -> Dict[str, Any]:
     if not result:
         raise HTTPException(status_code=404, detail="domain result not found")
     return result
+
+
+def _resolve_domain_for_run(job_id: str, domain: Optional[str]) -> str:
+    chosen = str(domain or "").strip().lower()
+    if chosen:
+        return chosen
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="job not found")
+        domains = [str(item).strip().lower() for item in (job.get("request", {}).get("domains", []) or []) if str(item).strip()]
+        if not domains:
+            raise HTTPException(status_code=404, detail="no domains found for run")
+        return domains[0]
 
 
 def _resolve_generated_tests(result: Dict[str, Any]) -> Dict[str, str]:
@@ -250,14 +387,14 @@ def _run_job(job_id: str) -> None:
     for domain in req["domains"]:
         output_dir = JOB_ROOT / f"{ts}_{job_id}_{domain}"
         checkpoint = CHECKPOINT_ROOT / f"{req['tenant_id']}_{domain}.pt"
+        spec_paths = req.get("spec_paths") or {}
+        spec_path_override = str(spec_paths.get(domain, "")).strip()
 
         cmd = [
             "bash",
             str(REPO_ROOT / "run_qa_domain.sh"),
             "--domain",
             domain,
-            "--action",
-            "both",
             "--tenant-id",
             req["tenant_id"],
             "--base-url",
@@ -270,9 +407,47 @@ def _run_job(job_id: str) -> None:
             str(req["pass_threshold"]),
             "--script-kind",
             req["script_kind"],
+            "--environment-profile",
+            str(req.get("environment_profile", "mock")),
             "--rl-checkpoint",
             str(checkpoint),
         ]
+        workspace_id = str(req.get("workspace_id") or req.get("tenant_id") or "").strip()
+        if workspace_id:
+            cmd += ["--workspace-id", workspace_id]
+        max_runtime_sec = req.get("max_runtime_sec")
+        if isinstance(max_runtime_sec, int) and max_runtime_sec > 0:
+            cmd += ["--max-runtime-sec", str(max_runtime_sec)]
+        llm_token_cap = req.get("llm_token_cap")
+        if isinstance(llm_token_cap, int) and llm_token_cap > 0:
+            cmd += ["--llm-token-cap", str(llm_token_cap)]
+
+        if spec_path_override:
+            cmd += ["--action", "run", "--spec-path", spec_path_override]
+        else:
+            if domain not in DOMAIN_PRESET_SET:
+                with _jobs_lock:
+                    job = _jobs[job_id]
+                    _append_log(
+                        job,
+                        f"[{domain}] Unsupported preset domain without spec path. "
+                        + "Provide specPaths.<domain>=/path/to/openapi.yaml",
+                    )
+                    job["results"][domain] = {
+                        "domain": domain,
+                        "return_code": 2,
+                        "script_kind": req["script_kind"],
+                        "output_dir": str(output_dir),
+                        "checkpoint": str(checkpoint),
+                        "spec_path": "",
+                        "report_json": "",
+                        "report_md": "",
+                        "summary": {"error": "missing_spec_path_for_custom_domain"},
+                        "generated_tests": {},
+                    }
+                failures += 1
+                continue
+            cmd += ["--action", "both"]
 
         if req.get("prompt"):
             cmd += ["--prompt", req["prompt"]]
@@ -288,9 +463,15 @@ def _run_job(job_id: str) -> None:
             _append_log(job, f"===== DOMAIN: {domain} =====")
             _append_log(job, "$ " + " ".join(cmd))
 
+        child_env = dict(os.environ)
+        child_env["GAM_LLM_MODE"] = "on"
+        child_env["GAM_MEMO_LLM_MODE"] = "on"
+        child_env.setdefault("QA_SCENARIO_LLM_TIMEOUT_SECONDS", "45")
+        child_env.setdefault("QA_SCENARIO_LLM_MAX_RETRIES", "1")
         proc = subprocess.Popen(
             cmd,
             cwd=str(REPO_ROOT),
+            env=child_env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -318,6 +499,7 @@ def _run_job(job_id: str) -> None:
                 "script_kind": req["script_kind"],
                 "output_dir": str(output_dir),
                 "checkpoint": str(checkpoint),
+                "spec_path": spec_path_override,
                 "report_json": str(report_json),
                 "report_md": str(report_md),
                 "summary": summary,
@@ -480,13 +662,12 @@ def index() -> str:
     <section class=\"card\">
       <h2>Run Configuration</h2>
       <div class=\"field\">
-        <label>Domains</label>
-        <div class=\"domains\">
-          <label class=\"domain-item\"><input type=\"checkbox\" name=\"domain\" value=\"ecommerce\" checked> ecommerce</label>
-          <label class=\"domain-item\"><input type=\"checkbox\" name=\"domain\" value=\"healthcare\"> healthcare</label>
-          <label class=\"domain-item\"><input type=\"checkbox\" name=\"domain\" value=\"logistics\"> logistics</label>
-          <label class=\"domain-item\"><input type=\"checkbox\" name=\"domain\" value=\"hr\"> hr</label>
-        </div>
+        <label>Domains (comma or newline separated)</label>
+        <textarea id=\"domainsInput\" style=\"min-height:72px;\" placeholder=\"ecommerce, healthcare\">ecommerce</textarea>
+      </div>
+      <div class=\"field\">
+        <label>Spec Paths (optional, one per line: domain=/abs/path/openapi.yaml)</label>
+        <textarea id=\"specPaths\" style=\"min-height:72px;\" placeholder=\"payments=/tmp/openapi_payments.yaml\"></textarea>
       </div>
 
       <div class=\"field\">
@@ -570,7 +751,27 @@ def index() -> str:
     ];
 
     function selectedDomains() {
-      return Array.from(document.querySelectorAll('input[name="domain"]:checked')).map(i => i.value);
+      const raw = String(document.getElementById('domainsInput').value || '');
+      const tokens = raw
+        .split(/[\\n,]+/)
+        .map(v => v.trim().toLowerCase().replace(/[^a-z0-9_-]+/g, '_'))
+        .filter(Boolean);
+      return Array.from(new Set(tokens));
+    }
+
+    function parseSpecPaths() {
+      const raw = String(document.getElementById('specPaths').value || '');
+      const lines = raw.split(/\\n+/).map(v => v.trim()).filter(Boolean);
+      const out = {};
+      lines.forEach((line) => {
+        const idx = line.indexOf('=');
+        if (idx <= 0) return;
+        const domain = line.slice(0, idx).trim().toLowerCase().replace(/[^a-z0-9_-]+/g, '_');
+        const specPath = line.slice(idx + 1).trim();
+        if (!domain || !specPath) return;
+        out[domain] = specPath;
+      });
+      return out;
     }
 
     async function startRun() {
@@ -582,6 +783,7 @@ def index() -> str:
 
       const body = {
         domains,
+        spec_paths: parseSpecPaths(),
         tenant_id: document.getElementById('tenant').value.trim() || 'customer_default',
         script_kind: document.getElementById('scriptKind').value || 'python_pytest',
         prompt: document.getElementById('prompt').value.trim() || null,
@@ -708,6 +910,19 @@ def index() -> str:
 
 @app.post("/api/jobs")
 def create_job(req: RunRequest) -> Dict[str, Any]:
+    req_payload = req.model_dump()
+    if not str(req_payload.get("workspace_id") or "").strip():
+        req_payload["workspace_id"] = str(req_payload.get("tenant_id") or "customer_default")
+    spec_paths = req_payload.get("spec_paths") or {}
+    if isinstance(spec_paths, dict) and spec_paths:
+        domain_set = {_sanitize_domain_token(item) for item in req_payload.get("domains", [])}
+        domain_set = {item for item in domain_set if item}
+        for domain in spec_paths.keys():
+            token = _sanitize_domain_token(domain)
+            if token:
+                domain_set.add(token)
+        req_payload["domains"] = sorted(domain_set)
+
     job_id = uuid.uuid4().hex[:12]
     job = {
         "id": job_id,
@@ -716,7 +931,7 @@ def create_job(req: RunRequest) -> Dict[str, Any]:
         "started_at": None,
         "completed_at": None,
         "current_domain": None,
-        "request": req.model_dump(),
+        "request": req_payload,
         "logs": [],
         "results": {},
     }
@@ -851,6 +1066,154 @@ def get_generated_test_script(job_id: str, domain: str, kind: str):
     result = _domain_result_or_404(job_id, domain)
     script_path = _resolve_safe_generated_script_path(result, kind)
     return PlainTextResponse(script_path.read_text(encoding="utf-8"))
+
+
+@app.get("/api/ping")
+def api_ping() -> Dict[str, str]:
+    return {
+        "backend": "fastapi",
+        "service": "qa_customer_api",
+        "status": "ok",
+    }
+
+
+@app.post("/api/runs")
+def create_run(req: RunRequest) -> Dict[str, Any]:
+    response = create_job(req)
+    return {"run_id": response.get("job_id"), "status": response.get("status", "queued")}
+
+
+@app.get("/api/runs")
+def list_runs() -> List[Dict[str, Any]]:
+    rows = list_jobs()
+    return [
+        {
+            "run_id": item.get("id"),
+            "status": item.get("status"),
+            "created_at": item.get("created_at"),
+            "started_at": item.get("started_at"),
+            "completed_at": item.get("completed_at"),
+            "current_domain": item.get("current_domain"),
+            "domains": item.get("domains", []),
+        }
+        for item in rows
+    ]
+
+
+@app.get("/api/runs/{run_id}")
+def get_run(run_id: str, tail: int = Query(500, ge=50, le=3000)) -> Dict[str, Any]:
+    payload = get_job(run_id, tail=tail)
+    payload["run_id"] = payload.pop("id")
+    return payload
+
+
+@app.get("/api/runs/{run_id}/report")
+def get_run_report(
+    run_id: str,
+    domain: Optional[str] = Query(default=None),
+    format: str = Query("json"),
+):
+    if format not in {"json", "md"}:
+        raise HTTPException(status_code=400, detail="format must be json or md")
+    resolved_domain = _resolve_domain_for_run(run_id, domain)
+    return get_report(run_id, resolved_domain, format=format)
+
+
+@app.get("/api/runs/{run_id}/scripts")
+def get_run_script(
+    run_id: str,
+    language: str = Query("python"),
+    domain: Optional[str] = Query(default=None),
+):
+    resolved_domain = _resolve_domain_for_run(run_id, domain)
+    normalized = str(language or "").strip().lower()
+    kind_map = {
+        "python": "python_pytest",
+        "javascript": "javascript_jest",
+        "js": "javascript_jest",
+        "java": "java_restassured",
+        "curl": "curl_script",
+    }
+    kind = kind_map.get(normalized, normalized)
+    if kind not in SUPPORTED_SCRIPT_KINDS:
+        raise HTTPException(status_code=400, detail="unsupported language")
+    return get_generated_test_script(run_id, resolved_domain, kind)
+
+
+@app.get("/api/runs/{run_id}/gam-context")
+def get_run_gam_context(run_id: str, domain: Optional[str] = Query(default=None)) -> Dict[str, Any]:
+    resolved_domain = _resolve_domain_for_run(run_id, domain)
+    result = _domain_result_or_404(run_id, resolved_domain)
+    report_json = _canonical_path(result.get("report_json", ""))
+    payload = _read_report_payload(report_json)
+    return {
+        "run_id": run_id,
+        "domain": resolved_domain,
+        "gam_context_pack": payload.get("gam_context_pack", {}),
+        "gam_diagnostics": (payload.get("gam", {}) or {}).get("diagnostics", {}),
+        "research_engine": (payload.get("gam", {}) or {}).get("research_engine", {}),
+    }
+
+
+@app.get("/api/runs/{run_id}/rl-decisions")
+def get_run_rl_decisions(run_id: str, domain: Optional[str] = Query(default=None)) -> Dict[str, Any]:
+    resolved_domain = _resolve_domain_for_run(run_id, domain)
+    result = _domain_result_or_404(run_id, resolved_domain)
+    report_json = _canonical_path(result.get("report_json", ""))
+    payload = _read_report_payload(report_json)
+    return {
+        "run_id": run_id,
+        "domain": resolved_domain,
+        "selection_decision_trace": payload.get("selection_decision_trace", []),
+        "mutation_decision_trace": payload.get("mutation_decision_trace", []),
+        "selection_policy": payload.get("selection_policy", {}),
+        "mutation_policy": payload.get("mutation_policy", {}),
+        "learning_feedback": (payload.get("learning", {}) or {}).get("feedback", {}),
+    }
+
+
+@app.get("/api/runs/{run_id}/learning-delta")
+def get_run_learning_delta(
+    run_id: str,
+    from_run: Optional[str] = Query(default=None),
+    domain: Optional[str] = Query(default=None),
+) -> Dict[str, Any]:
+    resolved_domain = _resolve_domain_for_run(run_id, domain)
+    result = _domain_result_or_404(run_id, resolved_domain)
+    current_report = _read_report_payload(_canonical_path(result.get("report_json", "")))
+    learning = current_report.get("learning", {}) or {}
+    summary = current_report.get("summary", {}) or {}
+    weak_deltas = current_report.get("weak_pattern_deltas", {}) or {}
+    base_payload: Dict[str, Any] = {
+        "run_id": run_id,
+        "domain": resolved_domain,
+        "learning_delta_status": learning.get("learning_delta_status", "unchanged"),
+        "improvement_deltas": (learning.get("state_snapshot", {}) or {}).get("improvement_deltas", {}),
+        "weak_pattern_deltas": weak_deltas,
+        "summary": {
+            "pass_rate": summary.get("pass_rate"),
+            "meets_quality_gate": summary.get("meets_quality_gate"),
+            "total_scenarios": summary.get("total_scenarios"),
+        },
+    }
+
+    if from_run:
+        from_domain = _resolve_domain_for_run(from_run, resolved_domain)
+        from_result = _domain_result_or_404(from_run, from_domain)
+        from_report = _read_report_payload(_canonical_path(from_result.get("report_json", "")))
+        from_summary = from_report.get("summary", {}) or {}
+        base_payload["comparison"] = {
+            "from_run": from_run,
+            "from_domain": from_domain,
+            "pass_rate_delta": round(
+                float(summary.get("pass_rate", 0.0)) - float(from_summary.get("pass_rate", 0.0)),
+                4,
+            ),
+            "failed_scenarios_delta": int(summary.get("failed_scenarios", 0))
+            - int(from_summary.get("failed_scenarios", 0)),
+        }
+
+    return base_payload
 
 
 if __name__ == "__main__":

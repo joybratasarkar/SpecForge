@@ -2,13 +2,6 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 
-const DOMAINS = ['ecommerce', 'healthcare', 'logistics', 'hr'];
-const DOMAIN_LABELS = {
-  ecommerce: 'E-commerce',
-  healthcare: 'Healthcare',
-  logistics: 'Logistics',
-  hr: 'HR'
-};
 const STEP_MARKERS = [
   { name: 'Spec Prepared', marker: '[OK] OpenAPI spec written' },
   { name: 'Run Started', marker: '[RUN] QA specialist agent' },
@@ -66,7 +59,7 @@ const CUSTOMER_APIS = [
     method: 'POST',
     path: '/api/jobs',
     purpose: 'Start one multi-domain agent run',
-    body: '{ domains[], tenantId, scriptKind, maxScenarios, passThreshold, verifyPersistence, ... }'
+    body: '{ domains[], specPaths{domain:path}, tenantId, scriptKind, maxScenarios, passThreshold, verifyPersistence, ... }'
   },
   {
     method: 'GET',
@@ -106,6 +99,7 @@ const CUSTOMER_APIS = [
   }
 ];
 const API_BASE = (process.env.NEXT_PUBLIC_BACKEND_BASE_URL || '').replace(/\/$/, '');
+const DEFAULT_TEST_BASE_URL = (process.env.NEXT_PUBLIC_TEST_BASE_URL || 'http://127.0.0.1:8000').replace(/\/$/, '');
 const API_URL = (path) => `${API_BASE}${path}`;
 const CONNECTION_MODE = API_BASE ? 'Direct FastAPI Backend' : 'Next.js API Proxy';
 const SCRIPT_KIND_LABELS = {
@@ -115,6 +109,65 @@ const SCRIPT_KIND_LABELS = {
   java_restassured: 'Java / RestAssured'
 };
 const SCRIPT_KINDS = ['python_pytest', 'javascript_jest', 'curl_script', 'java_restassured'];
+const DOMAIN_PRESET_OPTIONS = [
+  { value: 'ecommerce', label: 'E-commerce API (preset)' },
+  { value: 'healthcare', label: 'Healthcare Appointments API (preset)' },
+  { value: 'logistics', label: 'Logistics Shipment API (preset)' },
+  { value: 'hr', label: 'HR Recruitment API (preset)' }
+];
+const OPENAPI_SOURCE_OPTIONS = [
+  { value: 'preset', label: 'Use preset OpenAPI template (auto generated)' },
+  { value: 'custom_path', label: 'Use custom OpenAPI file path' }
+];
+
+function sanitizeDomainToken(value) {
+  return String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 64);
+}
+
+function parseDomainList(raw) {
+  const tokens = String(raw || '')
+    .split(/[\n,]/)
+    .map((item) => sanitizeDomainToken(item))
+    .filter(Boolean);
+  return [...new Set(tokens)];
+}
+
+function parseSpecPathsMap(raw) {
+  const out = {};
+  const lines = String(raw || '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  for (const line of lines) {
+    const eq = line.indexOf('=');
+    if (eq <= 0) {
+      continue;
+    }
+    const domain = sanitizeDomainToken(line.slice(0, eq));
+    const specPath = line.slice(eq + 1).trim();
+    if (!domain || !specPath) {
+      continue;
+    }
+    out[domain] = specPath;
+  }
+  return out;
+}
+
+function formatDomainLabel(domain) {
+  const clean = String(domain || '').trim();
+  if (!clean) {
+    return 'n/a';
+  }
+  return clean
+    .replace(/[_-]+/g, ' ')
+    .replace(/\b\w/g, (ch) => ch.toUpperCase());
+}
 
 function getField(obj, keys, fallback = null) {
   if (!obj) {
@@ -153,6 +206,15 @@ function formatBytes(value) {
     return `${(size / 1024).toFixed(1)} KB`;
   }
   return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function formatDelta(value, digits = 4) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) {
+    return 'n/a';
+  }
+  const sign = n > 0 ? '+' : '';
+  return `${sign}${n.toFixed(digits)}`;
 }
 
 function normalizeGeneratedTestItems(input) {
@@ -327,16 +389,24 @@ function parseGeneratedScriptInsights(kind, text) {
 }
 
 export default function HomePage() {
-  const [domains, setDomains] = useState(['ecommerce']);
+  const [domainsInput, setDomainsInput] = useState('');
+  const [specPathsInput, setSpecPathsInput] = useState('');
+  const [presetDomain, setPresetDomain] = useState('ecommerce');
+  const [presetOpenapiSource, setPresetOpenapiSource] = useState('preset');
+  const [presetSpecPath, setPresetSpecPath] = useState('');
   const [tenantId, setTenantId] = useState('customer_default');
+  const [workspaceId, setWorkspaceId] = useState('customer_default');
   const [runScriptKind, setRunScriptKind] = useState('python_pytest');
   const [prompt, setPrompt] = useState('');
   const [maxScenarios, setMaxScenarios] = useState(16);
+  const [maxRuntimeSec, setMaxRuntimeSec] = useState(0);
+  const [llmTokenCap, setLlmTokenCap] = useState(0);
+  const [environmentProfile, setEnvironmentProfile] = useState('mock');
   const [passThreshold, setPassThreshold] = useState(0.7);
-  const [baseUrl, setBaseUrl] = useState('http://localhost:8000');
+  const [baseUrl, setBaseUrl] = useState(DEFAULT_TEST_BASE_URL);
   const [customerRoot, setCustomerRoot] = useState('~/.spec_test_pilot');
   const [customerMode, setCustomerMode] = useState(true);
-  const [verifyPersistence, setVerifyPersistence] = useState(true);
+  const [verifyPersistence, setVerifyPersistence] = useState(false);
 
   const [job, setJob] = useState(null);
   const [reportText, setReportText] = useState('Select a domain report to inspect.');
@@ -355,6 +425,45 @@ export default function HomePage() {
   const [outputDomain, setOutputDomain] = useState('');
   const [flashMessage, setFlashMessage] = useState('');
   const [running, setRunning] = useState(false);
+  const [showTechnical, setShowTechnical] = useState(false);
+  const [connectionProbe, setConnectionProbe] = useState({
+    status: 'idle',
+    backend: 'unknown',
+    detail: ''
+  });
+
+  const domains = useMemo(() => parseDomainList(domainsInput), [domainsInput]);
+  const specPaths = useMemo(() => parseSpecPathsMap(specPathsInput), [specPathsInput]);
+  const selectedPresetDomain = useMemo(() => sanitizeDomainToken(presetDomain), [presetDomain]);
+  const submitDomains = useMemo(() => {
+    const merged = new Set(domains);
+    if (selectedPresetDomain) {
+      merged.add(selectedPresetDomain);
+    }
+    return [...merged];
+  }, [domains, selectedPresetDomain]);
+  const submitSpecPaths = useMemo(() => {
+    const merged = { ...specPaths };
+    if (!selectedPresetDomain) {
+      return merged;
+    }
+    if (presetOpenapiSource === 'custom_path') {
+      const customPath = String(presetSpecPath || '').trim();
+      if (customPath) {
+        merged[selectedPresetDomain] = customPath;
+      }
+    } else {
+      delete merged[selectedPresetDomain];
+    }
+    return merged;
+  }, [specPaths, selectedPresetDomain, presetOpenapiSource, presetSpecPath]);
+  const effectiveDomainCount = useMemo(() => {
+    const merged = new Set(submitDomains);
+    for (const domain of Object.keys(submitSpecPaths)) {
+      merged.add(domain);
+    }
+    return merged.size;
+  }, [submitDomains, submitSpecPaths]);
 
   const timerRef = useRef(null);
   const eventSourceRef = useRef(null);
@@ -377,14 +486,41 @@ export default function HomePage() {
   const trainingStats = reportJson?.agent_lightning?.training_stats || {};
   const learningFeedback = reportJson?.learning?.feedback || {};
   const selectionPolicy = reportJson?.selection_policy || {};
+  const mutationPolicy = reportJson?.mutation_policy || {};
+  const gamData = reportJson?.gam || {};
+  const scenarioContext = reportJson?.scenario_context || {};
+  const scenarioContextCounts = scenarioContext?.counts || {};
+  const scenarioContextSourceBreakdown = scenarioContext?.source_breakdown || {};
+  const gamResearchEngine = gamData?.research_engine || {};
+  const promptTrace = reportJson?.prompt_trace || {};
+  const scenarioGeneration = promptTrace?.scenario_generation || {};
+  const llmGenerationDiagnostics = scenarioGeneration?.llm_diagnostics || {};
+  const llmParseDiagnostics = llmGenerationDiagnostics?.parse_diagnostics || {};
+  const gamDiagnostics = gamData?.diagnostics || {};
+  const gamPlan = Array.isArray(gamData?.research_plan) ? gamData.research_plan : [];
+  const gamLearningSignalPageId = gamData?.learning_signal_page_id || null;
+  const gamSpecContextPageId = gamData?.spec_context_page_id || null;
+  const gamResearchExcerpts = Array.isArray(gamData?.research_excerpts) ? gamData.research_excerpts : [];
+  const gamEngineIterations = Array.isArray(gamResearchEngine?.iterations) ? gamResearchEngine.iterations : [];
+  const gamSourceBreakdown = gamData?.excerpt_source_breakdown || gamDiagnostics?.source_breakdown || {};
+  const gamWarnings = Array.isArray(gamDiagnostics?.warnings) ? gamDiagnostics.warnings : [];
+  const gamExcerptPreview = (Array.isArray(gamData?.excerpt_preview) && gamData.excerpt_preview.length > 0)
+    ? gamData.excerpt_preview
+    : (Array.isArray(promptTrace?.memory_excerpt_preview) ? promptTrace.memory_excerpt_preview : []);
   const stateSnapshot = reportJson?.learning?.state_snapshot || {};
   const scenarioResults = Array.isArray(reportJson?.scenario_results) ? reportJson.scenario_results : [];
   const topDecisions = Array.isArray(selectionPolicy?.top_decisions) ? selectionPolicy.top_decisions : [];
   const weakestPatterns = Array.isArray(stateSnapshot?.weakest_patterns) ? stateSnapshot.weakest_patterns : [];
+  const decisionHistoryTail = Array.isArray(stateSnapshot?.decision_history_tail)
+    ? stateSnapshot.decision_history_tail
+    : [];
+  const latestRunMetrics = stateSnapshot?.latest_run_metrics || {};
+  const previousRunMetrics = stateSnapshot?.previous_run_metrics || {};
+  const improvementDeltas = stateSnapshot?.improvement_deltas || {};
   const rewardBreakdown = learningFeedback?.reward_breakdown || {};
   const resultSummaries = Object.values(results).map((r) => r?.summary || {});
   const resultDomains = Object.keys(results);
-  const selectedDomainLabel = selectedReportDomain ? DOMAIN_LABELS[selectedReportDomain] || selectedReportDomain : 'none';
+  const selectedDomainLabel = selectedReportDomain ? formatDomainLabel(selectedReportDomain) : 'none';
   const passedScenarioCount = scenarioResults.filter((row) => !!row?.passed).length;
   const failedScenarioCount = Math.max(0, scenarioResults.length - passedScenarioCount);
   const successDomainCount = Object.values(results).filter((result) => {
@@ -421,6 +557,123 @@ export default function HomePage() {
       return blob.includes(needle);
     });
   }, [scenarioFilter, scenarioResults, scenarioSearch]);
+
+  const scenarioCoverageRows = useMemo(() => {
+    const map = new Map();
+    for (const row of scenarioResults) {
+      const testType = String(row?.test_type || 'unknown');
+      const current = map.get(testType) || { testType, total: 0, passed: 0, failed: 0 };
+      current.total += 1;
+      if (row?.passed) {
+        current.passed += 1;
+      } else {
+        current.failed += 1;
+      }
+      map.set(testType, current);
+    }
+    return Array.from(map.values()).sort((a, b) => b.total - a.total);
+  }, [scenarioResults]);
+
+  const endpointCoverageCount = useMemo(() => {
+    const unique = new Set();
+    for (const row of scenarioResults) {
+      const method = String(row?.method || '').toUpperCase();
+      const endpoint = String(row?.endpoint_template || '');
+      const key = `${method} ${endpoint}`.trim();
+      if (key) {
+        unique.add(key);
+      }
+    }
+    return unique.size;
+  }, [scenarioResults]);
+
+  const rlExecutedScenarioCount = useMemo(() => {
+    return scenarioResults.filter((row) => String(row?.name || '').includes('_rl_')).length;
+  }, [scenarioResults]);
+
+  const historySeedExecutedCount = useMemo(() => {
+    return scenarioResults.filter((row) => String(row?.name || '').includes('rl_history_seed')).length;
+  }, [scenarioResults]);
+
+  const decisionSignals = Array.isArray(learningFeedback?.decision_signals)
+    ? learningFeedback.decision_signals
+    : [];
+
+  const topImprovedScenarios = useMemo(() => {
+    return [...decisionSignals]
+      .filter((item) => Number(item?.reward) >= 0)
+      .sort((a, b) => Number(b?.reward || 0) - Number(a?.reward || 0))
+      .slice(0, 6);
+  }, [decisionSignals]);
+
+  const topFailedScenarios = useMemo(() => {
+    return [...decisionSignals]
+      .filter((item) => Number(item?.reward) < 0)
+      .sort((a, b) => Number(a?.reward || 0) - Number(b?.reward || 0))
+      .slice(0, 6);
+  }, [decisionSignals]);
+
+  const rlMutationExamples = useMemo(() => {
+    const raw = Array.isArray(mutationPolicy?.applied_examples)
+      ? mutationPolicy.applied_examples
+      : [];
+    return raw.slice(0, 8);
+  }, [mutationPolicy]);
+  const mutationStrategyBreakdown = useMemo(() => {
+    const raw = mutationPolicy?.mutation_strategy_breakdown;
+    if (!raw || typeof raw !== 'object') {
+      return [];
+    }
+    return Object.entries(raw)
+      .map(([strategy, count]) => [String(strategy), Number(count || 0)])
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 10);
+  }, [mutationPolicy]);
+
+  const executedScenarioSources = useMemo(() => {
+    const contextSelected = scenarioContextSourceBreakdown?.selected;
+    if (contextSelected && typeof contextSelected === 'object') {
+      return {
+        llmBase: Number(getField(contextSelected, ['llm_base'], 0)),
+        heuristicBase: Number(getField(contextSelected, ['heuristic_base'], 0)),
+        rlMutation: Number(getField(contextSelected, ['rl_mutation'], 0)),
+        rlHistorySeed: Number(getField(contextSelected, ['rl_history_seed'], 0))
+      };
+    }
+    const baseSourceHint = String(getField(promptTrace, ['scenario_generation', 'base_source'], 'llm_base'));
+    let llmBase = 0;
+    let heuristicBase = 0;
+    let rlMutation = 0;
+    let rlHistorySeed = 0;
+    for (const row of scenarioResults) {
+      const name = String(row?.name || '');
+      if (name.includes('rl_history_seed')) {
+        rlHistorySeed += 1;
+      } else if (name.includes('_rl_')) {
+        rlMutation += 1;
+      } else {
+        if (baseSourceHint === 'heuristic_base') {
+          heuristicBase += 1;
+        } else {
+          llmBase += 1;
+        }
+      }
+    }
+    return {
+      llmBase,
+      heuristicBase,
+      rlMutation,
+      rlHistorySeed
+    };
+  }, [promptTrace, scenarioResults, scenarioContextSourceBreakdown]);
+
+  const selectedScenarioContextRows = useMemo(() => {
+    const raw = getField(scenarioContext, ['selected_scenarios'], []);
+    if (!Array.isArray(raw)) {
+      return [];
+    }
+    return raw.slice(0, 40);
+  }, [scenarioContext]);
 
   const selectedScriptContent = useMemo(() => {
     if (selectedScriptKind && Object.prototype.hasOwnProperty.call(generatedScriptContents, selectedScriptKind)) {
@@ -461,6 +714,16 @@ export default function HomePage() {
   const checkpointValue = getField(selectedDomainResult, ['checkpointPath', 'checkpoint'], '');
   const reportJsonPathValue = getField(selectedDomainResult, ['reportJsonPath', 'report_json'], '');
   const reportMdPathValue = getField(selectedDomainResult, ['reportMdPath', 'report_md'], '');
+  const firstPassReportJsonPath = getField(
+    selectedDomainResult,
+    ['firstPassReportJsonPath', 'first_pass_report_json'],
+    ''
+  );
+  const secondPassReportJsonPath = getField(
+    selectedDomainResult,
+    ['secondPassReportJsonPath', 'second_pass_report_json'],
+    ''
+  );
   const openapiPathFromLog = findLastLogMatch(job?.logs || [], /OpenAPI spec written:\s*(.+)$/i)?.[1]?.trim() || '';
   const commandFromLog = findLastLogMatch(job?.logs || [], /\$\s+bash\s+(.+)$/i)?.[1]?.trim() || '';
   const reportJsonPathFromLog = findLastLogMatch(job?.logs || [], /JSON report:\s*(.+)$/i)?.[1]?.trim() || '';
@@ -513,14 +776,41 @@ export default function HomePage() {
         }
       },
       {
+        id: 'spec_intelligence',
+        title: '4) Spec Intelligence + OSS Tooling',
+        ready: Boolean(reportJson?.spec_intelligence || reportJson?.oss_tooling),
+        payload: {
+          spec_intelligence: reportJson?.spec_intelligence || null,
+          oss_tooling: reportJson?.oss_tooling || null,
+          metadata_stage_metrics_ms: reportJson?.metadata?.stage_metrics_ms || {}
+        }
+      },
+      {
+        id: 'prompt_trace',
+        title: '5) Prompt Assembly Output',
+        ready: Boolean(reportJson?.prompt_trace),
+        payload: reportJson?.prompt_trace || null
+      },
+      {
         id: 'scenario_selection',
-        title: '4) Scenario Selection Output',
+        title: '6) Scenario Selection Output',
         ready: Boolean(reportJson?.selection_policy),
         payload: reportJson?.selection_policy || null
       },
       {
+        id: 'scenario_context',
+        title: '7) Scenario Context (LLM/GAM/RL Influence)',
+        ready: Boolean(reportJson?.scenario_context),
+        payload: {
+          scenario_context: reportJson?.scenario_context || null,
+          prompt_gam_focus_points: reportJson?.prompt_trace?.gam_focus_points_used || [],
+          prompt_rl_focus_points: reportJson?.prompt_trace?.rl_focus_points_used || [],
+          mutation_policy: reportJson?.mutation_policy || null
+        }
+      },
+      {
         id: 'generated_tests',
-        title: '5) Generated Test Scripts (API Output)',
+        title: '8) Generated Test Scripts (API Output)',
         ready: generatedTests.length > 0 || Boolean(reportJson?.generated_test_files),
         payload: {
           selected_domain: generatedTestsDomain || selectedStateDomain || null,
@@ -534,7 +824,7 @@ export default function HomePage() {
       },
       {
         id: 'scenario_execution',
-        title: '6) Executed Scenario Results',
+        title: '9) Executed Scenario Results',
         ready: scenarioResults.length > 0,
         payload: {
           total: scenarioResults.length,
@@ -545,13 +835,13 @@ export default function HomePage() {
       },
       {
         id: 'gam_research',
-        title: '7) GAM Deep Research State',
+        title: '10) GAM Deep Research State',
         ready: Boolean(reportJson?.gam),
         payload: reportJson?.gam || null
       },
       {
         id: 'rl_training',
-        title: '8) RL Training State',
+        title: '11) RL Training State',
         ready: Boolean(reportJson?.agent_lightning || reportJson?.learning),
         payload: {
           learning: reportJson?.learning || null,
@@ -560,12 +850,14 @@ export default function HomePage() {
       },
       {
         id: 'final_reports',
-        title: '9) Final Report Paths + Payload',
+        title: '12) Final Report Paths + Payload',
         ready: Boolean(reportJson || reportJsonPathValue || reportMdPathValue),
         payload: {
           report_files: reportJson?.report_files || null,
           report_json_from_domain_result: reportJsonPathValue || null,
           report_md_from_domain_result: reportMdPathValue || null,
+          report_json_first_pass: firstPassReportJsonPath || null,
+          report_json_second_pass: secondPassReportJsonPath || null,
           report_json_from_log: reportJsonPathFromLog || null,
           report_md_from_log: reportMdPathFromLog || null
         }
@@ -591,6 +883,8 @@ export default function HomePage() {
     reportJsonPathValue,
     reportMdPathFromLog,
     reportMdPathValue,
+    firstPassReportJsonPath,
+    secondPassReportJsonPath,
     generatedScriptExecution,
     scenarioResults,
     selectedDomainResult,
@@ -706,16 +1000,17 @@ export default function HomePage() {
     source.onerror = () => {
       source.close();
       eventSourceRef.current = null;
-      // Fallback to polling if SSE stream disconnects during active run.
-      if (jobId && running) {
+      // Fallback to polling if SSE stream disconnects.
+      // Do not gate on React state here; closures can hold stale `running=false`.
+      if (jobId && !timerRef.current) {
         timerRef.current = setTimeout(() => pollJob(jobId), 1500);
       }
     };
   }
 
   async function onRun() {
-    if (!domains.length) {
-      alert('Select at least one domain.');
+    if (effectiveDomainCount === 0) {
+      alert('Provide at least one domain or a spec path mapping.');
       return;
     }
 
@@ -734,11 +1029,16 @@ export default function HomePage() {
     autoLoadedJobRef.current = '';
 
     const body = {
-      domains,
+      domains: submitDomains,
+      specPaths: submitSpecPaths,
       tenantId,
+      workspaceId,
       scriptKind: runScriptKind,
       prompt: prompt.trim() || null,
       maxScenarios,
+      maxRuntimeSec: Number(maxRuntimeSec) > 0 ? Number(maxRuntimeSec) : null,
+      llmTokenCap: Number(llmTokenCap) > 0 ? Number(llmTokenCap) : null,
+      environmentProfile,
       passThreshold,
       baseUrl,
       customerMode,
@@ -747,13 +1047,30 @@ export default function HomePage() {
     };
 
     const reqUrl = API_URL('/api/jobs');
-    const res = await fetch(reqUrl, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(body)
-    });
+    let res;
+    try {
+      res = await fetch(reqUrl, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+    } catch (error) {
+      setRunning(false);
+      const detail = error instanceof Error ? error.message : String(error);
+      const modeHint = API_BASE
+        ? 'Start backend with ./backend/start-backend.sh, or run UI in local proxy mode: QA_UI_MODE=full_next ./frontend/run_customer_ui_next.sh'
+        : 'Check that Next.js API routes are running in this UI process.';
+      alert(`Failed to reach API: ${reqUrl}\n${modeHint}\n\n${detail}`);
+      return;
+    }
 
-    const payload = await res.json();
+    let payload = {};
+    const rawPayload = await res.text();
+    try {
+      payload = rawPayload ? JSON.parse(rawPayload) : {};
+    } catch {
+      payload = { error: rawPayload || 'Unexpected non-JSON response from API' };
+    }
     if (!res.ok) {
       setRunning(false);
       alert(payload.error || 'Failed to start run');
@@ -767,6 +1084,11 @@ export default function HomePage() {
       return;
     }
     connectRealtime(startedJobId);
+    // Safety-net polling starts immediately and continues until terminal status.
+    // This keeps UI state moving even if SSE is interrupted or browser-filtered.
+    if (!timerRef.current) {
+      timerRef.current = setTimeout(() => pollJob(startedJobId), 1500);
+    }
   }
 
   async function loadAllGeneratedScripts(domain, items) {
@@ -924,15 +1246,6 @@ export default function HomePage() {
     await openReport(outputDomain, format);
   }
 
-  function toggleDomain(domain) {
-    setDomains((prev) => {
-      if (prev.includes(domain)) {
-        return prev.filter((d) => d !== domain);
-      }
-      return [...prev, domain];
-    });
-  }
-
   useEffect(() => {
     if (!jobId || selectedReportDomain || resultDomains.length === 0) {
       return;
@@ -958,6 +1271,47 @@ export default function HomePage() {
   }, [resultDomains, outputDomain]);
 
   useEffect(() => {
+    let active = true;
+    setConnectionProbe({
+      status: 'checking',
+      backend: 'unknown',
+      detail: ''
+    });
+
+    const probe = async () => {
+      try {
+        const res = await fetch(API_URL('/api/ping'), { cache: 'no-store' });
+        if (!res.ok) {
+          throw new Error(`HTTP ${res.status}`);
+        }
+        const payload = await res.json();
+        if (!active) {
+          return;
+        }
+        setConnectionProbe({
+          status: 'ok',
+          backend: String(payload?.backend || 'unknown'),
+          detail: String(payload?.service || '')
+        });
+      } catch (error) {
+        if (!active) {
+          return;
+        }
+        setConnectionProbe({
+          status: 'error',
+          backend: 'unreachable',
+          detail: String(error?.message || error || 'unknown_error')
+        });
+      }
+    };
+
+    void probe();
+    return () => {
+      active = false;
+    };
+  }, [API_BASE]);
+
+  useEffect(() => {
     return () => {
       closeRealtimeConnection();
       if (flashTimerRef.current) {
@@ -979,6 +1333,13 @@ export default function HomePage() {
             <span className="header-badge">domains={resultDomains.length}</span>
             <span className="header-badge">success={successDomainCount}</span>
             <span className="header-badge">pass_rate={overallPassRate}</span>
+            <span className={`header-badge ${API_BASE ? 'ok' : 'warn'}`}>
+              mode={API_BASE ? 'fastapi' : 'next_proxy'}
+            </span>
+            <span className="header-badge">backend={API_BASE || 'same-origin'}</span>
+            <span className={`header-badge ${connectionProbe.status === 'ok' && connectionProbe.backend === 'fastapi' ? 'ok' : 'warn'}`}>
+              probe={connectionProbe.status}:{connectionProbe.backend}
+            </span>
           </div>
         </div>
         {flashMessage && <div className="toast">{flashMessage}</div>}
@@ -989,24 +1350,74 @@ export default function HomePage() {
           <h2>Run Configuration</h2>
 
           <div className="field">
-            <label>Domains</label>
-            <div className="domains">
-              {DOMAINS.map((domain) => (
-                <label className="domain" key={domain}>
-                  <input
-                    type="checkbox"
-                    checked={domains.includes(domain)}
-                    onChange={() => toggleDomain(domain)}
-                  />{' '}
-                  {domain}
-                </label>
+            <label>Domain (predefined)</label>
+            <select value={presetDomain} onChange={(e) => setPresetDomain(e.target.value)}>
+              {DOMAIN_PRESET_OPTIONS.map((item) => (
+                <option key={item.value} value={item.value}>
+                  {item.label}
+                </option>
               ))}
+            </select>
+          </div>
+
+          <div className="field">
+            <label>OpenAPI spec source</label>
+            <select value={presetOpenapiSource} onChange={(e) => setPresetOpenapiSource(e.target.value)}>
+              {OPENAPI_SOURCE_OPTIONS.map((item) => (
+                <option key={item.value} value={item.value}>
+                  {item.label}
+                </option>
+              ))}
+            </select>
+            {presetOpenapiSource === 'custom_path' && (
+              <input
+                value={presetSpecPath}
+                onChange={(e) => setPresetSpecPath(e.target.value)}
+                placeholder="~/specs/openapi_custom.yaml"
+              />
+            )}
+            <div className="small">
+              selected_domain={selectedPresetDomain || 'none'} | openapi_source=
+              {presetOpenapiSource === 'preset' ? 'preset_template' : 'custom_path'}
             </div>
+          </div>
+
+          <details className="advanced">
+            <summary>Advanced domain/spec overrides (optional)</summary>
+            <div className="field">
+              <label>Additional Domains (comma/newline list)</label>
+              <textarea
+                value={domainsInput}
+                onChange={(e) => setDomainsInput(e.target.value)}
+                placeholder={'payments\npartner_api'}
+              />
+            </div>
+            <div className="field">
+              <label>Spec Paths (optional, one per line)</label>
+              <textarea
+                value={specPathsInput}
+                onChange={(e) => setSpecPathsInput(e.target.value)}
+                placeholder={'payments=/tmp/openapi_payments.yaml\npartner_api=~/specs/partner.yaml'}
+              />
+            </div>
+            <div className="small">
+              format: domain=/absolute/or/home-relative/path/to/openapi.yaml | manual_domains=
+              {domains.join(', ') || 'none'}
+            </div>
+          </details>
+
+          <div className="small">
+            effective_domains={String(effectiveDomainCount)} | submit_domains={submitDomains.join(', ') || 'none'}
           </div>
 
           <div className="field">
             <label>Tenant ID</label>
             <input value={tenantId} onChange={(e) => setTenantId(e.target.value)} />
+          </div>
+
+          <div className="field">
+            <label>Workspace ID</label>
+            <input value={workspaceId} onChange={(e) => setWorkspaceId(e.target.value)} />
           </div>
 
           <div className="field">
@@ -1032,6 +1443,37 @@ export default function HomePage() {
           </div>
 
           <div className="field">
+            <label>Max Runtime Seconds (optional)</label>
+            <input
+              type="number"
+              min={0}
+              max={7200}
+              value={maxRuntimeSec}
+              onChange={(e) => setMaxRuntimeSec(Number(e.target.value || 0))}
+            />
+          </div>
+
+          <div className="field">
+            <label>LLM Token Cap (optional)</label>
+            <input
+              type="number"
+              min={0}
+              max={16000}
+              value={llmTokenCap}
+              onChange={(e) => setLlmTokenCap(Number(e.target.value || 0))}
+            />
+          </div>
+
+          <div className="field">
+            <label>Environment Profile</label>
+            <select value={environmentProfile} onChange={(e) => setEnvironmentProfile(e.target.value)}>
+              <option value="mock">mock</option>
+              <option value="staging">staging</option>
+              <option value="prod_safe">prod_safe</option>
+            </select>
+          </div>
+
+          <div className="field">
             <label>Pass Threshold (0..1)</label>
             <input
               type="number"
@@ -1046,6 +1488,9 @@ export default function HomePage() {
           <div className="field">
             <label>Base URL</label>
             <input value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} />
+            <div className="small">
+              Used as `BASE_URL` inside generated test scripts. Default from `NEXT_PUBLIC_TEST_BASE_URL`.
+            </div>
           </div>
 
           <div className="field">
@@ -1073,7 +1518,15 @@ export default function HomePage() {
                 checked={verifyPersistence}
                 onChange={(e) => setVerifyPersistence(e.target.checked)}
               />{' '}
-              verify persistence (auto second pass)
+              verify persistence (auto second pass, slower)
+            </label>
+            <label>
+              <input
+                type="checkbox"
+                checked={showTechnical}
+                onChange={(e) => setShowTechnical(e.target.checked)}
+              />{' '}
+              show technical details (logs + raw state)
             </label>
           </div>
 
@@ -1106,6 +1559,325 @@ export default function HomePage() {
             </div>
           </div>
 
+          <div className="card">
+            <h2>RL Improvement Over Time</h2>
+            {!reportJson && (
+              <div className="small">Open a domain JSON report to see learning progress per run.</div>
+            )}
+            {reportJson && (
+              <>
+                <div className="report-grid">
+                  <div className="report-metric">
+                    <span>Learning Runs</span>
+                    <strong>{String(getField(stateSnapshot, ['run_count'], 'n/a'))}</strong>
+                  </div>
+                  <div className="report-metric">
+                    <span>RL Steps</span>
+                    <strong>{String(getField(trainingStats, ['rl_training_steps'], 'n/a'))}</strong>
+                  </div>
+                  <div className="report-metric">
+                    <span>RL Buffer</span>
+                    <strong>{String(getField(trainingStats, ['rl_buffer_size'], 'n/a'))}</strong>
+                  </div>
+                  <div className="report-metric">
+                    <span>Run Reward Δ</span>
+                    <strong>{formatDelta(getField(improvementDeltas, ['run_reward_delta'], null), 4)}</strong>
+                  </div>
+                  <div className="report-metric">
+                    <span>Avg Decision Reward Δ</span>
+                    <strong>{formatDelta(getField(improvementDeltas, ['avg_decision_reward_delta'], null), 4)}</strong>
+                  </div>
+                  <div className="report-metric">
+                    <span>Penalized Decisions Δ</span>
+                    <strong>{formatDelta(getField(improvementDeltas, ['penalized_decisions_delta'], null), 0)}</strong>
+                  </div>
+                </div>
+                <div className="small">
+                  latest_run_reward={String(getField(latestRunMetrics, ['run_reward'], 'n/a'))} | previous_run_reward=
+                  {String(getField(previousRunMetrics, ['run_reward'], 'n/a'))}
+                </div>
+                <div className="small">
+                  first_pass_report={firstPassReportJsonPath || 'n/a'}
+                  <br />
+                  second_pass_report={secondPassReportJsonPath || 'n/a'}
+                </div>
+                {decisionHistoryTail.length > 0 && (
+                  <div className="scenario-table-wrap">
+                    <table className="scenario-table">
+                      <thead>
+                        <tr>
+                          <th>run</th>
+                          <th>run_reward</th>
+                          <th>avg_decision_reward</th>
+                          <th>rewarded</th>
+                          <th>penalized</th>
+                          <th>timestamp</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {decisionHistoryTail.map((item, idx) => (
+                          <tr key={`${String(item.timestamp || '')}-${idx}`}>
+                            <td>{String(idx + 1)}</td>
+                            <td>{String(getField(item, ['run_reward'], 'n/a'))}</td>
+                            <td>{String(getField(item, ['average_decision_reward'], 'n/a'))}</td>
+                            <td>{String(getField(item, ['rewarded_decisions'], 'n/a'))}</td>
+                            <td>{String(getField(item, ['penalized_decisions'], 'n/a'))}</td>
+                            <td>{String(getField(item, ['timestamp'], 'n/a'))}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+
+          <div className="card">
+            <h2>Scenario Influence Map (LLM vs GAM vs RL)</h2>
+            {!reportJson && (
+              <div className="small">Open a domain JSON report to inspect how each component influenced the run.</div>
+            )}
+            {reportJson && (
+              <>
+                <div className="report-grid">
+                  <div className="report-metric">
+                    <span>Base Candidates</span>
+                    <strong>{String(getField(selectionPolicy, ['base_candidate_count'], getField(scenarioContextCounts, ['base_generated'], 'n/a')))}</strong>
+                  </div>
+                  <div className="report-metric">
+                    <span>RL Added Candidates</span>
+                    <strong>{String(getField(mutationPolicy, ['mutated_candidates_added'], 0))}</strong>
+                  </div>
+                  <div className="report-metric">
+                    <span>Selected For Execution</span>
+                    <strong>{String(getField(selectionPolicy, ['selected_count'], 'n/a'))}</strong>
+                  </div>
+                  <div className="report-metric">
+                    <span>GAM Excerpts Used</span>
+                    <strong>{String(getField(gamDiagnostics, ['total_excerpts'], getField(gamData, ['research_excerpt_count'], 0)))}</strong>
+                  </div>
+                  <div className="report-metric">
+                    <span>GAM Plan Items</span>
+                    <strong>{String(getField(gamData, ['research_plan_count'], gamPlan.length))}</strong>
+                  </div>
+                  <div className="report-metric">
+                    <span>GAM Planner Mode</span>
+                    <strong>{String((getField(gamResearchEngine, ['plan_modes'], []).slice(-1)[0]) || 'heuristic')}</strong>
+                  </div>
+                  <div className="report-metric">
+                    <span>GAM Reflector Mode</span>
+                    <strong>{String((getField(gamResearchEngine, ['reflect_modes'], []).slice(-1)[0]) || 'heuristic')}</strong>
+                  </div>
+                  <div className="report-metric">
+                    <span>GAM Quality Score</span>
+                    <strong>{String(getField(gamDiagnostics, ['quality_score'], 'n/a'))}</strong>
+                  </div>
+                  <div className="report-metric">
+                    <span>RL Training Enabled</span>
+                    <strong>{String(getField(trainingStats, ['training_enabled'], 'n/a'))}</strong>
+                  </div>
+                </div>
+
+                <div className="scenario-panel">
+                  <div className="scenario-head">
+                    <h3>Executed Scenarios By Source</h3>
+                  </div>
+                  <div className="report-grid">
+                    <div className="report-metric">
+                      <span>Base Generated</span>
+                      <strong>{String(getField(scenarioContextCounts, ['base_generated'], getField(selectionPolicy, ['base_candidate_count'], 'n/a')))}</strong>
+                    </div>
+                    <div className="report-metric">
+                      <span>Candidate Pool</span>
+                      <strong>{String(getField(scenarioContextCounts, ['candidate_total'], getField(selectionPolicy, ['candidate_count'], 'n/a')))}</strong>
+                    </div>
+                    <div className="report-metric">
+                      <span>Selected Total</span>
+                      <strong>{String(getField(scenarioContextCounts, ['selected_total'], getField(selectionPolicy, ['selected_count'], 'n/a')))}</strong>
+                    </div>
+                    <div className="report-metric">
+                      <span>LLM Base Executed</span>
+                      <strong>{String(executedScenarioSources.llmBase)}</strong>
+                    </div>
+                    <div className="report-metric">
+                      <span>Heuristic Base Executed</span>
+                      <strong>{String(executedScenarioSources.heuristicBase)}</strong>
+                    </div>
+                    <div className="report-metric">
+                      <span>RL Mutation Executed</span>
+                      <strong>{String(executedScenarioSources.rlMutation)}</strong>
+                    </div>
+                    <div className="report-metric">
+                      <span>RL History-Seed Executed</span>
+                      <strong>{String(executedScenarioSources.rlHistorySeed)}</strong>
+                    </div>
+                    <div className="report-metric">
+                      <span>Selected New vs History</span>
+                      <strong>{String(getField(scenarioContextCounts, ['selected_new_vs_history'], 'n/a'))}</strong>
+                    </div>
+                    <div className="report-metric">
+                      <span>Selected Weak Historical</span>
+                      <strong>{String(getField(scenarioContextCounts, ['selected_historical_weak_patterns'], 'n/a'))}</strong>
+                    </div>
+                  </div>
+                  <div className="small">
+                    interpretation: LLM creates base candidates, GAM enriches the prompt/research context, RL expands and selects high-value scenarios.
+                  </div>
+                  {selectedScenarioContextRows.length > 0 && (
+                    <div className="scenario-table-wrap">
+                      <table className="scenario-table">
+                        <thead>
+                          <tr>
+                            <th>name</th>
+                            <th>source</th>
+                            <th>strategy</th>
+                            <th>reason</th>
+                            <th>hist_seen</th>
+                            <th>hist_fail_rate</th>
+                            <th>expected</th>
+                            <th>actual</th>
+                            <th>passed</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {selectedScenarioContextRows.map((item, idx) => (
+                            <tr key={`${String(item?.fingerprint || item?.name || 'row')}-${idx}`}>
+                              <td>{String(getField(item, ['name'], 'n/a'))}</td>
+                              <td>{String(getField(item, ['source'], 'n/a'))}</td>
+                              <td>{String(getField(item, ['mutation_strategy'], '')) || '-'}</td>
+                              <td>{String(getField(item, ['selection_reason'], 'n/a'))}</td>
+                              <td>{String(getField(item, ['historical_seen_before'], 'n/a'))}</td>
+                              <td>{String(getField(item, ['historical_failure_rate_before'], 'n/a'))}</td>
+                              <td>{String(getField(item, ['expected_status'], 'n/a'))}</td>
+                              <td>{String(getField(item, ['actual_status'], 'n/a'))}</td>
+                              <td>{String(getField(item, ['passed'], 'n/a'))}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </div>
+
+                <div className="scenario-panel">
+                  <div className="scenario-head">
+                    <h3>GAM Research Influence</h3>
+                  </div>
+                  <div className="report-grid">
+                    <div className="report-metric">
+                      <span>Convention Excerpts</span>
+                      <strong>{String(getField(gamDiagnostics, ['convention_excerpts'], 'n/a'))}</strong>
+                    </div>
+                    <div className="report-metric">
+                      <span>Non-Convention Excerpts</span>
+                      <strong>{String(getField(gamDiagnostics, ['non_convention_excerpts'], 'n/a'))}</strong>
+                    </div>
+                    <div className="report-metric">
+                      <span>Actionable Excerpts</span>
+                      <strong>{String(getField(gamDiagnostics, ['actionable_excerpt_count'], 'n/a'))}</strong>
+                    </div>
+                    <div className="report-metric">
+                      <span>Machine-Like Excerpts</span>
+                      <strong>{String(getField(gamDiagnostics, ['machine_like_excerpt_count'], 'n/a'))}</strong>
+                    </div>
+                  </div>
+                  <div className="small">
+                    warnings: {gamWarnings.length > 0 ? gamWarnings.join(' | ') : 'none'}
+                  </div>
+                  <div className="small">
+                    plan: {gamPlan.length > 0
+                      ? gamPlan.join(' | ')
+                      : 'n/a'}
+                  </div>
+                  <div className="small">
+                    reflection: {String(getField(gamData, ['research_reflection'], 'n/a'))}
+                  </div>
+                  <div className="small">
+                    gam_llm_enabled: {String(Boolean(getField(gamResearchEngine, ['llm_enabled'], false)))} |
+                    gam_llm_model: {String(getField(gamResearchEngine, ['llm_model'], 'n/a'))}
+                  </div>
+                  <div className="small">
+                    gam_llm_stats: plan_success=
+                    {String(getField(gamResearchEngine, ['llm_stats', 'plan_success'], 0))} /
+                    {String(getField(gamResearchEngine, ['llm_stats', 'plan_calls'], 0))}, reflect_success=
+                    {String(getField(gamResearchEngine, ['llm_stats', 'reflect_success'], 0))} /
+                    {String(getField(gamResearchEngine, ['llm_stats', 'reflect_calls'], 0))}
+                  </div>
+                  <div className="small">
+                    learning_signal_page_id: {String(gamLearningSignalPageId || 'none')}
+                  </div>
+                  <div className="small">
+                    spec_context_page_id: {String(gamSpecContextPageId || 'none')}
+                  </div>
+                  <details className="advanced">
+                    <summary>GAM Planner/Reflector Iteration Trace</summary>
+                    <pre>{toJsonString(gamEngineIterations)}</pre>
+                  </details>
+                  <details className="advanced">
+                    <summary>GAM Excerpt Source Breakdown</summary>
+                    <pre>{toJsonString(gamSourceBreakdown)}</pre>
+                  </details>
+                  <details className="advanced">
+                    <summary>GAM Excerpt Preview</summary>
+                    <pre>{toJsonString(gamExcerptPreview)}</pre>
+                  </details>
+                  <details className="advanced">
+                    <summary>GAM Retrieved Excerpts (Raw)</summary>
+                    <pre>{toJsonString(gamResearchExcerpts)}</pre>
+                  </details>
+                </div>
+
+                <div className="scenario-panel">
+                  <div className="scenario-head">
+                    <h3>RL Mutation Influence (Examples)</h3>
+                  </div>
+                  {mutationStrategyBreakdown.length > 0 && (
+                    <div className="small">
+                      strategy_mix: {mutationStrategyBreakdown.map(([name, count]) => `${name}=${count}`).join(' | ')}
+                    </div>
+                  )}
+                  {rlMutationExamples.length === 0 && (
+                    <div className="small">No RL mutation examples recorded in this run.</div>
+                  )}
+                  {rlMutationExamples.length > 0 && (
+                    <div className="scenario-table-wrap">
+                      <table className="scenario-table">
+                        <thead>
+                          <tr>
+                            <th>from</th>
+                            <th>to</th>
+                            <th>strategy</th>
+                            <th>test_type</th>
+                            <th>expected_status</th>
+                            <th>priority</th>
+                            <th>budget</th>
+                            <th>op_fail_rate</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {rlMutationExamples.map((item, idx) => (
+                            <tr key={`${String(item.to || 'row')}-${idx}`}>
+                              <td>{String(item.from || item.from_fingerprint || 'history_seed')}</td>
+                              <td>{String(item.to || 'n/a')}</td>
+                              <td>{String(item.strategy || item.source || 'n/a')}</td>
+                              <td>{String(item.test_type || 'n/a')}</td>
+                              <td>{String(item.expected_status ?? 'n/a')}</td>
+                              <td>{String(item.priority ?? 'n/a')}</td>
+                              <td>{String(item.mutation_budget ?? 'n/a')}</td>
+                              <td>{String(item.operation_failure_rate ?? 'n/a')}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </div>
+              </>
+            )}
+          </div>
+
+          {showTechnical && (
           <div className="card">
             <details className="advanced">
               <summary>How It Works (API + Agent Flow)</summary>
@@ -1142,6 +1914,7 @@ export default function HomePage() {
               </div>
             </details>
           </div>
+          )}
 
           <div className="card">
             <h2>Domain Results</h2>
@@ -1167,7 +1940,7 @@ export default function HomePage() {
                 return (
                   <div className="result" key={domain}>
                     <h3>
-                      {DOMAIN_LABELS[domain] || domain}
+                      {formatDomainLabel(domain)}
                       <span className={`pill ${ok ? 'ok' : 'bad'}`}>{ok ? 'ok' : 'failed'}</span>
                     </h3>
                     <div className="small">
@@ -1192,7 +1965,7 @@ export default function HomePage() {
           </div>
 
           <div className="card">
-            <details className="advanced" open>
+            <details className="advanced">
               <summary>Customer Output (Click to Open/Close)</summary>
               <div className="small">
                 selected_domain={selectedDomainLabel}
@@ -1208,7 +1981,7 @@ export default function HomePage() {
                   {resultDomains.length === 0 && <option value="">No domains yet</option>}
                   {resultDomains.map((domain) => (
                     <option key={domain} value={domain}>
-                      {DOMAIN_LABELS[domain] || domain}
+                      {formatDomainLabel(domain)}
                     </option>
                   ))}
                 </select>
@@ -1226,6 +1999,120 @@ export default function HomePage() {
             </details>
           </div>
 
+          <div className="card">
+            <details className="advanced">
+              <summary>Prompt Used By Agent (Click to Open/Close)</summary>
+              {!reportJson && (
+                <div className="small">
+                  Load customer output first to inspect the exact prompt payload used by the agent.
+                </div>
+              )}
+              {reportJson && (
+                <>
+                  <div className="small">
+                    base_prompt_length={String((promptTrace?.base_prompt || '').length)} | effective_prompt_length=
+                    {String((promptTrace?.effective_prompt || '').length)} | gam_focus_points=
+                    {String(promptTrace?.gam_focus_points_used_count || 0)} | rl_focus_points=
+                    {String(promptTrace?.rl_focus_points_used_count || 0)} | gam_enriched=
+                    {String(Boolean(promptTrace?.prompt_was_enriched_by_gam))} | rl_enriched=
+                    {String(Boolean(promptTrace?.prompt_was_enriched_by_rl))}
+                  </div>
+                  <div className="small">
+                    base_prompt_supplied_by_user={String(Boolean(promptTrace?.base_prompt_supplied_by_user))} |
+                    prompt_seeded_from_default={String(Boolean(promptTrace?.prompt_seeded_from_default))}
+                  </div>
+                  <div className="small">
+                    scenario_engine={String(getField(scenarioGeneration, ['engine'], 'n/a'))} | base_source=
+                    {String(getField(scenarioGeneration, ['base_source'], 'n/a'))} | llm_response_mode=
+                    {String(getField(llmGenerationDiagnostics, ['response_mode'], 'n/a'))}
+                  </div>
+                  <div className="small">
+                    llm_parse_status={String(getField(llmParseDiagnostics, ['status'], 'n/a'))} | parse_attempts=
+                    {String(getField(llmParseDiagnostics, ['parse_attempts'], 'n/a'))} | parse_failures=
+                    {String(getField(llmParseDiagnostics, ['parse_failures'], 'n/a'))} | schema_rejections=
+                    {String(getField(scenarioGeneration?.llm_stats, ['scenario_schema_rejections'], 0))}
+                  </div>
+                  <details className="advanced" open={Boolean(promptTrace?.scenario_generation)}>
+                    <summary>Scenario Generator Engine</summary>
+                    <pre>{toJsonString(promptTrace?.scenario_generation || {})}</pre>
+                  </details>
+                  <details className="advanced" open>
+                    <summary>Base Prompt Input</summary>
+                    <pre>{promptTrace?.base_prompt || 'n/a'}</pre>
+                  </details>
+                  <details
+                    className="advanced"
+                    open={Boolean((promptTrace?.gam_focus_points_used || promptTrace?.focus_points_used || []).length)}
+                  >
+                    <summary>
+                      GAM Excerpts Added Into Prompt (
+                      {String((promptTrace?.gam_focus_points_used || promptTrace?.focus_points_used || []).length)})
+                    </summary>
+                    <pre>{toJsonString(promptTrace?.gam_focus_points_used || promptTrace?.focus_points_used || [])}</pre>
+                  </details>
+                  <details className="advanced" open={Boolean((promptTrace?.rl_focus_points_used || []).length)}>
+                    <summary>
+                      RL Focus Points Added Into Prompt ({String((promptTrace?.rl_focus_points_used || []).length)})
+                    </summary>
+                    <pre>{toJsonString(promptTrace?.rl_focus_points_used || [])}</pre>
+                  </details>
+                  <details className="advanced">
+                    <summary>Memory Excerpt Preview (What Was Available)</summary>
+                    <pre>{toJsonString(promptTrace?.memory_excerpt_preview || [])}</pre>
+                  </details>
+                  <details className="advanced">
+                    <summary>Why GAM Excerpts May Repeat</summary>
+                    <pre>{toJsonString(promptTrace?.notes || {})}</pre>
+                  </details>
+                  <details className="advanced" open>
+                    <summary>Final Effective Prompt Sent To Scenario Generator</summary>
+                    <pre>{promptTrace?.effective_prompt || promptTrace?.base_prompt || 'n/a'}</pre>
+                  </details>
+                </>
+              )}
+            </details>
+          </div>
+
+          <div className="card">
+            <details className="advanced">
+              <summary>Where RL Is Used (Click to Open/Close)</summary>
+              {!reportJson && (
+                <div className="small">Load customer output first to view runtime RL usage locations.</div>
+              )}
+              {reportJson && (
+                <pre>{toJsonString({
+                  rl_prompt_influence: {
+                    prompt_was_enriched_by_rl: Boolean(promptTrace?.prompt_was_enriched_by_rl),
+                    rl_focus_points_used_count: Number(promptTrace?.rl_focus_points_used_count || 0),
+                    rl_focus_points_used: promptTrace?.rl_focus_points_used || []
+                  },
+                  rl_mutation_stage: {
+                    mutated_candidates_added: Number(getField(mutationPolicy, ['mutated_candidates_added'], 0)),
+                    direct_mutation_candidates_added: Number(getField(mutationPolicy, ['direct_mutation_candidates_added'], 0)),
+                    history_seed_candidates_added: Number(getField(mutationPolicy, ['history_seed_candidates_added'], 0)),
+                    top_targets: getField(mutationPolicy, ['top_targets'], []).slice(0, 5)
+                  },
+                  rl_selection_stage: {
+                    algorithm: getField(selectionPolicy, ['algorithm'], 'n/a'),
+                    candidate_count: Number(getField(selectionPolicy, ['candidate_count'], 0)),
+                    selected_count: Number(getField(selectionPolicy, ['selected_count'], 0)),
+                    uncertain_selected_count: Number(getField(selectionPolicy, ['uncertain_selected_count'], 0)),
+                    top_decisions: topDecisions.slice(0, 5)
+                  },
+                  rl_training_stage: {
+                    training_enabled: Boolean(getField(trainingStats, ['training_enabled'], false)),
+                    rl_training_steps: Number(getField(trainingStats, ['rl_training_steps'], 0)),
+                    rl_buffer_size: Number(getField(trainingStats, ['rl_buffer_size'], 0)),
+                    rewarded_decisions: Number(getField(learningFeedback, ['rewarded_decisions'], 0)),
+                    penalized_decisions: Number(getField(learningFeedback, ['penalized_decisions'], 0))
+                  },
+                  note: "RL optimizes scenario mutation/selection/training. GAM now supports LLM-driven planning/reflection (see GAM Research Influence for plan_mode/reflect_mode and llm_stats)."
+                })}</pre>
+              )}
+            </details>
+          </div>
+
+          {showTechnical && (
           <div className="card">
             <details className="advanced" open>
               <summary>State-by-State API Output (Glass Box) (Click to Open/Close)</summary>
@@ -1246,6 +2133,7 @@ export default function HomePage() {
               </div>
             </details>
           </div>
+          )}
 
           <div className="card">
             <h2>1) Test Scripts Generated By Agent</h2>
@@ -1408,57 +2296,182 @@ export default function HomePage() {
               <div className="small">Open customer output for a domain to view tested cases.</div>
             )}
             {reportJson && (
-              <div className="scenario-panel">
-                <div className="scenario-head">
-                  <h3>Scenario Results</h3>
-                  <div className="scenario-controls">
-                    <select value={scenarioFilter} onChange={(e) => setScenarioFilter(e.target.value)}>
-                      <option value="all">all</option>
-                      <option value="pass">passed</option>
-                      <option value="fail">failed</option>
-                    </select>
-                    <input
-                      placeholder="Search scenario name, endpoint, method..."
-                      value={scenarioSearch}
-                      onChange={(e) => setScenarioSearch(e.target.value)}
-                    />
+              <>
+                <div className="report-grid">
+                  <div className="report-metric">
+                    <span>Endpoints Covered</span>
+                    <strong>{String(endpointCoverageCount)}</strong>
+                  </div>
+                  <div className="report-metric">
+                    <span>Test Types Covered</span>
+                    <strong>{String(scenarioCoverageRows.length)}</strong>
+                  </div>
+                  <div className="report-metric">
+                    <span>RL Scenarios Executed</span>
+                    <strong>{String(rlExecutedScenarioCount)}</strong>
+                  </div>
+                  <div className="report-metric">
+                    <span>History-Seeded Executed</span>
+                    <strong>{String(historySeedExecutedCount)}</strong>
+                  </div>
+                  <div className="report-metric">
+                    <span>Direct RL Mutations Added</span>
+                    <strong>{String(getField(mutationPolicy, ['direct_mutation_candidates_added'], 0))}</strong>
+                  </div>
+                  <div className="report-metric">
+                    <span>History-Seed Mutations Added</span>
+                    <strong>{String(getField(mutationPolicy, ['history_seed_candidates_added'], 0))}</strong>
                   </div>
                 </div>
-                <div className="inline-actions">
-                  <button onClick={() => setScenarioFilter('all')}>Show All</button>
-                  <button onClick={() => setScenarioFilter('pass')}>Show Passed</button>
-                  <button onClick={() => setScenarioFilter('fail')}>Show Failed</button>
-                </div>
-                <div className="small">showing {filteredScenarios.length} / {scenarioResults.length}</div>
-                <div className="scenario-table-wrap">
-                  <table className="scenario-table">
-                    <thead>
-                      <tr>
-                        <th>status</th>
-                        <th>name</th>
-                        <th>type</th>
-                        <th>endpoint</th>
-                        <th>expected</th>
-                        <th>actual</th>
-                        <th>ms</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {filteredScenarios.map((row) => (
-                        <tr key={String(row.name)}>
-                          <td>{row.passed ? 'pass' : 'fail'}</td>
-                          <td>{row.name}</td>
-                          <td>{row.test_type}</td>
-                          <td>{`${row.method || ''} ${row.endpoint_template || ''}`.trim()}</td>
-                          <td>{String(row.expected_status ?? 'n/a')}</td>
-                          <td>{String(row.actual_status ?? 'n/a')}</td>
-                          <td>{String(row.duration_ms ?? 'n/a')}</td>
+
+                <div className="scenario-panel">
+                  <div className="scenario-head">
+                    <h3>Coverage By Test Type</h3>
+                  </div>
+                  <div className="scenario-table-wrap">
+                    <table className="scenario-table">
+                      <thead>
+                        <tr>
+                          <th>test_type</th>
+                          <th>total</th>
+                          <th>passed</th>
+                          <th>failed</th>
                         </tr>
-                      ))}
-                    </tbody>
-                  </table>
+                      </thead>
+                      <tbody>
+                        {scenarioCoverageRows.map((row) => (
+                          <tr key={row.testType}>
+                            <td>{row.testType}</td>
+                            <td>{String(row.total)}</td>
+                            <td>{String(row.passed)}</td>
+                            <td>{String(row.failed)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
                 </div>
-              </div>
+
+                <div className="scenario-panel">
+                  <div className="scenario-head">
+                    <h3>What Improved Due To RL</h3>
+                  </div>
+                  <div className="small">
+                    rewarded_decisions={String(getField(learningFeedback, ['rewarded_decisions'], 'n/a'))} | penalized_decisions=
+                    {String(getField(learningFeedback, ['penalized_decisions'], 'n/a'))}
+                  </div>
+                  {rlMutationExamples.length > 0 && (
+                    <div className="small rl-examples">
+                      rl_mutation_examples: {rlMutationExamples
+                        .map((item) => `${String(item.from || item.from_fingerprint || 'seed')} -> ${String(item.to || 'n/a')}`)
+                        .join(' | ')}
+                    </div>
+                  )}
+                  <div className="scenario-table-wrap">
+                    <table className="scenario-table">
+                      <thead>
+                        <tr>
+                          <th>top_improved_scenario</th>
+                          <th>reward</th>
+                          <th>type</th>
+                          <th>endpoint</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {topImprovedScenarios.length === 0 && (
+                          <tr>
+                            <td colSpan={4}>No rewarded decision signals yet.</td>
+                          </tr>
+                        )}
+                        {topImprovedScenarios.map((row) => (
+                          <tr key={`improved-${String(row.name)}`}>
+                            <td>{String(row.name)}</td>
+                            <td>{String(row.reward)}</td>
+                            <td>{String(row.test_type)}</td>
+                            <td>{`${String(row.method || '')} ${String(row.endpoint_template || '')}`.trim()}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                  {topFailedScenarios.length > 0 && (
+                    <div className="scenario-table-wrap">
+                      <table className="scenario-table">
+                        <thead>
+                          <tr>
+                            <th>needs_improvement</th>
+                            <th>reward</th>
+                            <th>type</th>
+                            <th>endpoint</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {topFailedScenarios.map((row) => (
+                            <tr key={`regress-${String(row.name)}`}>
+                              <td>{String(row.name)}</td>
+                              <td>{String(row.reward)}</td>
+                              <td>{String(row.test_type)}</td>
+                              <td>{`${String(row.method || '')} ${String(row.endpoint_template || '')}`.trim()}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </div>
+
+                <div className="scenario-panel">
+                  <div className="scenario-head">
+                    <h3>Scenario Results</h3>
+                    <div className="scenario-controls">
+                      <select value={scenarioFilter} onChange={(e) => setScenarioFilter(e.target.value)}>
+                        <option value="all">all</option>
+                        <option value="pass">passed</option>
+                        <option value="fail">failed</option>
+                      </select>
+                      <input
+                        placeholder="Search scenario name, endpoint, method..."
+                        value={scenarioSearch}
+                        onChange={(e) => setScenarioSearch(e.target.value)}
+                      />
+                    </div>
+                  </div>
+                  <div className="inline-actions">
+                    <button onClick={() => setScenarioFilter('all')}>Show All</button>
+                    <button onClick={() => setScenarioFilter('pass')}>Show Passed</button>
+                    <button onClick={() => setScenarioFilter('fail')}>Show Failed</button>
+                  </div>
+                  <div className="small">showing {filteredScenarios.length} / {scenarioResults.length}</div>
+                  <div className="scenario-table-wrap">
+                    <table className="scenario-table">
+                      <thead>
+                        <tr>
+                          <th>status</th>
+                          <th>name</th>
+                          <th>type</th>
+                          <th>endpoint</th>
+                          <th>expected</th>
+                          <th>actual</th>
+                          <th>ms</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {filteredScenarios.map((row) => (
+                          <tr key={String(row.name)}>
+                            <td>{row.passed ? 'pass' : 'fail'}</td>
+                            <td>{row.name}</td>
+                            <td>{row.test_type}</td>
+                            <td>{`${row.method || ''} ${row.endpoint_template || ''}`.trim()}</td>
+                            <td>{String(row.expected_status ?? 'n/a')}</td>
+                            <td>{String(row.actual_status ?? 'n/a')}</td>
+                            <td>{String(row.duration_ms ?? 'n/a')}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </>
             )}
           </div>
 
@@ -1502,14 +2515,20 @@ export default function HomePage() {
                 </div>
               </div>
             )}
-            <pre>{reportText}</pre>
+            <details className="advanced">
+              <summary>Raw Report Payload</summary>
+              <pre>{reportText}</pre>
+            </details>
           </div>
 
+          {showTechnical && (
           <div className="card">
             <h2>Live Process Log</h2>
             <pre>{logText || 'No logs yet.'}</pre>
           </div>
+          )}
 
+          {showTechnical && (
           <div className="card">
             <details className="advanced">
               <summary>Advanced Agent R&D (optional)</summary>
@@ -1637,6 +2656,7 @@ export default function HomePage() {
               )}
             </details>
           </div>
+          )}
         </section>
       </div>
     </main>

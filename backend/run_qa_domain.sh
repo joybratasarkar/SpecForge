@@ -16,6 +16,10 @@ Options:
   --output-dir <dir>        Output directory for reports/tests
   --prompt <text>           QA prompt override
   --max-scenarios <n>       Max scenarios to execute (default: 16)
+  --max-runtime-sec <n>     Runtime cap in seconds for scenario execution
+  --llm-token-cap <n>       Optional token cap for GAM + scenario LLM calls
+  --workspace-id <id>       Workspace id for multi-user isolation (default: tenant id)
+  --environment-profile <p> mock|staging|prod_safe (default: mock)
   --pass-threshold <float>  Quality gate threshold (default: 0.70)
   --script-kind <kind>      One generated script kind: python_pytest|javascript_jest|curl_script|java_restassured (default: python_pytest)
   --base-url <url>          Base URL for generated tests (default: http://localhost:8000)
@@ -49,6 +53,10 @@ TENANT_ID=""
 OUTPUT_DIR=""
 PROMPT="Generate comprehensive QA tests for authentication, validation, error handling, and boundary scenarios."
 MAX_SCENARIOS="16"
+MAX_RUNTIME_SEC=""
+LLM_TOKEN_CAP=""
+WORKSPACE_ID=""
+ENVIRONMENT_PROFILE="mock"
 PASS_THRESHOLD="0.70"
 SCRIPT_KIND="python_pytest"
 BASE_URL="http://localhost:8000"
@@ -57,6 +65,16 @@ CUSTOMER_MODE="0"
 VERIFY_PERSISTENCE="0"
 CUSTOMER_ROOT="${HOME}/.spec_test_pilot"
 CUSTOMER_ROOT_FALLBACK="/tmp/.spec_test_pilot"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+ENV_FILE="${REPO_ROOT}/.env"
+
+if [[ -z "${OPENAI_API_KEY:-}" && -f "${ENV_FILE}" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "${ENV_FILE}"
+  set +a
+fi
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -86,6 +104,22 @@ while [[ $# -gt 0 ]]; do
       ;;
     --max-scenarios)
       MAX_SCENARIOS="${2:-}"
+      shift 2
+      ;;
+    --max-runtime-sec)
+      MAX_RUNTIME_SEC="${2:-}"
+      shift 2
+      ;;
+    --llm-token-cap)
+      LLM_TOKEN_CAP="${2:-}"
+      shift 2
+      ;;
+    --workspace-id)
+      WORKSPACE_ID="${2:-}"
+      shift 2
+      ;;
+    --environment-profile)
+      ENVIRONMENT_PROFILE="${2:-}"
       shift 2
       ;;
     --pass-threshold)
@@ -461,12 +495,12 @@ YAML
 }
 
 resolve_python() {
-  if [[ -x ".venv/bin/python" ]]; then
-    echo ".venv/bin/python"
-  elif [[ -x "venv/bin/python" ]]; then
-    echo "venv/bin/python"
-  elif [[ -x "../venv/bin/python" ]]; then
-    echo "../venv/bin/python"
+  if [[ -x "${SCRIPT_DIR}/.venv/bin/python" ]]; then
+    echo "${SCRIPT_DIR}/.venv/bin/python"
+  elif [[ -x "${SCRIPT_DIR}/venv/bin/python" ]]; then
+    echo "${SCRIPT_DIR}/venv/bin/python"
+  elif [[ -x "${REPO_ROOT}/venv/bin/python" ]]; then
+    echo "${REPO_ROOT}/venv/bin/python"
   elif command -v python3 >/dev/null 2>&1; then
     echo "python3"
   else
@@ -508,6 +542,12 @@ if [[ "${ACTION}" == "run" || "${ACTION}" == "both" ]]; then
 
   PYTHON_BIN="$(resolve_python)"
   mkdir -p "${OUTPUT_DIR}"
+  export PYTHONUNBUFFERED="1"
+  export GAM_LLM_MODE="on"
+  export GAM_MEMO_LLM_MODE="on"
+  # Keep scenario LLM reliable by default; callers can still override via env.
+  export QA_SCENARIO_LLM_TIMEOUT_SECONDS="${QA_SCENARIO_LLM_TIMEOUT_SECONDS:-45}"
+  export QA_SCENARIO_LLM_MAX_RETRIES="${QA_SCENARIO_LLM_MAX_RETRIES:-1}"
 
   echo "[RUN] QA specialist agent"
   echo "  domain:        ${DOMAIN}"
@@ -515,18 +555,29 @@ if [[ "${ACTION}" == "run" || "${ACTION}" == "both" ]]; then
   echo "  tenant_id:     ${TENANT_ID}"
   echo "  output_dir:    ${OUTPUT_DIR}"
   echo "  max_scenarios: ${MAX_SCENARIOS}"
+  if [[ -n "${MAX_RUNTIME_SEC}" ]]; then
+    echo "  max_runtime:   ${MAX_RUNTIME_SEC}s"
+  fi
+  if [[ -n "${LLM_TOKEN_CAP}" ]]; then
+    echo "  llm_token_cap: ${LLM_TOKEN_CAP}"
+  fi
+  echo "  env_profile:   ${ENVIRONMENT_PROFILE}"
   echo "  script_kind:   ${SCRIPT_KIND}"
   echo "  rl_checkpoint: ${RL_CHECKPOINT}"
+  echo "  gam_llm_mode:  ${GAM_LLM_MODE} (enforced)"
+  echo "  llm_timeout:   ${QA_SCENARIO_LLM_TIMEOUT_SECONDS}s"
+  echo "  llm_retries:   ${QA_SCENARIO_LLM_MAX_RETRIES}"
   if [[ "${CUSTOMER_MODE}" == "1" ]]; then
     echo "  customer_mode: enabled"
     echo "  customer_root: ${CUSTOMER_ROOT}"
   fi
 
   cmd=(
-    "${PYTHON_BIN}" qa_agent_runner.py
+    "${PYTHON_BIN}" -u "${SCRIPT_DIR}/qa_agent_runner.py"
     --spec "${SPEC_PATH}"
     --tenant-id "${TENANT_ID}"
     --base-url "${BASE_URL}"
+    --environment-profile "${ENVIRONMENT_PROFILE}"
     --output-dir "${OUTPUT_DIR}"
     --prompt "${PROMPT}"
     --max-scenarios "${MAX_SCENARIOS}"
@@ -535,6 +586,15 @@ if [[ "${ACTION}" == "run" || "${ACTION}" == "both" ]]; then
   )
   if [[ -n "${RL_CHECKPOINT}" ]]; then
     cmd+=(--rl-checkpoint "${RL_CHECKPOINT}")
+  fi
+  if [[ -n "${WORKSPACE_ID}" ]]; then
+    cmd+=(--workspace-id "${WORKSPACE_ID}")
+  fi
+  if [[ -n "${MAX_RUNTIME_SEC}" ]]; then
+    cmd+=(--max-runtime-sec "${MAX_RUNTIME_SEC}")
+  fi
+  if [[ -n "${LLM_TOKEN_CAP}" ]]; then
+    cmd+=(--llm-token-cap "${LLM_TOKEN_CAP}")
   fi
   "${cmd[@]}"
 
@@ -556,10 +616,11 @@ if [[ "${ACTION}" == "run" || "${ACTION}" == "both" ]]; then
 
     echo "[VERIFY] Running automatic persistence check pass..."
     verify_cmd=(
-      "${PYTHON_BIN}" qa_agent_runner.py
+      "${PYTHON_BIN}" -u "${SCRIPT_DIR}/qa_agent_runner.py"
       --spec "${SPEC_PATH}"
       --tenant-id "${TENANT_ID}"
       --base-url "${BASE_URL}"
+      --environment-profile "${ENVIRONMENT_PROFILE}"
       --output-dir "${verify_output_dir}"
       --prompt "${PROMPT}"
       --max-scenarios "${MAX_SCENARIOS}"
@@ -568,6 +629,15 @@ if [[ "${ACTION}" == "run" || "${ACTION}" == "both" ]]; then
     )
     if [[ -n "${RL_CHECKPOINT}" ]]; then
       verify_cmd+=(--rl-checkpoint "${RL_CHECKPOINT}")
+    fi
+    if [[ -n "${WORKSPACE_ID}" ]]; then
+      verify_cmd+=(--workspace-id "${WORKSPACE_ID}")
+    fi
+    if [[ -n "${MAX_RUNTIME_SEC}" ]]; then
+      verify_cmd+=(--max-runtime-sec "${MAX_RUNTIME_SEC}")
+    fi
+    if [[ -n "${LLM_TOKEN_CAP}" ]]; then
+      verify_cmd+=(--llm-token-cap "${LLM_TOKEN_CAP}")
     fi
     "${verify_cmd[@]}"
 

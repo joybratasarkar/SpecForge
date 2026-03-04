@@ -68,12 +68,32 @@ Terminal 2 (Next.js frontend):
 NEXT_PUBLIC_BACKEND_BASE_URL=http://127.0.0.1:8787 npm run dev -- -p 3001
 ```
 
+Script equivalent:
+
+```bash
+./frontend/start-frontend.sh
+```
+
+or:
+
+```bash
+QA_UI_MODE=split ./frontend/run_customer_ui_next.sh
+```
+
+For local full-Next mode (no FastAPI):
+
+```bash
+QA_UI_MODE=full_next ./frontend/run_customer_ui_next.sh
+```
+
 ## Notes
 
 1. API routes run on Node.js runtime and spawn `backend/run_qa_domain.sh`.
 2. Run outputs are stored under `/tmp/qa_ui_next_runs`.
 3. Per-domain checkpoints are stored under `/tmp/qa_ui_next_checkpoints`.
 4. Frontend receives real-time updates over SSE and falls back to polling if stream disconnects.
+5. Generated script `baseUrl` defaults to `NEXT_PUBLIC_TEST_BASE_URL` (fallback: `http://127.0.0.1:8000`).
+6. Header badge `probe=ok:fastapi` confirms the UI is connected to FastAPI backend.
 
 ## Customer API Contract
 
@@ -90,7 +110,7 @@ If frontend and backend are split (FastAPI backend), the same API contract is us
   "prompt": "optional context",
   "maxScenarios": 16,
   "passThreshold": 0.7,
-  "baseUrl": "http://localhost:8000",
+  "baseUrl": "http://127.0.0.1:8000",
   "customerMode": true,
   "verifyPersistence": true,
   "customerRoot": "~/.spec_test_pilot"

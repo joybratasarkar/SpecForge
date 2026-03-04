@@ -173,6 +173,8 @@ Each run writes:
 3. `learning_state.json`
 4. `openapi_under_test.yaml`
 5. `generated_tests/` (Python/JS/Java/cURL)
+6. `spec_intelligence` section in JSON report (dependency graph + risk map + workflow candidates)
+7. `oss_tooling` + `oss_checks` section in JSON report (availability + ready/skipped status for integrations)
 
 ## Official Runner Status
 
@@ -194,3 +196,4 @@ If network/package index is restricted, this install must be done in an environm
 4. `docs/project-file-organization.md`: file map and execution entrypoints.
 5. `docs/customer-ui-api-flow.md`: customer UI API contract and runtime sequence.
 6. `docs/qa-agent-glass-box-deep-dive.md`: full black-box transparency guide (formulas, payloads, persistence, and report field mapping).
+7. `docs/qa-agent-corrected-complete-flow.md`: corrected end-to-end target flow (non-static GAM + RL + Agent Lightning) with strict stage contracts.

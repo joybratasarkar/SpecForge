@@ -224,7 +224,118 @@ class TestEnhancedGAMCompliance:
         assert len(secure_in_other) == 0, "Should not find secure tenant's content"
         
         print("✅ IMPLEMENTED: Hybrid search with tenant scoping")
-    
+
+    def test_reflect_returns_structured_info_check_with_follow_up(self):
+        """Test: Reflect returns GAM-style structured status + follow-up request."""
+        context = {
+            "spec_title": "Orders API",
+            "auth_type": "bearer",
+            "endpoints": [{"method": "GET", "path": "/orders/{orderId}"}],
+            "learning_weakness_hints": [
+                {
+                    "method": "GET",
+                    "endpoint": "/orders/{orderId}",
+                    "test_type": "authentication",
+                    "expected_status": 401,
+                }
+            ],
+        }
+        excerpts = [
+            {
+                "source": "memo",
+                "excerpt": "Pagination checks were added for list endpoints.",
+            }
+        ]
+
+        info_check = self.memory.researcher.reflect(context, excerpts, iteration=1)
+        assert info_check.request_status == "need_more"
+        assert "auth testing patterns" in info_check.missing
+        assert isinstance(info_check.next_request, str)
+        assert len(info_check.next_request) > 0
+
+    def test_search_supports_plan_page_id_retrieval(self):
+        """Test: search() can retrieve explicit page_id references from plan."""
+        tenant_id = "plan_page_id_tenant"
+        page = self.memory.page_store.add_page(
+            title="Prior Failure Note",
+            tags=["memo", "learning", "orders_api"],
+            content="Failure on GET /orders/{orderId} expecting 404 got 200.",
+            source="memo",
+            tenant_id=tenant_id,
+        )
+        plan = [f"Investigate prior failure page_id:{page.id} and summarize actionable fixes"]
+
+        results = self.memory.researcher.search(plan, tenant_id=tenant_id)
+        result_ids = {entry[0].id for entry in results}
+        assert page.id in result_ids
+        summary = getattr(self.memory.researcher, "_last_search_summary", {})
+        futures = summary.get("futures_by_kind", {})
+        assert int(futures.get("plan_page_ids", 0)) >= 1
+
+    def test_research_emits_info_checks_and_retrieval_trace(self):
+        """Test: research() exposes per-iteration reflection + retrieval traces."""
+        tenant_id = "trace_tenant"
+        self.memory.page_store.add_page(
+            title="Spec Context Signals: Payments API",
+            tags=["memo", "spec_context", "payments_api"],
+            content="Spec: Payments API Auth type: bearer",
+            source="memo",
+            tenant_id=tenant_id,
+        )
+        context = {
+            "spec_title": "Payments API",
+            "auth_type": "bearer",
+            "endpoints": [{"method": "POST", "path": "/payments"}],
+            "tenant_id": tenant_id,
+            "spec_memory_tags": ["payments_api"],
+        }
+
+        result = self.memory.researcher.research(context)
+        assert len(result.info_checks) >= 1
+        assert len(result.retrieval_trace) >= 1
+        first_trace = result.retrieval_trace[0]
+        assert "plan" in first_trace
+        assert "search_summary" in first_trace
+        assert "request_status" in result.info_checks[0]
+
+    def test_research_emits_engine_trace_with_modes(self, monkeypatch):
+        """Test: research() exposes planner/reflector engine modes for glass-box UI."""
+        monkeypatch.setenv("GAM_LLM_MODE", "off")
+        memory = GAMMemorySystem(use_vector_search=False)
+
+        context = {
+            "spec_title": "Orders API",
+            "auth_type": "bearer",
+            "endpoints": [{"method": "GET", "path": "/orders/{orderId}"}],
+            "tenant_id": "engine_trace_tenant",
+        }
+        result = memory.researcher.research(context)
+        engine = getattr(result, "research_engine", {})
+
+        assert isinstance(engine, dict)
+        assert engine.get("llm_enabled") is False
+        assert isinstance(engine.get("plan_modes"), list)
+        assert isinstance(engine.get("reflect_modes"), list)
+        assert len(engine.get("iterations", [])) >= 1
+
+    def test_research_respects_configured_max_reflections(self, monkeypatch):
+        """Test: GAM_MAX_REFLECTIONS is applied and exposed in research engine trace."""
+        monkeypatch.setenv("GAM_LLM_MODE", "off")
+        monkeypatch.setenv("GAM_MAX_REFLECTIONS", "3")
+        memory = GAMMemorySystem(use_vector_search=False)
+
+        context = {
+            "spec_title": "Orders API",
+            "auth_type": "bearer",
+            "endpoints": [{"method": "GET", "path": "/orders/{orderId}"}],
+            "tenant_id": "max_reflections_tenant",
+        }
+        result = memory.researcher.research(context)
+        engine = getattr(result, "research_engine", {})
+
+        assert int(engine.get("max_reflections", 0)) == 3
+        assert int(getattr(result, "iteration", 0)) <= 3
+
     # ========================================================================
     # SMOKE TEST: End-to-End GAM Compliance
     # ========================================================================

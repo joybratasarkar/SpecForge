@@ -6,17 +6,23 @@ Supports multiple programming languages and testing frameworks
 """
 
 import json
+import logging
 import os
+import pprint
 import re
 import subprocess
 import tempfile
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Dict, List, Any, Optional, Tuple
 from enum import Enum
+from urllib.parse import quote, unquote, urlparse
 import yaml
 import requests
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 class TestLanguage(Enum):
@@ -77,7 +83,12 @@ class APIEndpoint:
 class HumanTesterSimulator:
     """Simulates how a human tester would analyze and test an API with NLP prompts."""
     
-    def __init__(self, api_spec: Dict[str, Any], base_url: str):
+    def __init__(
+        self,
+        api_spec: Dict[str, Any],
+        base_url: str,
+        llm_debug_log_path: Optional[str] = None,
+    ):
         """Initialize with API specification and base URL."""
         self.api_spec = api_spec
         self.base_url = base_url.rstrip('/')
@@ -85,6 +96,24 @@ class HumanTesterSimulator:
         self.test_scenarios = []
         self.error_fixes = {}  # Store automatic fixes for errors
         self.workflow_chains = []  # Store workflow orchestrations
+        self.last_generation_engine = "heuristic_default"
+        self.llm_stats: Dict[str, int] = {
+            "scenario_calls": 0,
+            "scenario_success": 0,
+            "scenario_errors": 0,
+            "scenario_parse_failures": 0,
+            "scenario_schema_rejections": 0,
+        }
+        self.last_llm_generation_diagnostics: Dict[str, Any] = {}
+        self._llm_mode = str(os.getenv("QA_SCENARIO_LLM_MODE", "auto")).strip().lower() or "auto"
+        self._llm_model = str(os.getenv("QA_SCENARIO_LLM_MODEL", "gpt-4.1-mini")).strip() or "gpt-4.1-mini"
+        self._llm_temperature = self._safe_float(os.getenv("QA_SCENARIO_LLM_TEMPERATURE"), default=0.1)
+        self._llm_max_tokens = self._safe_int(os.getenv("QA_SCENARIO_LLM_MAX_TOKENS"), default=2200)
+        self._llm_timeout = self._safe_float(os.getenv("QA_SCENARIO_LLM_TIMEOUT_SECONDS"), default=20.0)
+        self._llm_max_retries = self._safe_int(os.getenv("QA_SCENARIO_LLM_MAX_RETRIES"), default=1)
+        self._llm_debug_log_path = self._resolve_llm_debug_log_path(llm_debug_log_path)
+        self._llm_client = self._init_llm_client()
+        self.llm_enabled = self._llm_client is not None
         
     def _parse_endpoints(self) -> List[APIEndpoint]:
         """Parse OpenAPI spec like a human tester would analyze it."""
@@ -150,6 +179,929 @@ class HumanTesterSimulator:
                 merged[(location, name)] = param
 
         return list(merged.values())
+
+    @staticmethod
+    def _safe_float(value: Optional[str], default: float) -> float:
+        try:
+            if value is None:
+                return float(default)
+            return float(value)
+        except Exception:
+            return float(default)
+
+    @staticmethod
+    def _safe_int(value: Optional[str], default: int) -> int:
+        try:
+            if value is None:
+                return int(default)
+            return int(value)
+        except Exception:
+            return int(default)
+
+    @staticmethod
+    def _resolve_llm_debug_log_path(path_value: Optional[str]) -> str:
+        candidate = str(path_value or os.getenv("QA_SCENARIO_LLM_DEBUG_LOG", "")).strip()
+        if not candidate:
+            return ""
+        path = Path(candidate).expanduser().resolve()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            return ""
+        return str(path)
+
+    @staticmethod
+    def _text_preview(value: Any, max_chars: int = 240) -> str:
+        cleaned = re.sub(r"\s+", " ", str(value or "")).strip()
+        if len(cleaned) <= max_chars:
+            return cleaned
+        return cleaned[: max_chars - 1] + "..."
+
+    def _log_llm_debug(self, event: str, payload: Optional[Dict[str, Any]] = None) -> None:
+        path = str(self._llm_debug_log_path or "").strip()
+        if not path:
+            return
+        row: Dict[str, Any] = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "event": str(event),
+            "llm_mode": str(self._llm_mode),
+            "llm_model": str(self._llm_model),
+        }
+        if isinstance(payload, dict):
+            row.update(payload)
+        try:
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(row, ensure_ascii=True) + "\n")
+        except Exception as exc:
+            logger.warning("Failed writing LLM scenario debug log (%s): %s", path, exc)
+
+    def _init_llm_client(self) -> Any:
+        if self._llm_mode == "off":
+            self._log_llm_debug("llm_disabled", {"reason": "QA_SCENARIO_LLM_MODE=off"})
+            return None
+        api_key = str(os.getenv("OPENAI_API_KEY", "")).strip()
+        if not api_key:
+            if self._llm_mode == "on":
+                logger.warning(
+                    "QA_SCENARIO_LLM_MODE=on but OPENAI_API_KEY is missing. "
+                    "Falling back to heuristic scenario generation."
+                )
+            self._log_llm_debug("llm_unavailable", {"reason": "missing_openai_api_key"})
+            return None
+        try:
+            from openai import OpenAI
+            client = OpenAI(
+                api_key=api_key,
+                timeout=float(self._llm_timeout),
+                max_retries=max(0, int(self._llm_max_retries)),
+            )
+            self._log_llm_debug("llm_client_initialized", {"timeout_sec": float(self._llm_timeout)})
+            return client
+        except Exception as exc:
+            logger.warning("Failed to initialize OpenAI client for scenario generation: %s", exc)
+            self._log_llm_debug(
+                "llm_unavailable",
+                {"reason": "client_init_failed", "error": self._text_preview(str(exc), 300)},
+            )
+            return None
+
+    @staticmethod
+    def _extract_bracketed_json(raw: str) -> str:
+        text = str(raw or "")
+        start_idx = -1
+        opening = ""
+        for idx, ch in enumerate(text):
+            if ch in "{[":
+                start_idx = idx
+                opening = ch
+                break
+        if start_idx < 0:
+            return ""
+        closing = "}" if opening == "{" else "]"
+        depth = 0
+        in_string = False
+        escaped = False
+        for idx in range(start_idx, len(text)):
+            ch = text[idx]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_string = False
+                continue
+            if ch == '"':
+                in_string = True
+                continue
+            if ch == opening:
+                depth += 1
+            elif ch == closing:
+                depth -= 1
+                if depth == 0:
+                    return text[start_idx : idx + 1]
+        return ""
+
+    def _extract_json_object(self, text: str) -> Optional[Any]:
+        parsed, _ = self._extract_json_object_detailed(text)
+        return parsed
+
+    @staticmethod
+    def _normalize_json_candidate(raw: str) -> str:
+        text = str(raw or "").strip()
+        if not text:
+            return ""
+        # Some models prepend "json" before the object.
+        if text.lower().startswith("json\n"):
+            text = text[5:].lstrip()
+        # Normalize typographic quotes and remove control chars.
+        text = (
+            text.replace("\u201c", '"')
+            .replace("\u201d", '"')
+            .replace("\u2018", "'")
+            .replace("\u2019", "'")
+        )
+        text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", text)
+        # Recover common invalid JSON emitted by LLMs.
+        text = re.sub(r",\s*([}\]])", r"\1", text)
+        return text.strip()
+
+    @staticmethod
+    def _repair_truncated_json_candidate(raw: str) -> str:
+        text = str(raw or "").strip()
+        if not text:
+            return ""
+        text = HumanTesterSimulator._normalize_json_candidate(text)
+        if not text:
+            return ""
+        # If output was cut right after a key separator, inject null so we can close the structure.
+        text = re.sub(r":\s*$", ": null", text)
+        text = re.sub(r",\s*$", "", text)
+
+        stack: List[str] = []
+        in_string = False
+        escaped = False
+        for ch in text:
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_string = False
+                continue
+            if ch == '"':
+                in_string = True
+                continue
+            if ch in "{[":
+                stack.append(ch)
+            elif ch == "}" and stack and stack[-1] == "{":
+                stack.pop()
+            elif ch == "]" and stack and stack[-1] == "[":
+                stack.pop()
+
+        if in_string:
+            # Best-effort close for unterminated JSON string.
+            if text.endswith("\\"):
+                text = text[:-1]
+            text += '"'
+        while stack:
+            opener = stack.pop()
+            text += "}" if opener == "{" else "]"
+        return HumanTesterSimulator._normalize_json_candidate(text)
+
+    def _extract_json_object_detailed(self, text: str) -> Tuple[Optional[Any], Dict[str, Any]]:
+        raw = str(text or "").strip()
+        if not raw:
+            return None, {
+                "status": "empty",
+                "parse_attempts": 0,
+                "parse_failures": 0,
+                "strategy": "",
+                "errors": [],
+            }
+
+        candidates: List[str] = []
+        fenced_blocks = re.findall(
+            r"```(?:json)?\s*([\s\S]*?)```",
+            raw,
+            flags=re.IGNORECASE,
+        )
+        candidates.extend(block.strip() for block in fenced_blocks if str(block).strip())
+        candidates.append(raw)
+
+        parse_attempts = 0
+        parse_errors: List[Dict[str, str]] = []
+        for candidate in candidates:
+            variants: List[Tuple[str, str]] = [("raw", candidate)]
+            bracketed = self._extract_bracketed_json(candidate)
+            if bracketed and bracketed != candidate:
+                variants.append(("bracketed", bracketed))
+            normalized = self._normalize_json_candidate(candidate)
+            if normalized and normalized != candidate:
+                variants.append(("normalized", normalized))
+                normalized_bracketed = self._extract_bracketed_json(normalized)
+                if normalized_bracketed and normalized_bracketed != normalized:
+                    variants.append(("normalized_bracketed", normalized_bracketed))
+            repaired = self._repair_truncated_json_candidate(candidate)
+            if repaired and repaired not in {candidate, normalized}:
+                variants.append(("repaired", repaired))
+                repaired_bracketed = self._extract_bracketed_json(repaired)
+                if repaired_bracketed and repaired_bracketed not in {repaired, candidate, normalized}:
+                    variants.append(("repaired_bracketed", repaired_bracketed))
+
+            seen_variant_payloads: set[str] = set()
+            for strategy, payload in variants:
+                if payload in seen_variant_payloads:
+                    continue
+                seen_variant_payloads.add(payload)
+                parse_attempts += 1
+                try:
+                    parsed = json.loads(payload)
+                    if isinstance(parsed, (dict, list)):
+                        return parsed, {
+                            "status": "ok",
+                            "parse_attempts": int(parse_attempts),
+                            "parse_failures": int(len(parse_errors)),
+                            "strategy": str(strategy),
+                            "errors": parse_errors[:6],
+                        }
+                except Exception as exc:
+                    if len(parse_errors) < 12:
+                        parse_errors.append(
+                            {
+                                "strategy": str(strategy),
+                                "error": self._text_preview(str(exc), 240),
+                            }
+                        )
+                    continue
+        return None, {
+            "status": "parse_failed",
+            "parse_attempts": int(parse_attempts),
+            "parse_failures": int(len(parse_errors)),
+            "strategy": "",
+            "errors": parse_errors[:6],
+        }
+
+    def _extract_scenario_candidates(self, parsed: Any) -> List[Dict[str, Any]]:
+        def _as_dict_list(value: Any) -> List[Dict[str, Any]]:
+            if not isinstance(value, list):
+                return []
+            return [item for item in value if isinstance(item, dict)]
+
+        if isinstance(parsed, list):
+            return _as_dict_list(parsed)
+
+        if not isinstance(parsed, dict):
+            return []
+
+        preferred_keys = (
+            "scenarios",
+            "tests",
+            "test_scenarios",
+            "cases",
+            "items",
+            "results",
+            "data",
+            "output",
+        )
+        for key in preferred_keys:
+            value = parsed.get(key)
+            if isinstance(value, list):
+                rows = _as_dict_list(value)
+                if rows:
+                    return rows
+            elif isinstance(value, dict):
+                rows = self._extract_scenario_candidates(value)
+                if rows:
+                    return rows
+
+        if any(
+            key in parsed
+            for key in (
+                "method",
+                "http_method",
+                "verb",
+                "endpoint",
+                "path",
+                "url",
+                "operation",
+                "endpoint_key",
+            )
+        ):
+            return [parsed]
+
+        for value in parsed.values():
+            if isinstance(value, (dict, list)):
+                rows = self._extract_scenario_candidates(value)
+                if rows:
+                    return rows
+        return []
+
+    def _normalize_llm_method_and_endpoint(self, item: Dict[str, Any]) -> Tuple[str, str]:
+        method = str(
+            item.get("method")
+            or item.get("http_method")
+            or item.get("verb")
+            or ""
+        ).strip().upper()
+        endpoint = str(
+            item.get("endpoint")
+            or item.get("path")
+            or item.get("url")
+            or item.get("uri")
+            or item.get("route")
+            or ""
+        ).strip()
+
+        operation_hint = str(item.get("operation") or item.get("endpoint_key") or "").strip()
+        for candidate in (endpoint, operation_hint):
+            if not candidate:
+                continue
+            match = re.match(
+                r"^\s*(GET|POST|PUT|PATCH|DELETE)\s+(.+?)\s*$",
+                candidate,
+                flags=re.IGNORECASE,
+            )
+            if match:
+                if not method:
+                    method = str(match.group(1)).upper()
+                endpoint = str(match.group(2)).strip()
+                break
+
+        return method, endpoint
+
+    @staticmethod
+    def _segment_is_placeholder(segment: str) -> bool:
+        seg = str(segment or "").strip()
+        if not seg:
+            return False
+        if (seg.startswith("{") and seg.endswith("}")) or (seg.startswith("<") and seg.endswith(">")):
+            return True
+        if seg.startswith(":") and len(seg) > 1:
+            return True
+        return False
+
+    @staticmethod
+    def _normalize_static_segment(segment: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", str(segment or "").strip().lower())
+
+    def _resolve_endpoint_template(self, endpoint: str, method: Optional[str] = None) -> str:
+        candidate = str(endpoint or "").strip()
+        method_filter = str(method or "").strip().upper()
+        if not candidate:
+            return ""
+
+        op_match = re.match(
+            r"^\s*(GET|POST|PUT|PATCH|DELETE)\s+(.+?)\s*$",
+            candidate,
+            flags=re.IGNORECASE,
+        )
+        if op_match:
+            if not method_filter:
+                method_filter = str(op_match.group(1)).upper()
+            candidate = str(op_match.group(2)).strip()
+
+        parsed_url = urlparse(candidate)
+        if parsed_url.scheme and parsed_url.path:
+            candidate = parsed_url.path
+        candidate = unquote(str(candidate or "").strip())
+        candidate = candidate.split("?", 1)[0].split("#", 1)[0]
+        candidate = re.sub(r"[.,;]+$", "", candidate).strip()
+        candidate = re.sub(r":([a-zA-Z_][a-zA-Z0-9_]*)", r"{\1}", candidate)
+        candidate = re.sub(r"<([a-zA-Z_][a-zA-Z0-9_]*)>", r"{\1}", candidate)
+        if candidate and not candidate.startswith("/"):
+            candidate = "/" + candidate
+        if not candidate:
+            return ""
+
+        known_paths = {
+            str(ep.path).strip()
+            for ep in self.endpoints
+            if not method_filter or str(ep.method).upper() == method_filter
+        }
+        if not known_paths:
+            known_paths = {str(ep.path).strip() for ep in self.endpoints}
+
+        if candidate in known_paths:
+            return candidate
+
+        lower_exact = {path.lower(): path for path in known_paths}
+        if candidate.lower() in lower_exact:
+            return lower_exact[candidate.lower()]
+
+        candidate_parts = [part for part in candidate.strip("/").split("/") if part]
+        if not candidate_parts:
+            return ""
+
+        best_path = ""
+        best_score = -1.0
+        for path in known_paths:
+            path_parts = [part for part in path.strip("/").split("/") if part]
+            if len(path_parts) != len(candidate_parts):
+                continue
+            matched = True
+            score = 0.0
+            for path_seg, cand_seg in zip(path_parts, candidate_parts):
+                if self._segment_is_placeholder(path_seg) or self._segment_is_placeholder(cand_seg):
+                    score += 0.25
+                    continue
+                if self._normalize_static_segment(path_seg) == self._normalize_static_segment(cand_seg):
+                    score += 1.0
+                else:
+                    matched = False
+                    break
+            if matched and score > best_score:
+                best_path = path
+                best_score = score
+
+        return best_path
+
+    def _coerce_test_type(self, value: Any) -> TestType:
+        normalized = re.sub(r"[\s\-]+", "_", str(value or "").strip().lower())
+        aliases = {
+            "auth": TestType.AUTHENTICATION,
+            "authn": TestType.AUTHENTICATION,
+            "authz": TestType.AUTHORIZATION,
+            "validation": TestType.INPUT_VALIDATION,
+            "boundary": TestType.BOUNDARY_TESTING,
+            "error": TestType.ERROR_HANDLING,
+            "edge": TestType.EDGE_CASES,
+        }
+        if normalized in aliases:
+            return aliases[normalized]
+        for test_type in TestType:
+            if normalized == test_type.value:
+                return test_type
+        return TestType.ERROR_HANDLING
+
+    def _default_expected_status(self, test_type: TestType, method: str) -> int:
+        if test_type in {TestType.AUTHENTICATION, TestType.AUTHORIZATION}:
+            return 401
+        if test_type in {TestType.ERROR_HANDLING, TestType.INPUT_VALIDATION, TestType.BOUNDARY_TESTING, TestType.SECURITY}:
+            return 400
+        if test_type == TestType.HAPPY_PATH:
+            return 201 if method.upper() == "POST" else 200
+        return 200
+
+    def _documented_statuses_for_operation(self, method: str, endpoint: str) -> List[int]:
+        method_u = str(method or "").strip().upper()
+        endpoint_norm = str(endpoint or "").strip()
+        for item in self.endpoints:
+            if str(item.method).upper() != method_u:
+                continue
+            if str(item.path).strip() != endpoint_norm:
+                continue
+            statuses: List[int] = []
+            responses = item.responses if isinstance(item.responses, dict) else {}
+            for key in responses.keys():
+                raw = str(key).strip()
+                if raw.isdigit():
+                    code = int(raw)
+                    if 100 <= code <= 599:
+                        statuses.append(code)
+            return sorted(set(statuses))
+        return []
+
+    @staticmethod
+    def _is_attack_like_security_signal(
+        *,
+        name: str,
+        description: str,
+        params: Dict[str, Any],
+        body: Optional[Dict[str, Any]],
+    ) -> bool:
+        attack_markers = (
+            "sql injection",
+            "drop table",
+            "union select",
+            " or 1=1",
+            "--",
+            "<script",
+            "xss",
+            "javascript:",
+            "../",
+            "%3cscript",
+        )
+        haystack = " ".join(
+            [
+                str(name or ""),
+                str(description or ""),
+                json.dumps(params or {}, ensure_ascii=True),
+                json.dumps(body or {}, ensure_ascii=True),
+            ]
+        ).lower()
+        return any(marker in haystack for marker in attack_markers)
+
+    def _normalize_llm_expected_status(
+        self,
+        *,
+        test_type: TestType,
+        method: str,
+        endpoint: str,
+        expected_status: int,
+        name: str,
+        description: str,
+        params: Dict[str, Any],
+        body: Optional[Dict[str, Any]],
+    ) -> int:
+        method_u = str(method or "").strip().upper()
+        status = int(expected_status)
+        if status < 100 or status > 599:
+            status = self._default_expected_status(test_type, method_u)
+
+        documented = self._documented_statuses_for_operation(method_u, endpoint)
+        documented_negative = [s for s in documented if 400 <= s < 500]
+        documented_non_auth_negative = [s for s in documented_negative if s not in {401, 403}]
+        documented_happy = [s for s in documented if 200 <= s < 300]
+
+        if test_type in {TestType.AUTHENTICATION, TestType.AUTHORIZATION}:
+            return 401
+
+        if test_type == TestType.HAPPY_PATH:
+            if 200 <= status < 300:
+                return status
+            if documented_happy:
+                return int(documented_happy[0])
+            return 201 if method_u == "POST" else 200
+
+        if test_type == TestType.SECURITY:
+            is_attack = self._is_attack_like_security_signal(
+                name=name,
+                description=description,
+                params=params,
+                body=body,
+            )
+            if is_attack and 200 <= status < 300:
+                if documented_non_auth_negative:
+                    return int(documented_non_auth_negative[0])
+                return 400
+            return status
+
+        if test_type in {
+            TestType.ERROR_HANDLING,
+            TestType.INPUT_VALIDATION,
+            TestType.BOUNDARY_TESTING,
+            TestType.EDGE_CASES,
+        } and 200 <= status < 300:
+            if documented_negative:
+                return int(documented_negative[0])
+            return 400
+        return status
+
+    def _generate_from_nlp_prompt_llm(self, prompt: str) -> List[TestScenario]:
+        if self._llm_client is None:
+            self.last_llm_generation_diagnostics = {
+                "status": "skipped",
+                "reason": "llm_client_missing",
+            }
+            self._log_llm_debug("planner_skip", {"reason": "llm_client_missing"})
+            return []
+
+        self.llm_stats["scenario_calls"] = int(self.llm_stats.get("scenario_calls", 0)) + 1
+        self.last_llm_generation_diagnostics = {
+            "status": "in_progress",
+            "response_mode": "",
+            "parse_diagnostics": {},
+            "candidate_rows": 0,
+            "accepted_rows": 0,
+            "drop_counts": {},
+        }
+        spec_info = self.api_spec.get("info", {}) if isinstance(self.api_spec, dict) else {}
+        operation_pairs = [
+            {"method": str(ep.method).upper(), "path": str(ep.path), "auth_required": bool(ep.auth_required)}
+            for ep in self.endpoints
+        ][:40]
+        payload = {
+            "spec_title": str(spec_info.get("title", "")),
+            "spec_version": str(spec_info.get("version", "")),
+            "prompt": str(prompt),
+            "available_operations": operation_pairs,
+            "allowed_test_types": [t.value for t in TestType],
+            "constraints": {
+                "max_scenarios": max(12, min(24, len(operation_pairs) * 5)),
+                "prefer_negative_tests": False,
+                "require_happy_path_per_operation": True,
+                "keep_endpoint_as_openapi_template": True,
+            },
+        }
+        print(
+            "   🧠 LLM scenario planner call "
+            f"(model={self._llm_model}, timeout={self._llm_timeout:.1f}s, retries={self._llm_max_retries})"
+        )
+        self._log_llm_debug(
+            "planner_start",
+            {
+                "prompt_chars": len(str(prompt or "")),
+                "operations_available": len(operation_pairs),
+                "timeout_sec": float(self._llm_timeout),
+                "max_retries": int(self._llm_max_retries),
+            },
+        )
+
+        def _request_llm(response_mode: str) -> Any:
+            mode = str(response_mode or "plain").strip().lower()
+            kwargs: Dict[str, Any] = {
+                "model": self._llm_model,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You generate API QA test scenarios from an OpenAPI operation list.\n"
+                            "Return STRICT JSON with key 'scenarios' as an array.\n"
+                            "Each scenario object keys: name, description, test_type, method, endpoint, "
+                            "expected_status, headers, params, body.\n"
+                            "Rules: endpoint must match available OpenAPI template path; "
+                            "method should be a valid HTTP verb; no markdown.\n"
+                            "Keep values concise to avoid long/truncated outputs."
+                        ),
+                    },
+                    {"role": "user", "content": json.dumps(payload, ensure_ascii=True)},
+                ],
+                "temperature": float(self._llm_temperature),
+                "max_tokens": int(self._llm_max_tokens),
+                "timeout": float(self._llm_timeout),
+            }
+            if mode == "json_schema":
+                kwargs["response_format"] = {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "qa_scenarios",
+                        "strict": False,
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": ["scenarios"],
+                            "properties": {
+                                "scenarios": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "additionalProperties": False,
+                                        "required": ["test_type", "method", "endpoint", "expected_status"],
+                                        "properties": {
+                                            "name": {"type": "string"},
+                                            "description": {"type": "string"},
+                                            "test_type": {"type": "string"},
+                                            "method": {"type": "string"},
+                                            "endpoint": {"type": "string"},
+                                            "expected_status": {"type": "integer"},
+                                            "headers": {"type": "object"},
+                                            "params": {"type": "object"},
+                                            "body": {"type": ["object", "null"]},
+                                        },
+                                    },
+                                }
+                            },
+                        },
+                    },
+                }
+            elif mode == "json_object":
+                kwargs["response_format"] = {"type": "json_object"}
+            return self._llm_client.chat.completions.create(**kwargs)
+
+        started_at = time.time()
+        try:
+            response = None
+            response_mode_used = ""
+            try:
+                print('*************************************************************************************')
+                response = _request_llm("json_schema")
+                response_mode_used = "json_schema"
+            except Exception as schema_error:
+                logger.warning(
+                    "Scenario planner json_schema call failed, retrying with json_object mode: %s",
+                    schema_error,
+                )
+                self._log_llm_debug(
+                    "planner_json_schema_failed",
+                    {"error": self._text_preview(str(schema_error), 300)},
+                )
+                try:
+                    response = _request_llm("json_object")
+                    response_mode_used = "json_object"
+                except Exception as json_mode_error:
+                    logger.warning(
+                        "Scenario planner json_object call failed, retrying without response_format: %s",
+                        json_mode_error,
+                    )
+                    self._log_llm_debug(
+                        "planner_json_mode_failed",
+                        {"error": self._text_preview(str(json_mode_error), 300)},
+                    )
+                    response = _request_llm("plain")
+                    response_mode_used = "plain"
+            elapsed = time.time() - started_at
+            print(f"   🧠 LLM scenario planner response received in {elapsed:.2f}s")
+            content = ""
+            if getattr(response, "choices", None):
+                msg = getattr(response.choices[0], "message", None)
+                content = str(getattr(msg, "content", "") or "")
+            self._log_llm_debug(
+                "planner_response",
+                {
+                    "elapsed_sec": round(float(elapsed), 3),
+                    "content_chars": len(content),
+                    "content_preview": self._text_preview(content, 320),
+                    "response_mode": response_mode_used,
+                },
+            )
+            parsed, parse_diagnostics = self._extract_json_object_detailed(content)
+            if parse_diagnostics.get("status") != "ok":
+                self.llm_stats["scenario_parse_failures"] = int(
+                    self.llm_stats.get("scenario_parse_failures", 0)
+                ) + 1
+                self._log_llm_debug(
+                    "planner_parse_failed",
+                    {
+                        "response_mode": response_mode_used,
+                        "parse_diagnostics": parse_diagnostics,
+                    },
+                )
+            raw_scenarios = self._extract_scenario_candidates(parsed)
+            drop_counts: Dict[str, int] = {}
+            drop_samples: List[Dict[str, Any]] = []
+            scenarios: List[TestScenario] = []
+            seen_keys: set[tuple[str, str, str, int]] = set()
+            if not raw_scenarios:
+                drop_counts["no_candidates_extracted"] = 1
+                parsed_type = type(parsed).__name__ if parsed is not None else "none"
+                parsed_keys: List[str] = []
+                if isinstance(parsed, dict):
+                    parsed_keys = list(parsed.keys())[:12]
+                if len(drop_samples) < 6:
+                    drop_samples.append(
+                        {
+                            "reason": "no_candidates_extracted",
+                            "parsed_type": str(parsed_type),
+                            "parsed_keys": parsed_keys,
+                            "parse_diagnostics": parse_diagnostics,
+                        }
+                    )
+            for item in raw_scenarios:
+                if not isinstance(item, dict):
+                    drop_counts["non_dict_row"] = int(drop_counts.get("non_dict_row", 0)) + 1
+                    continue
+                method, endpoint_raw = self._normalize_llm_method_and_endpoint(item)
+                if not method:
+                    method = "GET"
+                if method not in {"GET", "POST", "PUT", "PATCH", "DELETE"}:
+                    drop_counts["invalid_method"] = int(drop_counts.get("invalid_method", 0)) + 1
+                    if len(drop_samples) < 6:
+                        drop_samples.append(
+                            {
+                                "reason": "invalid_method",
+                                "method": str(method),
+                                "endpoint": self._text_preview(endpoint_raw, 100),
+                            }
+                        )
+                    continue
+                endpoint = self._resolve_endpoint_template(endpoint_raw, method=method)
+                if not endpoint:
+                    drop_counts["endpoint_unresolved"] = int(
+                        drop_counts.get("endpoint_unresolved", 0)
+                    ) + 1
+                    if len(drop_samples) < 6:
+                        drop_samples.append(
+                            {
+                                "reason": "endpoint_unresolved",
+                                "method": str(method),
+                                "endpoint": self._text_preview(endpoint_raw, 100),
+                            }
+                        )
+                    continue
+                test_type = self._coerce_test_type(
+                    item.get("test_type", item.get("type", item.get("category")))
+                )
+                expected_status_raw = item.get(
+                    "expected_status",
+                    item.get("status", item.get("expectedStatus")),
+                )
+                if expected_status_raw is None:
+                    expected_status_raw = self._default_expected_status(test_type, method)
+                try:
+                    expected_status = int(expected_status_raw)
+                except Exception:
+                    expected_status = self._default_expected_status(test_type, method)
+                raw_name = str(item.get("name", "")).strip()
+                raw_description = str(item.get("description", item.get("reason", ""))).strip()
+                headers = item.get("headers", item.get("request_headers", {}))
+                params = item.get("params", item.get("query", item.get("query_params", {})))
+                body = item.get(
+                    "body",
+                    item.get("payload", item.get("request_body", item.get("data", None))),
+                )
+                if not isinstance(headers, dict):
+                    headers = {}
+                if not isinstance(params, dict):
+                    params = {}
+                if body is not None and not isinstance(body, dict):
+                    body = None
+                expected_status = self._normalize_llm_expected_status(
+                    test_type=test_type,
+                    method=method,
+                    endpoint=endpoint,
+                    expected_status=int(expected_status),
+                    name=raw_name,
+                    description=raw_description,
+                    params=dict(params),
+                    body=dict(body) if isinstance(body, dict) else None,
+                )
+                key = (method, endpoint, test_type.value, int(expected_status))
+                if key in seen_keys:
+                    drop_counts["duplicate"] = int(drop_counts.get("duplicate", 0)) + 1
+                    continue
+                seen_keys.add(key)
+                scenarios.append(
+                    TestScenario(
+                        name=raw_name
+                        or f"test_{method.lower()}_{endpoint.replace('/', '_').replace('{', '').replace('}', '')}_{test_type.value}",
+                        description=raw_description
+                        or f"{test_type.value} scenario for {method} {endpoint}",
+                        test_type=test_type,
+                        endpoint=endpoint,
+                        method=method,
+                        headers={str(k): str(v) for k, v in headers.items()},
+                        params=dict(params),
+                        body=dict(body) if isinstance(body, dict) else None,
+                        expected_status=int(expected_status),
+                    )
+                )
+                if len(scenarios) >= 60:
+                    break
+
+            if scenarios:
+                self.llm_stats["scenario_success"] = int(self.llm_stats.get("scenario_success", 0)) + 1
+                self._log_llm_debug(
+                    "planner_accepted",
+                    {
+                        "candidate_rows": len(raw_scenarios),
+                        "accepted_rows": len(scenarios),
+                        "drop_counts": drop_counts,
+                        "response_mode": response_mode_used,
+                        "parse_diagnostics": parse_diagnostics,
+                    },
+                )
+                self.last_llm_generation_diagnostics = {
+                    "status": "accepted",
+                    "response_mode": str(response_mode_used),
+                    "parse_diagnostics": parse_diagnostics,
+                    "candidate_rows": int(len(raw_scenarios)),
+                    "accepted_rows": int(len(scenarios)),
+                    "drop_counts": dict(drop_counts),
+                }
+                return scenarios
+            if raw_scenarios:
+                logger.warning(
+                    "LLM scenario planner returned %d candidate rows but none mapped to known operations. Falling back to heuristic mode.",
+                    len(raw_scenarios),
+                )
+            self._log_llm_debug(
+                "planner_rejected",
+                {
+                    "candidate_rows": len(raw_scenarios),
+                    "accepted_rows": 0,
+                    "drop_counts": drop_counts,
+                    "drop_samples": drop_samples,
+                    "response_mode": response_mode_used,
+                    "parse_diagnostics": parse_diagnostics,
+                    "fallback": "heuristic",
+                },
+            )
+            self.llm_stats["scenario_schema_rejections"] = int(
+                self.llm_stats.get("scenario_schema_rejections", 0)
+            ) + 1
+            self.last_llm_generation_diagnostics = {
+                "status": "rejected",
+                "response_mode": str(response_mode_used),
+                "parse_diagnostics": parse_diagnostics,
+                "candidate_rows": int(len(raw_scenarios)),
+                "accepted_rows": 0,
+                "drop_counts": dict(drop_counts),
+                "drop_samples": drop_samples[:6],
+                "fallback": "heuristic",
+            }
+            self.llm_stats["scenario_errors"] = int(self.llm_stats.get("scenario_errors", 0)) + 1
+            return []
+        except Exception as exc:
+            self.llm_stats["scenario_errors"] = int(self.llm_stats.get("scenario_errors", 0)) + 1
+            elapsed = time.time() - started_at
+            print(f"   ⚠️ LLM scenario planner failed after {elapsed:.2f}s, switching to heuristic mode")
+            logger.warning("LLM scenario generation failed. Falling back to heuristic mode: %s", exc)
+            self._log_llm_debug(
+                "planner_exception",
+                {
+                    "elapsed_sec": round(float(elapsed), 3),
+                    "error": self._text_preview(str(exc), 320),
+                    "fallback": "heuristic",
+                },
+            )
+            self.last_llm_generation_diagnostics = {
+                "status": "exception",
+                "error": self._text_preview(str(exc), 320),
+                "fallback": "heuristic",
+            }
+            return []
     
     def think_like_tester(self, nlp_prompt: Optional[str] = None) -> List[TestScenario]:
         """
@@ -166,6 +1118,8 @@ class HumanTesterSimulator:
         if nlp_prompt:
             print(f"🤖 AI Tester analyzing prompt: '{nlp_prompt}'")
             scenarios = self._generate_from_nlp_prompt(nlp_prompt)
+            if not scenarios:
+                self.last_generation_engine = "heuristic_fallback_empty"
         else:
             # Default comprehensive testing
             for endpoint in self.endpoints:
@@ -190,6 +1144,7 @@ class HumanTesterSimulator:
                 
                 # 7. Edge cases
                 scenarios.extend(self._create_edge_case_tests(endpoint))
+            self.last_generation_engine = "heuristic_default"
         
         self.test_scenarios = scenarios
         return scenarios
@@ -198,8 +1153,28 @@ class HumanTesterSimulator:
         """Generate tests based on natural language prompt like Postman AI."""
         scenarios = []
         prompt_lower = prompt.lower()
+        wants_comprehensive = any(
+            token in prompt_lower
+            for token in (
+                "comprehensive",
+                "complete",
+                "full coverage",
+                "end to end",
+                "end-to-end",
+            )
+        )
         
         print(f"   🧠 Analyzing intent: {prompt}")
+
+        llm_scenarios = self._generate_from_nlp_prompt_llm(prompt)
+        if llm_scenarios:
+            print(f"   🧠 LLM generated {len(llm_scenarios)} scenarios")
+            self.last_generation_engine = "llm_primary"
+            return llm_scenarios
+        if self.llm_enabled:
+            self.last_generation_engine = "llm_fallback_to_heuristic"
+        else:
+            self.last_generation_engine = "heuristic_prompt_mode"
         
         # Parse what user wants to test
         if 'status code' in prompt_lower or 'response time' in prompt_lower:
@@ -213,7 +1188,7 @@ class HumanTesterSimulator:
         if 'auth' in prompt_lower or 'login' in prompt_lower or 'token' in prompt_lower:
             print("   🔐 Generating authentication and authorization tests")
             scenarios.extend(self._create_comprehensive_auth_tests())
-            
+
         if 'error' in prompt_lower or 'invalid' in prompt_lower or 'fail' in prompt_lower:
             print("   💥 Generating error handling and edge case tests")
             scenarios.extend(self._create_comprehensive_error_tests())
@@ -225,10 +1200,16 @@ class HumanTesterSimulator:
         if 'boundary' in prompt_lower or 'limit' in prompt_lower or 'edge' in prompt_lower:
             print("   🎯 Generating boundary and limit tests")
             scenarios.extend(self._create_comprehensive_boundary_tests())
+
+        if 'happy path' in prompt_lower or 'happy_path' in prompt_lower or wants_comprehensive:
+            print("   ✅ Ensuring happy path coverage for each operation")
+            for endpoint in self.endpoints:
+                scenarios.extend(self._create_happy_path_tests(endpoint))
             
         # If no specific intent, generate comprehensive suite
         if not scenarios:
             print("   🎯 No specific intent detected, generating comprehensive test suite")
+            self.last_generation_engine = "heuristic_prompt_to_default"
             return self.think_like_tester()  # Recursive call without prompt
             
         print(f"   ✅ Generated {len(scenarios)} test scenarios from prompt")
@@ -624,9 +1605,10 @@ class HumanTesterSimulator:
         # Add required parameters
         for param in endpoint.parameters:
             if param.get('required', False):
-                if param['in'] == 'query':
+                location = str(param.get('in', '')).lower()
+                if location in {'query', 'path'}:
                     scenario.params[param['name']] = self._generate_sample_value(param)
-                elif param['in'] == 'header':
+                elif location == 'header':
                     scenario.headers[param['name']] = self._generate_sample_value(param)
         
         # Add request body for POST/PUT
@@ -642,11 +1624,12 @@ class HumanTesterSimulator:
         
         # Test 404 - Non-existent resource
         if '{id}' in endpoint.path or '{' in endpoint.path:
+            unresolved_path = re.sub(r"\{[^}]+\}", "nonexistent_dependency_id", endpoint.path)
             scenarios.append(TestScenario(
                 name=f"test_{endpoint.method.lower()}_{endpoint.path.replace('/', '_').replace('{', '').replace('}', '')}_not_found",
                 description=f"Test {endpoint.method} request with non-existent ID",
                 test_type=TestType.ERROR_HANDLING,
-                endpoint=endpoint.path.replace('{id}', '99999').replace('{userId}', '99999'),
+                endpoint=unresolved_path.replace('{id}', '99999').replace('{userId}', '99999'),
                 method=endpoint.method,
                 expected_status=404,
                 assertions=["Response contains error message", "Error format is consistent"]
@@ -788,13 +1771,22 @@ class HumanTesterSimulator:
     
     def _generate_sample_value(self, param: Dict[str, Any]) -> Any:
         """Generate sample values for parameters."""
-        param_type = param.get('type', 'string')
+        schema = param.get('schema', {}) if isinstance(param.get('schema', {}), dict) else {}
+        param_type = str(param.get('type') or schema.get('type') or 'string').lower()
         param_name = param.get('name', '').lower()
         
         if param_type == 'integer':
             if 'id' in param_name:
                 return 123
+            minimum = schema.get('minimum')
+            if isinstance(minimum, (int, float)):
+                return int(minimum) if float(minimum).is_integer() else minimum
             return 10
+        elif param_type == 'number':
+            minimum = schema.get('minimum')
+            if isinstance(minimum, (int, float)):
+                return float(minimum) if float(minimum) > 0 else 1.0
+            return 10.5
         elif param_type == 'boolean':
             return True
         elif param_type == 'array':
@@ -810,12 +1802,114 @@ class HumanTesterSimulator:
     
     def _generate_sample_body(self, request_body: Dict[str, Any]) -> Dict[str, Any]:
         """Generate sample request body."""
-        # This is a simplified version - in reality, you'd parse the schema
+        if not isinstance(request_body, dict):
+            return {
+                "name": "Test User",
+                "email": "test@example.com",
+                "description": "Sample description",
+            }
+
+        content = request_body.get("content", {})
+        if not isinstance(content, dict):
+            content = {}
+        media = content.get("application/json")
+        if not isinstance(media, dict):
+            # Fallback to the first media type if JSON is not explicit.
+            media = next((value for value in content.values() if isinstance(value, dict)), {})
+        schema = media.get("schema", {}) if isinstance(media, dict) else {}
+        resolved = self._resolve_schema(schema)
+        if not isinstance(resolved, dict):
+            resolved = {}
+
+        generated = self._sample_from_schema(resolved, field_name_hint="")
+        if isinstance(generated, dict) and generated:
+            return generated
+
+        # Stable fallback for underspecified schemas.
         return {
             "name": "Test User",
             "email": "test@example.com",
-            "description": "Sample description"
+            "description": "Sample description",
         }
+
+    def _resolve_schema(self, schema: Any) -> Any:
+        if not isinstance(schema, dict):
+            return schema
+        if "$ref" not in schema:
+            return schema
+        ref = str(schema.get("$ref", ""))
+        if not ref.startswith("#/components/schemas/"):
+            return schema
+        name = ref.split("/")[-1]
+        components = self.api_spec.get("components", {}) if isinstance(self.api_spec, dict) else {}
+        schemas = components.get("schemas", {}) if isinstance(components, dict) else {}
+        resolved = schemas.get(name, {}) if isinstance(schemas, dict) else {}
+        return resolved if isinstance(resolved, dict) else schema
+
+    def _sample_from_schema(self, schema: Any, field_name_hint: str = "") -> Any:
+        schema = self._resolve_schema(schema)
+        if not isinstance(schema, dict):
+            return "sample_value"
+
+        if isinstance(schema.get("enum"), list) and schema["enum"]:
+            return schema["enum"][0]
+
+        schema_type = str(schema.get("type", "")).lower()
+        if schema_type == "object" or (not schema_type and isinstance(schema.get("properties"), dict)):
+            properties = schema.get("properties", {}) if isinstance(schema.get("properties", {}), dict) else {}
+            required = schema.get("required", []) if isinstance(schema.get("required", []), list) else []
+            payload: Dict[str, Any] = {}
+            for key in required:
+                if key in properties:
+                    payload[str(key)] = self._sample_from_schema(properties[key], str(key))
+            # Add one optional field for richer happy-path payloads when available.
+            if properties and not payload:
+                first_key = next(iter(properties.keys()))
+                payload[str(first_key)] = self._sample_from_schema(
+                    properties[first_key],
+                    str(first_key),
+                )
+            return payload
+
+        if schema_type == "array":
+            item_schema = schema.get("items", {}) if isinstance(schema.get("items", {}), dict) else {}
+            return [self._sample_from_schema(item_schema, field_name_hint)]
+
+        if schema_type == "integer":
+            minimum = schema.get("minimum")
+            if isinstance(minimum, (int, float)):
+                min_int = int(minimum)
+                return min_int if min_int >= 0 else 0
+            if "quantity" in field_name_hint.lower():
+                return 1
+            if "id" in field_name_hint.lower():
+                return 123
+            return 1
+
+        if schema_type == "number":
+            minimum = schema.get("minimum")
+            if isinstance(minimum, (int, float)):
+                min_num = float(minimum)
+                return min_num if min_num > 0 else 0.01
+            if "price" in field_name_hint.lower():
+                return 19.99
+            return 1.0
+
+        if schema_type == "boolean":
+            return True
+
+        min_length = schema.get("minLength")
+        if "email" in field_name_hint.lower():
+            return "test@example.com"
+        if "token" in field_name_hint.lower():
+            return "valid_token_123"
+        if "id" in field_name_hint.lower():
+            return "id_123"
+        if isinstance(min_length, int) and min_length > 0:
+            return "x" * min(min_length, 8)
+        if "name" in field_name_hint.lower():
+            return "Sample Name"
+        return "sample_value"
 
 
 class MultiLanguageTestGenerator:
@@ -827,6 +1921,25 @@ class MultiLanguageTestGenerator:
         self.base_url = base_url
         self._python_name_counts: Dict[str, int] = {}
         self._java_name_counts: Dict[str, int] = {}
+
+    def _default_path_value(self, name: str) -> str:
+        lowered = str(name or "").strip().lower()
+        if lowered.endswith("id") or lowered == "id":
+            return "123"
+        return "sample"
+
+    def _render_endpoint_and_query(
+        self,
+        endpoint: str,
+        params: Optional[Dict[str, Any]],
+    ) -> Tuple[str, Dict[str, Any]]:
+        rendered = str(endpoint or "")
+        query_params = dict(params or {})
+        for path_name in re.findall(r"\{([^}]+)\}", rendered):
+            key = str(path_name)
+            value = query_params.pop(key, self._default_path_value(key))
+            rendered = rendered.replace("{" + key + "}", quote(str(value), safe=""))
+        return rendered, query_params
     
     def generate_python_tests(self) -> str:
         """Generate Python pytest tests."""
@@ -849,21 +1962,25 @@ class TestAPI:
     
     def _generate_python_test_method(self, scenario: TestScenario, method_name: str) -> str:
         """Generate a single Python test method."""
+        rendered_endpoint, query_params = self._render_endpoint_and_query(
+            scenario.endpoint,
+            scenario.params,
+        )
         method_code = f'''    def {method_name}(self):
         """{scenario.description}"""
-        url = BASE_URL + "{scenario.endpoint}"
+        url = BASE_URL + "{rendered_endpoint}"
         
 '''
         
         # Add headers
         if scenario.headers:
-            method_code += f"        headers = {json.dumps(scenario.headers, indent=8)}\n"
+            method_code += f"        headers = {self._to_python_literal(scenario.headers)}\n"
         else:
             method_code += "        headers = {}\n"
         
         # Add params
-        if scenario.params:
-            method_code += f"        params = {json.dumps(scenario.params, indent=8)}\n"
+        if query_params:
+            method_code += f"        params = {self._to_python_literal(query_params)}\n"
         else:
             method_code += "        params = {}\n"
         
@@ -872,13 +1989,13 @@ class TestAPI:
             method_code += "        response = requests.get(url, headers=headers, params=params)\n"
         elif scenario.method == 'POST':
             if scenario.body:
-                method_code += f"        data = {json.dumps(scenario.body, indent=8)}\n"
+                method_code += f"        data = {self._to_python_literal(scenario.body)}\n"
                 method_code += "        response = requests.post(url, headers=headers, params=params, json=data)\n"
             else:
                 method_code += "        response = requests.post(url, headers=headers, params=params)\n"
         elif scenario.method == 'PUT':
             if scenario.body:
-                method_code += f"        data = {json.dumps(scenario.body, indent=8)}\n"
+                method_code += f"        data = {self._to_python_literal(scenario.body)}\n"
                 method_code += "        response = requests.put(url, headers=headers, params=params, json=data)\n"
             else:
                 method_code += "        response = requests.put(url, headers=headers, params=params)\n"
@@ -896,6 +2013,11 @@ class TestAPI:
         
         method_code += "\n"
         return method_code
+
+    @staticmethod
+    def _to_python_literal(value: Any) -> str:
+        """Render Python literals (None/True/False) instead of JSON (null/true/false)."""
+        return pprint.pformat(value, sort_dicts=False)
 
     def _sanitize_identifier(self, raw_name: str, prefix: str) -> str:
         cleaned = re.sub(r"[^0-9a-zA-Z_]", "_", str(raw_name or ""))
@@ -941,8 +2063,12 @@ describe('API Tests', () => {{
     
     def _generate_javascript_test_method(self, scenario: TestScenario) -> str:
         """Generate JavaScript test method."""
+        rendered_endpoint, query_params = self._render_endpoint_and_query(
+            scenario.endpoint,
+            scenario.params,
+        )
         method_code = f'''  test('{scenario.description}', async () => {{
-    const url = BASE_URL + '{scenario.endpoint}';
+    const url = BASE_URL + '{rendered_endpoint}';
     const config = {{
       method: '{scenario.method.lower()}',
       url: url,
@@ -951,8 +2077,8 @@ describe('API Tests', () => {{
         if scenario.headers:
             method_code += f"      headers: {json.dumps(scenario.headers, indent=6)},\n"
         
-        if scenario.params:
-            method_code += f"      params: {json.dumps(scenario.params, indent=6)},\n"
+        if query_params:
+            method_code += f"      params: {json.dumps(query_params, indent=6)},\n"
         
         if scenario.body:
             method_code += f"      data: {json.dumps(scenario.body, indent=6)},\n"
@@ -988,9 +2114,13 @@ describe('API Tests', () => {{
                 curl_cmd += ' -H "Content-Type: application/json"'
             
             # Add URL
-            url = self.base_url + scenario.endpoint
-            if scenario.params:
-                param_str = "&".join([f"{k}={v}" for k, v in scenario.params.items()])
+            rendered_endpoint, query_params = self._render_endpoint_and_query(
+                scenario.endpoint,
+                scenario.params,
+            )
+            url = self.base_url + rendered_endpoint
+            if query_params:
+                param_str = "&".join([f"{k}={v}" for k, v in query_params.items()])
                 url += f"?{param_str}"
             
             curl_cmd += f' "{url}"'
@@ -1021,6 +2151,10 @@ public class APITests {{
     def _generate_java_test_method(self, scenario: TestScenario) -> str:
         """Generate Java test method."""
         method_name = self._java_method_name_for_scenario(scenario)
+        rendered_endpoint, query_params = self._render_endpoint_and_query(
+            scenario.endpoint,
+            scenario.params,
+        )
         method_code = f'''    @Test
     public void {method_name}() {{
         given()
@@ -1032,7 +2166,7 @@ public class APITests {{
             method_code += f'            .header("{key}", "{value}")\n'
         
         # Add params
-        for key, value in scenario.params.items():
+        for key, value in query_params.items():
             method_code += f'            .param("{key}", "{value}")\n'
         
         # Add body
@@ -1041,7 +2175,7 @@ public class APITests {{
             method_code += '            .contentType("application/json")\n'
         
         method_code += "        .when()\n"
-        method_code += f'            .{scenario.method.lower()}("{scenario.endpoint}")\n'
+        method_code += f'            .{scenario.method.lower()}("{rendered_endpoint}")\n'
         method_code += "        .then()\n"
         method_code += f"            .statusCode({scenario.expected_status});\n"
         method_code += "    }\n\n"

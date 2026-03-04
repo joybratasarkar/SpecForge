@@ -6,6 +6,7 @@ import { appendJobLog, getJob, setDomainResult, updateJob } from '@/lib/store';
 
 const RUN_ROOT = '/tmp/qa_ui_next_runs';
 const CHECKPOINT_ROOT = '/tmp/qa_ui_next_checkpoints';
+const PRESET_DOMAINS = new Set(['ecommerce', 'healthcare', 'logistics', 'hr']);
 
 function safeToken(value, fallback = 'token') {
   const token = String(value ?? '')
@@ -26,6 +27,15 @@ function buildRepoRoot() {
 async function ensureDirs() {
   await fs.mkdir(RUN_ROOT, { recursive: true });
   await fs.mkdir(CHECKPOINT_ROOT, { recursive: true });
+}
+
+async function fileExists(filePath) {
+  try {
+    await fs.access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function streamProcessOutput(proc, onLine) {
@@ -100,6 +110,7 @@ async function runDomain(jobId, domain) {
   const jobStamp = job.createdAt.replace(/[^0-9]/g, '').slice(0, 14);
   const outputDir = path.join(RUN_ROOT, `${jobStamp}_${jobId}_${domain}`);
   const checkpointPath = path.join(CHECKPOINT_ROOT, `${tenant}_${domain}.pt`);
+  const specPathOverride = String(job.request.specPaths?.[domain] || '').trim();
   const scriptPath = buildScriptPath();
   const repoRoot = buildRepoRoot();
 
@@ -109,8 +120,6 @@ async function runDomain(jobId, domain) {
     scriptPath,
     '--domain',
     domain,
-    '--action',
-    'both',
     '--tenant-id',
     tenant,
     '--base-url',
@@ -123,9 +132,48 @@ async function runDomain(jobId, domain) {
     String(job.request.passThreshold),
     '--script-kind',
     String(job.request.scriptKind || 'python_pytest'),
+    '--environment-profile',
+    String(job.request.environmentProfile || 'mock'),
     '--rl-checkpoint',
     checkpointPath
   ];
+  if (job.request.workspaceId) {
+    args.push('--workspace-id', String(job.request.workspaceId));
+  }
+  if (job.request.maxRuntimeSec && Number(job.request.maxRuntimeSec) > 0) {
+    args.push('--max-runtime-sec', String(job.request.maxRuntimeSec));
+  }
+  if (job.request.llmTokenCap && Number(job.request.llmTokenCap) > 0) {
+    args.push('--llm-token-cap', String(job.request.llmTokenCap));
+  }
+
+  if (specPathOverride) {
+    args.push('--action', 'run', '--spec-path', specPathOverride);
+  } else if (PRESET_DOMAINS.has(domain)) {
+    args.push('--action', 'both');
+  } else {
+    appendJobLog(
+      jobId,
+      `[${domain}] Unsupported custom domain without spec path. Provide specPaths.${domain}=/path/to/openapi.yaml`
+    );
+    setDomainResult(jobId, domain, {
+      domain,
+      exitCode: 2,
+      scriptKind: String(job.request.scriptKind || 'python_pytest'),
+      outputDir,
+      checkpointPath,
+      specPath: '',
+      reportJsonPath: '',
+      reportMdPath: '',
+      firstPassReportJsonPath: '',
+      firstPassReportMdPath: '',
+      secondPassReportJsonPath: null,
+      secondPassReportMdPath: null,
+      summary: { error: 'missing_spec_path_for_custom_domain' },
+      generatedTests: {}
+    });
+    return 2;
+  }
 
   if (job.request.prompt) {
     args.push('--prompt', job.request.prompt);
@@ -160,8 +208,15 @@ async function runDomain(jobId, domain) {
 
   const reportJsonPath = path.join(outputDir, 'qa_execution_report.json');
   const reportMdPath = path.join(outputDir, 'qa_execution_report.md');
+  const persistenceDir = `${outputDir}_persistence_check`;
+  const persistenceReportJsonPath = path.join(persistenceDir, 'qa_execution_report.json');
+  const persistenceReportMdPath = path.join(persistenceDir, 'qa_execution_report.md');
+  const hasPersistenceReport =
+    job.request.verifyPersistence && (await fileExists(persistenceReportJsonPath));
 
-  const reportData = await readSummary(reportJsonPath);
+  const finalReportJsonPath = hasPersistenceReport ? persistenceReportJsonPath : reportJsonPath;
+  const finalReportMdPath = hasPersistenceReport ? persistenceReportMdPath : reportMdPath;
+  const reportData = await readSummary(finalReportJsonPath);
 
   setDomainResult(jobId, domain, {
     domain,
@@ -169,8 +224,13 @@ async function runDomain(jobId, domain) {
     scriptKind: String(job.request.scriptKind || 'python_pytest'),
     outputDir,
     checkpointPath,
-    reportJsonPath,
-    reportMdPath,
+    specPath: specPathOverride || '',
+    reportJsonPath: finalReportJsonPath,
+    reportMdPath: finalReportMdPath,
+    firstPassReportJsonPath: reportJsonPath,
+    firstPassReportMdPath: reportMdPath,
+    secondPassReportJsonPath: hasPersistenceReport ? persistenceReportJsonPath : null,
+    secondPassReportMdPath: hasPersistenceReport ? persistenceReportMdPath : null,
     summary: reportData.summary,
     generatedTests: reportData.generatedTests
   });

@@ -30,13 +30,28 @@ http://localhost:3001
 
 In this mode, frontend calls FastAPI directly (`http://127.0.0.1:8787` by default).
 
+You can also run:
+```bash
+QA_UI_MODE=split ./frontend/run_customer_ui_next.sh
+```
+
 ## Full Next Mode
 
 ```bash
 ./frontend/start-full-next.sh
 ```
 
+or:
+```bash
+QA_UI_MODE=full_next ./frontend/run_customer_ui_next.sh
+```
+
 This runs Next.js UI with its own Node API routes.
+
+Use the UI header badge to verify runtime connection:
+
+1. `probe=ok:fastapi` means split mode is connected correctly.
+2. `probe=ok:next_proxy_local` means full-next local mode.
 
 ## What customer can do in UI
 

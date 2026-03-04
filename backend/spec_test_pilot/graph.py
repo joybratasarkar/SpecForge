@@ -304,9 +304,11 @@ def deep_research_reflect_node(state: AgentState) -> AgentState:
     }
     
     memory = GAMMemorySystem(use_vector_search=False)
-    reflection, should_continue = memory.researcher.reflect(
+    info_check = memory.researcher.reflect(
         context, excerpts, reflection_count
     )
+    reflection = str(info_check.analysis)
+    should_continue = info_check.request_status == "need_more"
     
     # Max 2 iterations
     should_continue = should_continue and reflection_count < 2

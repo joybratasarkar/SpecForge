@@ -5,8 +5,30 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${ROOT_DIR}/.." && pwd)"
 BACKEND_HOST="${BACKEND_HOST:-127.0.0.1}"
 BACKEND_PORT="${BACKEND_PORT:-8787}"
-ALLOWED_ORIGINS="${QA_UI_ALLOWED_ORIGINS:-http://localhost:3001,http://127.0.0.1:3001}"
+build_default_allowed_origins() {
+  local origins=()
+  local p
+  for p in 3000 3001 3002 3003 3004 3005 3006 3007 3008 3009 3010; do
+    origins+=("http://localhost:${p}")
+    origins+=("http://127.0.0.1:${p}")
+  done
+  local IFS=,
+  echo "${origins[*]}"
+}
+
+DEFAULT_ALLOWED_ORIGINS="$(build_default_allowed_origins)"
+ALLOWED_ORIGINS="${QA_UI_ALLOWED_ORIGINS:-${DEFAULT_ALLOWED_ORIGINS}}"
 BACKEND_RELOAD="${BACKEND_RELOAD:-0}"
+GAM_LLM_MODE="on"
+GAM_MEMO_LLM_MODE="on"
+ENV_FILE="${REPO_ROOT}/.env"
+
+if [[ -f "${ENV_FILE}" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "${ENV_FILE}"
+  set +a
+fi
 
 cd "${ROOT_DIR}"
 
@@ -23,8 +45,17 @@ fi
 echo "[RUN] Starting FastAPI backend at http://${BACKEND_HOST}:${BACKEND_PORT}"
 echo "[CFG] QA_UI_ALLOWED_ORIGINS=${ALLOWED_ORIGINS}"
 echo "[CFG] BACKEND_RELOAD=${BACKEND_RELOAD}"
+echo "[CFG] GAM_LLM_MODE=${GAM_LLM_MODE} (enforced)"
+echo "[CFG] GAM_MEMO_LLM_MODE=${GAM_MEMO_LLM_MODE} (enforced)"
+if [[ -n "${OPENAI_API_KEY:-}" ]]; then
+  echo "[CFG] OPENAI_API_KEY=loaded_from_env"
+else
+  echo "[CFG] OPENAI_API_KEY=missing"
+fi
 
 export QA_UI_ALLOWED_ORIGINS="${ALLOWED_ORIGINS}"
+export GAM_LLM_MODE="${GAM_LLM_MODE}"
+export GAM_MEMO_LLM_MODE="${GAM_MEMO_LLM_MODE}"
 if [[ "${BACKEND_RELOAD}" == "1" ]]; then
   exec "${PYTHON_BIN}" -m uvicorn qa_customer_api:app --host "${BACKEND_HOST}" --port "${BACKEND_PORT}" --reload
 else

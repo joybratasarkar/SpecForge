@@ -583,6 +583,7 @@ class AgentLightningTrainer:
         gam_memory_system = None,
         checkpoint_path: Optional[str] = None,
         checkpoint_autosave: bool = True,
+        gam_writeback: bool = False,
     ):
         # Initialize components
         self.collector = collector or ObservabilityCollector()
@@ -591,6 +592,9 @@ class AgentLightningTrainer:
         self.gam_memory = gam_memory_system
         self.checkpoint_path = str(checkpoint_path) if checkpoint_path else None
         self.checkpoint_autosave = bool(checkpoint_autosave)
+        # Keep RL observability and training separate from GAM retrieval memory by default.
+        # GAM writeback can be enabled explicitly for experiments.
+        self.gam_writeback = bool(gam_writeback)
         
         # Registered agents
         self.agents: Dict[str, Callable] = {}
@@ -648,7 +652,7 @@ class AgentLightningTrainer:
         
         # Start GAM session if available
         gam_session_id = None
-        if self.gam_memory:
+        if self.gam_memory and self.gam_writeback:
             gam_session_id = self.gam_memory.start_session(
                 tenant_id=task_data.get("tenant_id", "default")
             )
@@ -704,7 +708,7 @@ class AgentLightningTrainer:
                 )
             
             # Update GAM memory
-            if self.gam_memory and gam_session_id:
+            if self.gam_memory and self.gam_writeback and gam_session_id:
                 self.gam_memory.add_to_session(
                     gam_session_id, "agent", 
                     f"Agent {agent_id} executed task with result: {result}"
@@ -962,6 +966,7 @@ def create_agent_lightning_system(
     gam_memory_system=None,
     checkpoint_path: Optional[str] = None,
     checkpoint_autosave: bool = True,
+    gam_writeback: bool = False,
 ):
     """Create Agent Lightning system integrated with existing components."""
     
@@ -970,6 +975,7 @@ def create_agent_lightning_system(
         gam_memory_system=gam_memory_system,
         checkpoint_path=checkpoint_path,
         checkpoint_autosave=checkpoint_autosave,
+        gam_writeback=gam_writeback,
     )
     
     # Create adapter for existing SpecTestPilot
@@ -987,6 +993,7 @@ async def train_with_agent_lightning(
     gam_memory_system=None,
     checkpoint_path: Optional[str] = None,
     checkpoint_autosave: bool = True,
+    gam_writeback: bool = False,
 ) -> Dict[str, Any]:
     """
     Train SpecTestPilot using Agent Lightning with zero code changes.
@@ -1000,6 +1007,7 @@ async def train_with_agent_lightning(
         gam_memory_system,
         checkpoint_path=checkpoint_path,
         checkpoint_autosave=checkpoint_autosave,
+        gam_writeback=gam_writeback,
     )
     
     # Train agent

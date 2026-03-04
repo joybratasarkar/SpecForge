@@ -70,6 +70,18 @@ body {
   color: var(--muted);
 }
 
+.header-badge.ok {
+  border-color: #8fddc9;
+  background: #eaf9f4;
+  color: #156556;
+}
+
+.header-badge.warn {
+  border-color: #f2c59c;
+  background: #fff3e6;
+  color: #8c4f13;
+}
+
 .toast {
   margin-top: 10px;
   border: 1px solid #cbe0ff;

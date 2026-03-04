@@ -205,6 +205,38 @@ class DynamicMockServer:
                 return json.loads(content)
         except (yaml.YAMLError, json.JSONDecodeError) as e:
             raise ValueError(f"Invalid spec file format: {e}")
+
+    def _resolve_local_ref(self, ref: str) -> Any:
+        ref_text = str(ref or "").strip()
+        if not ref_text.startswith("#/"):
+            return None
+        node: Any = self.spec
+        for token in ref_text[2:].split("/"):
+            key = token.replace("~1", "/").replace("~0", "~")
+            if not isinstance(node, dict) or key not in node:
+                return None
+            node = node[key]
+        return node
+
+    def _resolve_refs(self, node: Any, max_depth: int = 12) -> Any:
+        if max_depth <= 0:
+            return node
+        if isinstance(node, dict):
+            if "$ref" in node and isinstance(node.get("$ref"), str):
+                resolved = self._resolve_local_ref(str(node.get("$ref")))
+                if isinstance(resolved, dict):
+                    merged = dict(resolved)
+                    for key, value in node.items():
+                        if key != "$ref":
+                            merged[key] = value
+                    return self._resolve_refs(merged, max_depth=max_depth - 1)
+            return {
+                str(key): self._resolve_refs(value, max_depth=max_depth - 1)
+                for key, value in node.items()
+            }
+        if isinstance(node, list):
+            return [self._resolve_refs(item, max_depth=max_depth - 1) for item in node]
+        return node
     
     def _count_operations(self) -> int:
         """Count total operations across all paths."""
@@ -227,7 +259,7 @@ class DynamicMockServer:
                 "method": request.method,
                 "path": request.url.path,
                 "query_params": dict(request.query_params),
-                "headers": dict(request.headers),
+                "headers": self._sanitize_headers_for_log(dict(request.headers)),
                 "ip": request.client.host if request.client else "unknown"
             }
             
@@ -242,6 +274,16 @@ class DynamicMockServer:
             response.headers["X-Process-Time"] = str(process_time)
             
             return response
+
+    def _sanitize_headers_for_log(self, headers: Dict[str, Any]) -> Dict[str, str]:
+        sanitized: Dict[str, str] = {}
+        for key, value in (headers or {}).items():
+            key_text = str(key)
+            if key_text.lower() in {"authorization", "cookie", "x-api-key"}:
+                sanitized[key_text] = "***"
+            else:
+                sanitized[key_text] = str(value)
+        return sanitized
     
     def _setup_dynamic_routes(self):
         """Dynamically create routes from OpenAPI spec."""
@@ -281,6 +323,7 @@ class DynamicMockServer:
         path_level_parameters: Optional[List[Dict]] = None,
     ):
         """Create a single dynamic route."""
+        operation = self._resolve_refs(operation if isinstance(operation, dict) else {})
         operation_id = operation.get("operationId", f"{method.lower()}_{path.replace('/', '_').replace('{', '').replace('}', '')}")
         
         async def dynamic_handler(request: Request):
@@ -321,6 +364,11 @@ class DynamicMockServer:
             
             # Validate path parameters
             path_params = self._extract_path_params(request.url.path, path)
+            self._validate_path_params(
+                path_params=path_params,
+                operation=operation,
+                path_level_parameters=path_level_parameters,
+            )
             await self._validate_query_params(
                 request=request,
                 operation=operation,
@@ -354,6 +402,7 @@ class DynamicMockServer:
 
         if isinstance(path_level_parameters, list):
             for param in path_level_parameters:
+                param = self._resolve_refs(param)
                 if not isinstance(param, dict):
                     continue
                 location = str(param.get("in", "")).lower()
@@ -364,6 +413,7 @@ class DynamicMockServer:
         operation_params = operation.get("parameters", [])
         if isinstance(operation_params, list):
             for param in operation_params:
+                param = self._resolve_refs(param)
                 if not isinstance(param, dict):
                     continue
                 location = str(param.get("in", "")).lower()
@@ -372,6 +422,97 @@ class DynamicMockServer:
                     merged[(location, name)] = param
 
         return list(merged.values())
+
+    def _validate_path_params(
+        self,
+        *,
+        path_params: Dict[str, str],
+        operation: Dict,
+        path_level_parameters: Optional[List[Dict]] = None,
+    ) -> None:
+        parameters = self._collect_operation_parameters(operation, path_level_parameters)
+        path_specs = [
+            p for p in parameters if str((p or {}).get("in", "")).lower() == "path"
+        ]
+        for param in path_specs:
+            if not isinstance(param, dict):
+                continue
+            name = str(param.get("name", "")).strip()
+            if not name:
+                continue
+            if bool(param.get("required", False)) and name not in path_params:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Missing required path parameter: {name}",
+                )
+            if name in path_params:
+                self._validate_path_param_value(name, str(path_params[name]), param)
+
+    def _validate_path_param_value(self, name: str, raw_value: str, param: Dict) -> None:
+        schema = self._resolve_refs(param.get("schema", {}))
+        if not isinstance(schema, dict):
+            return
+
+        enum_values = schema.get("enum", [])
+        if isinstance(enum_values, list) and enum_values:
+            allowed = {str(v) for v in enum_values}
+            if str(raw_value) not in allowed:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid value for path parameter '{name}': {raw_value}",
+                )
+
+        value_type = str(schema.get("type", "string")).lower()
+        if value_type == "integer":
+            if re.fullmatch(r"[+-]?\d+", str(raw_value)) is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Path parameter '{name}' must be an integer",
+                )
+            numeric_value = int(str(raw_value))
+            minimum = schema.get("minimum")
+            maximum = schema.get("maximum")
+            if minimum is not None and numeric_value < int(minimum):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Path parameter '{name}' must be >= {minimum}",
+                )
+            if maximum is not None and numeric_value > int(maximum):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Path parameter '{name}' must be <= {maximum}",
+                )
+            return
+
+        if value_type == "number":
+            try:
+                numeric_value = float(str(raw_value))
+            except ValueError:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Path parameter '{name}' must be numeric",
+                )
+            minimum = schema.get("minimum")
+            maximum = schema.get("maximum")
+            if minimum is not None and numeric_value < float(minimum):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Path parameter '{name}' must be >= {minimum}",
+                )
+            if maximum is not None and numeric_value > float(maximum):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Path parameter '{name}' must be <= {maximum}",
+                )
+            return
+
+        if value_type == "boolean":
+            if str(raw_value).lower() not in {"true", "false", "1", "0"}:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Path parameter '{name}' must be boolean",
+                )
+            return
 
     async def _validate_query_params(
         self,
@@ -414,7 +555,7 @@ class DynamicMockServer:
                 self._validate_query_param_value(name, incoming[name], param)
 
     def _validate_query_param_value(self, name: str, raw_value: str, param: Dict) -> None:
-        schema = param.get("schema", {})
+        schema = self._resolve_refs(param.get("schema", {}))
         if not isinstance(schema, dict):
             return
 
@@ -579,7 +720,23 @@ class DynamicMockServer:
         """Handle special test cases for specific parameter values."""
         # Simulate 404 for specific test values
         for param_name, param_value in path_params.items():
-            if param_value in ["999", "nonexistent", "invalid", "notfound"]:
+            value = str(param_value).strip()
+            value_lower = value.lower()
+            contains_not_found_token = any(
+                token in value_lower
+                for token in ("nonexistent", "notfound", "missing", "invalid")
+            )
+            is_not_found_token = value_lower in {
+                "999",
+                "9999",
+                "99999",
+                "999999",
+                "nonexistent",
+                "invalid",
+                "notfound",
+            }
+            is_high_nines_id = bool(re.fullmatch(r"9{3,}", value))
+            if is_not_found_token or is_high_nines_id or contains_not_found_token:
                 resource_name = param_name.replace("Id", "").replace("_id", "")
                 raise HTTPException(
                     status_code=404,
@@ -588,23 +745,24 @@ class DynamicMockServer:
         
         # Simulate conflict for POST with specific values
         if method == "POST":
+            body = None
             try:
                 body = await request.json()
-                if body and body.get("name") == "duplicate":
-                    raise HTTPException(status_code=409, detail="Resource already exists")
-            except:
-                pass
+            except Exception:
+                body = None
+            if isinstance(body, dict) and body.get("name") == "duplicate":
+                raise HTTPException(status_code=409, detail="Resource already exists")
     
     async def _validate_request_body(self, request: Request, operation: Dict) -> Optional[Dict]:
         """Validate request body against OpenAPI schema."""
-        request_body_spec = operation.get("requestBody", {})
+        request_body_spec = self._resolve_refs(operation.get("requestBody", {}))
         if not request_body_spec:
             return None
         
         # Get JSON content type schema
         content = request_body_spec.get("content", {})
         json_content = content.get("application/json", {})
-        schema = json_content.get("schema", {})
+        schema = self._resolve_refs(json_content.get("schema", {}))
         
         if not schema:
             return None
@@ -613,14 +771,165 @@ class DynamicMockServer:
             body = await request.json()
         except:
             raise HTTPException(status_code=400, detail="Invalid JSON in request body")
+
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="Request body must be a JSON object")
         
         # Basic validation - check required fields
         required = schema.get("required", [])
         for field in required:
             if field not in body or body[field] is None or body[field] == "":
                 raise HTTPException(status_code=400, detail=f"Missing required field: {field}")
+
+        # Validate known schema properties with lightweight OpenAPI checks.
+        properties = schema.get("properties", {})
+        if isinstance(properties, dict):
+            for field_name, field_schema in properties.items():
+                if field_name not in body:
+                    continue
+                self._validate_request_body_field(
+                    field_name=str(field_name),
+                    value=body[field_name],
+                    schema=(
+                        self._resolve_refs(field_schema)
+                        if isinstance(field_schema, dict)
+                        else {}
+                    ),
+                )
         
         return body
+
+    def _validate_request_body_field(self, field_name: str, value: Any, schema: Dict[str, Any]) -> None:
+        """Apply common OpenAPI constraints for request body fields."""
+        if not isinstance(schema, dict):
+            return
+
+        schema_type = str(schema.get("type", "")).lower()
+        enum_values = schema.get("enum")
+        if isinstance(enum_values, list) and enum_values and value not in enum_values:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Field '{field_name}' must be one of {enum_values}",
+            )
+
+        if schema_type == "string":
+            if not isinstance(value, str):
+                raise HTTPException(status_code=400, detail=f"Field '{field_name}' must be a string")
+            min_length = schema.get("minLength")
+            max_length = schema.get("maxLength")
+            if isinstance(min_length, int) and len(value) < min_length:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Field '{field_name}' is shorter than minLength={min_length}",
+                )
+            if isinstance(max_length, int) and len(value) > max_length:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Field '{field_name}' exceeds maxLength={max_length}",
+                )
+            pattern = schema.get("pattern")
+            if isinstance(pattern, str):
+                try:
+                    if re.fullmatch(pattern, value) is None:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Field '{field_name}' does not match required pattern",
+                        )
+                except re.error:
+                    pass
+            return
+
+        if schema_type == "integer":
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise HTTPException(status_code=400, detail=f"Field '{field_name}' must be an integer")
+            if isinstance(value, float) and not value.is_integer():
+                raise HTTPException(status_code=400, detail=f"Field '{field_name}' must be an integer")
+            self._validate_request_body_numeric_bounds(
+                field_name=field_name,
+                value=float(value),
+                schema=schema,
+            )
+            return
+
+        if schema_type == "number":
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise HTTPException(status_code=400, detail=f"Field '{field_name}' must be a number")
+            self._validate_request_body_numeric_bounds(
+                field_name=field_name,
+                value=float(value),
+                schema=schema,
+            )
+            return
+
+        if schema_type == "boolean":
+            if not isinstance(value, bool):
+                raise HTTPException(status_code=400, detail=f"Field '{field_name}' must be a boolean")
+            return
+
+        if schema_type == "array":
+            if not isinstance(value, list):
+                raise HTTPException(status_code=400, detail=f"Field '{field_name}' must be an array")
+            min_items = schema.get("minItems")
+            max_items = schema.get("maxItems")
+            if isinstance(min_items, int) and len(value) < min_items:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Field '{field_name}' must contain at least {min_items} item(s)",
+                )
+            if isinstance(max_items, int) and len(value) > max_items:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Field '{field_name}' must contain at most {max_items} item(s)",
+                )
+            return
+
+        if schema_type == "object" and not isinstance(value, dict):
+            raise HTTPException(status_code=400, detail=f"Field '{field_name}' must be an object")
+
+    def _validate_request_body_numeric_bounds(
+        self,
+        *,
+        field_name: str,
+        value: float,
+        schema: Dict[str, Any],
+    ) -> None:
+        minimum = schema.get("minimum")
+        maximum = schema.get("maximum")
+        exclusive_minimum = schema.get("exclusiveMinimum")
+        exclusive_maximum = schema.get("exclusiveMaximum")
+
+        if minimum is not None and value < float(minimum):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Field '{field_name}' must be >= {minimum}",
+            )
+        if maximum is not None and value > float(maximum):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Field '{field_name}' must be <= {maximum}",
+            )
+        if isinstance(exclusive_minimum, (int, float)):
+            if value <= float(exclusive_minimum):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Field '{field_name}' must be > {exclusive_minimum}",
+                )
+        elif exclusive_minimum is True and minimum is not None and value <= float(minimum):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Field '{field_name}' must be > {minimum}",
+            )
+        if isinstance(exclusive_maximum, (int, float)):
+            if value >= float(exclusive_maximum):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Field '{field_name}' must be < {exclusive_maximum}",
+                )
+        elif exclusive_maximum is True and maximum is not None and value >= float(maximum):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Field '{field_name}' must be < {maximum}",
+            )
     
     async def _generate_dynamic_response(
         self, 
@@ -632,7 +941,7 @@ class DynamicMockServer:
         body: Optional[Dict]
     ) -> Any:
         """Generate response dynamically based on operation definition."""
-        responses = operation.get("responses", {})
+        responses = self._resolve_refs(operation.get("responses", {}))
         
         # Determine success status code
         if method == "POST":
@@ -643,10 +952,12 @@ class DynamicMockServer:
             success_code = "200"
         
         # Get success response schema
-        success_response = responses.get(success_code, responses.get("200", {}))
+        success_response = self._resolve_refs(
+            responses.get(success_code, responses.get("200", {}))
+        )
         content = success_response.get("content", {})
         json_content = content.get("application/json", {})
-        schema = json_content.get("schema", {})
+        schema = self._resolve_refs(json_content.get("schema", {}))
         
         # Generate response data
         if schema:
