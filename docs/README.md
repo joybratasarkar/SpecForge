@@ -30,10 +30,6 @@ This folder contains architecture, runtime, and integration documentation for `S
 
 ## Licensing
 
-Repository license model: `MIT OR Apache-2.0`.
+Repository license model: `Apache-2.0`.
 
-See root files:
-
-1. `LICENSE`
-2. `LICENSE-MIT`
-3. `LICENSE-APACHE`
+See root `LICENSE`.

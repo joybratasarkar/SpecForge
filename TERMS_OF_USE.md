@@ -5,7 +5,7 @@ This repository is published publicly for technical learning, inspection, and co
 ## Allowed
 
 1. Read and study the code and documentation.
-2. Use, modify, and distribute according to either `LICENSE-MIT` or `LICENSE-APACHE`.
+2. Use, modify, and distribute according to `LICENSE` (Apache-2.0).
 3. Open issues/PRs (if enabled) for improvements and fixes.
 
 ## Important Notes
@@ -16,10 +16,6 @@ This repository is published publicly for technical learning, inspection, and co
 
 ## Licensing
 
-This project is dual-licensed:
+This project is licensed under Apache License 2.0.
 
-1. MIT
-2. Apache-2.0
-
-You may choose either license.
-
+See `LICENSE`.

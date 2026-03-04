@@ -10,12 +10,9 @@ Open-source QA agent platform for OpenAPI-driven testing with:
 
 ## License
 
-Dual licensed under:
+Licensed under Apache License 2.0.
 
-1. MIT (`LICENSE-MIT`)
-2. Apache-2.0 (`LICENSE-APACHE`)
-
-You may use this project under either license.
+See `LICENSE` for full terms.
 
 ## Quick Start
 
