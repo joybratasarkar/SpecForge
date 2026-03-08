@@ -1,0 +1,168 @@
+openapi: "3.0.3"
+info:
+  title: Bearer Inventory API
+  version: "1.0.0"
+servers:
+  - url: http://127.0.0.1:8000
+paths:
+  /auth/login:
+    post:
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required:
+                - username
+                - password
+              properties:
+                username:
+                  type: string
+                password:
+                  type: string
+      responses:
+        "200":
+          description: login ok
+        "401":
+          description: login failed
+  /inventory:
+    get:
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: query
+          name: page
+          schema:
+            type: integer
+            minimum: 1
+        - in: query
+          name: size
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+      responses:
+        "200":
+          description: ok
+        "401":
+          description: unauthorized
+    post:
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/InventoryCreate"
+      responses:
+        "201":
+          description: created
+        "400":
+          description: bad request
+        "401":
+          description: unauthorized
+  /inventory/{itemId}:
+    parameters:
+      - in: path
+        name: itemId
+        required: true
+        schema:
+          type: string
+    get:
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: ok
+        "401":
+          description: unauthorized
+        "404":
+          description: not found
+    patch:
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                quantity:
+                  type: integer
+                  minimum: 0
+                name:
+                  type: string
+      responses:
+        "200":
+          description: updated
+        "400":
+          description: bad request
+        "401":
+          description: unauthorized
+        "404":
+          description: not found
+    delete:
+      security:
+        - bearerAuth: []
+      responses:
+        "204":
+          description: deleted
+        "401":
+          description: unauthorized
+        "404":
+          description: not found
+  /inventory/{itemId}/photo:
+    parameters:
+      - in: path
+        name: itemId
+        required: true
+        schema:
+          type: string
+    post:
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+                - file
+              properties:
+                file:
+                  type: string
+                  format: binary
+                tag:
+                  type: string
+      responses:
+        "201":
+          description: created
+        "400":
+          description: bad request
+        "401":
+          description: unauthorized
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  schemas:
+    InventoryCreate:
+      type: object
+      required:
+        - sku
+        - quantity
+      properties:
+        sku:
+          type: string
+        quantity:
+          type: integer
+          minimum: 1
+        name:
+          type: string

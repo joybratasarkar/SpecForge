@@ -113,6 +113,13 @@ async function runDomain(jobId, domain) {
   const specPathOverride = String(job.request.specPaths?.[domain] || '').trim();
   const scriptPath = buildScriptPath();
   const repoRoot = buildRepoRoot();
+  const envProfile = String(job.request.environmentProfile || 'mock').trim().toLowerCase();
+  const environmentTargets =
+    job.request.environmentTargets && typeof job.request.environmentTargets === 'object'
+      ? job.request.environmentTargets
+      : {};
+  const targetBaseUrl = String(environmentTargets?.[envProfile] || '').trim();
+  const effectiveBaseUrl = targetBaseUrl || String(job.request.baseUrl || '').trim();
 
   await fs.mkdir(outputDir, { recursive: true });
 
@@ -123,7 +130,7 @@ async function runDomain(jobId, domain) {
     '--tenant-id',
     tenant,
     '--base-url',
-    job.request.baseUrl,
+    effectiveBaseUrl,
     '--output-dir',
     outputDir,
     '--max-scenarios',
@@ -133,7 +140,7 @@ async function runDomain(jobId, domain) {
     '--script-kind',
     String(job.request.scriptKind || 'python_pytest'),
     '--environment-profile',
-    String(job.request.environmentProfile || 'mock'),
+    envProfile,
     '--rl-checkpoint',
     checkpointPath
   ];
@@ -145,6 +152,32 @@ async function runDomain(jobId, domain) {
   }
   if (job.request.llmTokenCap && Number(job.request.llmTokenCap) > 0) {
     args.push('--llm-token-cap', String(job.request.llmTokenCap));
+  }
+  const releaseGate =
+    job.request.releaseGate && typeof job.request.releaseGate === 'object'
+      ? job.request.releaseGate
+      : {};
+  if (releaseGate.enabled === false) {
+    args.push('--no-ci-gate');
+  } else {
+    args.push('--ci-gate');
+  }
+  args.push(
+    '--ci-pass-floor',
+    String(releaseGate.passFloor ?? job.request.passThreshold ?? 0.7),
+    '--ci-flaky-threshold',
+    String(releaseGate.flakyThreshold ?? 0.15),
+    '--ci-max-pass-drop',
+    String(releaseGate.maxPassDrop ?? 0.08),
+    '--ci-max-reward-drop',
+    String(releaseGate.maxRewardDrop ?? 0.10),
+    '--ci-min-gam-quality',
+    String(releaseGate.minGamQuality ?? 0.55)
+  );
+  if (releaseGate.safeModeOnFail === false) {
+    args.push('--no-safe-mode-on-fail');
+  } else {
+    args.push('--safe-mode-on-fail');
   }
 
   if (specPathOverride) {
@@ -191,9 +224,74 @@ async function runDomain(jobId, domain) {
 
   updateJob(jobId, { currentDomain: domain });
 
+  const childEnv = {
+    ...process.env
+  };
+  const authMode = String(job.request?.authMode || '').trim().toLowerCase();
+  const runtimeSecrets = job.runtimeSecrets && typeof job.runtimeSecrets === 'object' ? job.runtimeSecrets : {};
+  childEnv.QA_AUTH_MODE = authMode || 'none';
+  delete childEnv.QA_AUTH_VALID_TOKEN;
+  delete childEnv.QA_AUTH_API_KEY_NAME;
+  delete childEnv.QA_AUTH_API_KEY_IN;
+  delete childEnv.QA_AUTH_API_KEY_VALUE;
+  delete childEnv.QA_AUTH_API_KEY_INVALID_VALUE;
+  delete childEnv.QA_AUTH_PROFILES_JSON;
+  delete childEnv.QA_CRITICAL_OPERATIONS_JSON;
+  delete childEnv.QA_CRITICAL_ASSERTIONS_JSON;
+  if (authMode === 'bearer') {
+    const token = String(runtimeSecrets.bearerToken || '').trim();
+    if (token) {
+      childEnv.QA_AUTH_VALID_TOKEN = token;
+    }
+  } else if (authMode === 'api_key') {
+    const authContext =
+      job.request.authContext && typeof job.request.authContext === 'object'
+        ? job.request.authContext
+        : {};
+    const apiKeyName = String(authContext.apiKeyName || 'X-API-Key').trim() || 'X-API-Key';
+    const apiKeyIn = String(authContext.apiKeyIn || 'header').trim().toLowerCase() === 'query' ? 'query' : 'header';
+    const apiKeyValue = String(runtimeSecrets.apiKeyValue || '').trim();
+    childEnv.QA_AUTH_API_KEY_NAME = apiKeyName;
+    childEnv.QA_AUTH_API_KEY_IN = apiKeyIn;
+    if (apiKeyValue) {
+      childEnv.QA_AUTH_API_KEY_VALUE = apiKeyValue;
+    }
+    childEnv.QA_AUTH_API_KEY_INVALID_VALUE = String(process.env.QA_AUTH_API_KEY_INVALID_VALUE || 'invalid_api_key');
+  }
+  const authProfiles =
+    runtimeSecrets.authProfiles && typeof runtimeSecrets.authProfiles === 'object'
+      ? runtimeSecrets.authProfiles
+      : null;
+  if (authProfiles && Object.keys(authProfiles).length > 0) {
+    childEnv.QA_AUTH_PROFILES_JSON = JSON.stringify(authProfiles);
+  }
+  if (Array.isArray(job.request.criticalOperations) && job.request.criticalOperations.length > 0) {
+    childEnv.QA_CRITICAL_OPERATIONS_JSON = JSON.stringify(job.request.criticalOperations);
+  }
+  if (Array.isArray(job.request.criticalAssertions) && job.request.criticalAssertions.length > 0) {
+    childEnv.QA_CRITICAL_ASSERTIONS_JSON = JSON.stringify(job.request.criticalAssertions);
+  }
+  childEnv.QA_REPORT_MODE = String(job.request.reportMode || 'full').trim().toLowerCase() || 'full';
+  const resourceLimits =
+    job.request.resourceLimits && typeof job.request.resourceLimits === 'object'
+      ? job.request.resourceLimits
+      : {};
+  if (Number(resourceLimits.liveRequestTimeoutSec) > 0) {
+    childEnv.QA_LIVE_REQUEST_TIMEOUT_SEC = String(resourceLimits.liveRequestTimeoutSec);
+  }
+  if (Number(resourceLimits.scriptExecMaxRuntimeSec) > 0) {
+    childEnv.QA_SCRIPT_EXEC_MAX_RUNTIME_SEC = String(resourceLimits.scriptExecMaxRuntimeSec);
+  }
+  if (Number(resourceLimits.llmTimeoutSec) > 0) {
+    childEnv.QA_SCENARIO_LLM_TIMEOUT_SECONDS = String(resourceLimits.llmTimeoutSec);
+  }
+  if (Number(resourceLimits.llmRetries) >= 0) {
+    childEnv.QA_SCENARIO_LLM_MAX_RETRIES = String(resourceLimits.llmRetries);
+  }
+
   const proc = spawn('bash', args, {
     cwd: repoRoot,
-    env: process.env,
+    env: childEnv,
     stdio: ['ignore', 'pipe', 'pipe']
   });
 

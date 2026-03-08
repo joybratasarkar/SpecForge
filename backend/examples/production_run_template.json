@@ -1,0 +1,89 @@
+{
+  "domains": ["orders_api"],
+  "specPaths": {
+    "orders_api": "/absolute/path/to/openapi.yaml"
+  },
+  "tenantId": "customer_prod",
+  "workspaceId": "customer_prod",
+  "scriptKind": "python_pytest",
+  "environmentProfile": "staging",
+  "environmentTargets": {
+    "staging": "https://staging.api.example.com",
+    "prod_safe": "https://api.example.com"
+  },
+  "baseUrl": "https://staging.api.example.com",
+  "authMode": "bearer",
+  "authContext": {
+    "bearerToken": "REDACTED_RUNTIME_TOKEN"
+  },
+  "authProfiles": {
+    "POST /auth/login": {
+      "authMode": "none"
+    },
+    "GET /orders/{orderId}": {
+      "authMode": "api_key",
+      "apiKeyName": "X-API-Key",
+      "apiKeyIn": "header",
+      "apiKeyValue": "REDACTED_RUNTIME_KEY"
+    }
+  },
+  "customerIntent": "Validate payment and order-critical flows, auth boundaries, and idempotency.",
+  "scopeMode": "advanced",
+  "includeOperations": [
+    "GET /orders",
+    "GET /orders/{orderId}",
+    "POST /orders",
+    "PATCH /orders/{orderId}"
+  ],
+  "excludeOperations": ["DELETE /orders/{orderId}"],
+  "requestMutationRules": [
+    {
+      "operationId": "POST /orders",
+      "requestMode": "body",
+      "fieldName": "amount",
+      "action": "invalid_type",
+      "value": "",
+      "note": "force invalid amount type"
+    }
+  ],
+  "criticalOperations": [
+    "POST /orders",
+    "GET /orders/{orderId}"
+  ],
+  "criticalAssertions": [
+    {
+      "operationId": "POST /orders",
+      "expectedStatus": 201,
+      "minPassCount": 1,
+      "note": "Create order happy path must pass."
+    },
+    {
+      "operationId": "GET /orders/{orderId}",
+      "allowedStatuses": [200, 404],
+      "minPassCount": 1
+    }
+  ],
+  "releaseGate": {
+    "enabled": true,
+    "passFloor": 0.75,
+    "flakyThreshold": 0.1,
+    "maxPassDrop": 0.05,
+    "maxRewardDrop": 0.08,
+    "minGamQuality": 0.6,
+    "safeModeOnFail": true
+  },
+  "resourceLimits": {
+    "liveRequestTimeoutSec": 10,
+    "scriptExecMaxRuntimeSec": 180,
+    "llmTimeoutSec": 45,
+    "llmRetries": 1
+  },
+  "reportMode": "executive",
+  "maxScenarios": 96,
+  "maxRuntimeSec": 600,
+  "llmTokenCap": 2048,
+  "passThreshold": 0.75,
+  "customerMode": true,
+  "verifyPersistence": true,
+  "customerRoot": "~/.spec_test_pilot"
+}

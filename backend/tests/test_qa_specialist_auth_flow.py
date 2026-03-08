@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import yaml
@@ -30,6 +31,97 @@ def _write_spec(path: Path) -> None:
         },
         "components": {
             "securitySchemes": {"bearerAuth": {"type": "http", "scheme": "bearer"}}
+        },
+    }
+    path.write_text(yaml.safe_dump(spec, sort_keys=False), encoding="utf-8")
+
+
+def _write_api_key_spec(path: Path) -> None:
+    spec = {
+        "openapi": "3.0.3",
+        "info": {"title": "API Key Auth API", "version": "1.0.0"},
+        "paths": {
+            "/orders/{orderId}": {
+                "get": {
+                    "security": [{"apiKeyAuth": []}],
+                    "parameters": [
+                        {
+                            "in": "path",
+                            "name": "orderId",
+                            "required": True,
+                            "schema": {"type": "string"},
+                        }
+                    ],
+                    "responses": {"200": {"description": "ok"}, "401": {"description": "unauthorized"}},
+                }
+            },
+            "/orders": {
+                "post": {
+                    "security": [{"apiKeyAuth": []}],
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "required": ["email"],
+                                    "properties": {
+                                        "email": {"type": "string"},
+                                        "name": {"type": "string"},
+                                    },
+                                }
+                            }
+                        },
+                    },
+                    "responses": {"201": {"description": "created"}, "400": {"description": "bad request"}},
+                }
+            },
+        },
+        "components": {
+            "securitySchemes": {
+                "apiKeyAuth": {
+                    "type": "apiKey",
+                    "name": "X-API-Key",
+                    "in": "header",
+                }
+            }
+        },
+    }
+    path.write_text(yaml.safe_dump(spec, sort_keys=False), encoding="utf-8")
+
+
+def _write_api_key_query_spec(path: Path) -> None:
+    spec = {
+        "openapi": "3.0.3",
+        "info": {"title": "API Key Query API", "version": "1.0.0"},
+        "paths": {
+            "/orders": {
+                "get": {
+                    "security": [{"apiKeyAuth": []}],
+                    "parameters": [
+                        {
+                            "in": "query",
+                            "name": "status",
+                            "schema": {"type": "string", "enum": ["pending", "confirmed"]},
+                        },
+                        {
+                            "in": "query",
+                            "name": "limit",
+                            "schema": {"type": "integer", "minimum": 1, "maximum": 100},
+                        },
+                    ],
+                    "responses": {"200": {"description": "ok"}, "400": {"description": "bad request"}},
+                }
+            }
+        },
+        "components": {
+            "securitySchemes": {
+                "apiKeyAuth": {
+                    "type": "apiKey",
+                    "name": "X-API-Key",
+                    "in": "header",
+                }
+            }
         },
     }
     path.write_text(yaml.safe_dump(spec, sort_keys=False), encoding="utf-8")
@@ -175,6 +267,198 @@ def test_boundary_401_expectation_is_treated_as_auth_negative(tmp_path: Path) ->
         headers=scenario.headers,
     )
     assert headers.get("Authorization") == "Bearer invalid"
+
+
+def test_api_key_header_auth_mode_injects_runtime_key_values(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("QA_AUTH_MODE", "api_key")
+    monkeypatch.setenv("QA_AUTH_API_KEY_NAME", "X-API-Key")
+    monkeypatch.setenv("QA_AUTH_API_KEY_IN", "header")
+    monkeypatch.setenv("QA_AUTH_API_KEY_VALUE", "live_key_123")
+    monkeypatch.setenv("QA_AUTH_API_KEY_INVALID_VALUE", "invalid_key_999")
+    spec_path = tmp_path / "spec.yaml"
+    _write_api_key_spec(spec_path)
+
+    agent = QASpecialistAgent(
+        spec_path=str(spec_path),
+        output_dir=str(tmp_path / "out"),
+        max_scenarios=4,
+    )
+    spec = agent._load_spec()
+    agent._auth_required_ops = agent._build_auth_requirement_map(spec)
+
+    non_auth = ScenarioModel(
+        name="test_get_orders_regular",
+        description="regular secured fetch",
+        test_type=ScenarioType.HAPPY_PATH,
+        endpoint="/orders/{orderId}",
+        method="GET",
+        expected_status=200,
+        params={"orderId": "123"},
+    )
+    auth_negative = ScenarioModel(
+        name="test_get_orders_auth_negative",
+        description="auth negative probe",
+        test_type=ScenarioType.AUTHENTICATION,
+        endpoint="/orders/{orderId}",
+        method="GET",
+        expected_status=401,
+        params={"orderId": "123"},
+    )
+
+    good_headers = agent._normalize_auth_headers_for_execution(
+        scenario=non_auth,
+        method="GET",
+        headers={},
+    )
+    bad_headers = agent._normalize_auth_headers_for_execution(
+        scenario=auth_negative,
+        method="GET",
+        headers={},
+    )
+
+    assert good_headers.get("X-API-Key") == "live_key_123"
+    assert good_headers.get("Authorization") in {None, ""}
+    assert bad_headers.get("X-API-Key") == "invalid_key_999"
+
+
+def test_api_key_query_auth_mode_injects_and_removes_query_key(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("QA_AUTH_MODE", "api_key")
+    monkeypatch.setenv("QA_AUTH_API_KEY_NAME", "api_key")
+    monkeypatch.setenv("QA_AUTH_API_KEY_IN", "query")
+    monkeypatch.setenv("QA_AUTH_API_KEY_VALUE", "query_live_key")
+    monkeypatch.setenv("QA_AUTH_API_KEY_INVALID_VALUE", "query_invalid_key")
+    spec_path = tmp_path / "spec.yaml"
+    _write_api_key_spec(spec_path)
+
+    agent = QASpecialistAgent(
+        spec_path=str(spec_path),
+        output_dir=str(tmp_path / "out"),
+        max_scenarios=4,
+    )
+    spec = agent._load_spec()
+    agent._auth_required_ops = agent._build_auth_requirement_map(spec)
+
+    non_auth = ScenarioModel(
+        name="test_get_orders_regular",
+        description="regular secured fetch",
+        test_type=ScenarioType.HAPPY_PATH,
+        endpoint="/orders/{orderId}",
+        method="GET",
+        expected_status=200,
+        params={"orderId": "123"},
+    )
+    missing_auth = ScenarioModel(
+        name="test_get_orders_missing_auth",
+        description="missing auth key",
+        test_type=ScenarioType.AUTHENTICATION,
+        endpoint="/orders/{orderId}",
+        method="GET",
+        expected_status=401,
+        params={"orderId": "123", "api_key": "existing_value"},
+    )
+
+    good_params = agent._normalize_auth_params_for_execution(
+        scenario=non_auth,
+        method="GET",
+        params=dict(non_auth.params or {}),
+    )
+    missing_params = agent._normalize_auth_params_for_execution(
+        scenario=missing_auth,
+        method="GET",
+        params=dict(missing_auth.params or {}),
+    )
+
+    assert good_params.get("api_key") == "query_live_key"
+    assert "api_key" not in missing_params
+
+
+def test_query_enum_and_type_params_are_normalized_for_positive_scenarios(tmp_path: Path) -> None:
+    spec_path = tmp_path / "spec.yaml"
+    _write_api_key_query_spec(spec_path)
+
+    agent = QASpecialistAgent(
+        spec_path=str(spec_path),
+        output_dir=str(tmp_path / "out"),
+        max_scenarios=4,
+    )
+    spec = agent._load_spec()
+    agent._auth_required_ops = agent._build_auth_requirement_map(spec)
+    agent._operation_index = agent._build_operation_index(spec)
+
+    op_key = "GET /orders"
+    op_meta = dict(agent._operation_index.get(op_key) or {})
+    guardrail = agent._build_happy_path_guardrail_scenario(
+        operation_key=op_key,
+        op_meta=op_meta,
+    )
+    assert guardrail is not None
+    guardrail_params = dict(guardrail.params or {})
+    assert guardrail_params.get("status") == "pending"
+    assert guardrail_params.get("limit") == 1
+
+    scenario = ScenarioModel(
+        name="test_get_orders_happy_dirty_query",
+        description="happy path query should be normalized",
+        test_type=ScenarioType.HAPPY_PATH,
+        endpoint="/orders",
+        method="GET",
+        expected_status=200,
+        params={"status": "not_a_real_status", "limit": "500000", "extra": "noise"},
+    )
+    normalized = agent._normalize_query_params_for_execution(
+        scenario,
+        op_meta=op_meta,
+    )
+    assert normalized == {"status": "pending", "limit": 1}
+
+
+def test_customer_mutation_rules_skip_on_happy_path_scenarios(
+    tmp_path: Path, monkeypatch
+) -> None:
+    mutation_rules = [
+        {
+            "operationId": "POST /orders",
+            "requestMode": "body",
+            "fieldName": "email",
+            "action": "set_empty",
+            "value": "",
+        }
+    ]
+    monkeypatch.setenv("QA_REQUEST_MUTATION_RULES_JSON", json.dumps(mutation_rules))
+    spec_path = tmp_path / "spec.yaml"
+    _write_api_key_spec(spec_path)
+
+    agent = QASpecialistAgent(
+        spec_path=str(spec_path),
+        output_dir=str(tmp_path / "out"),
+        max_scenarios=4,
+    )
+    spec = agent._load_spec()
+    agent._auth_required_ops = agent._build_auth_requirement_map(spec)
+    agent._operation_index = agent._build_operation_index(spec)
+
+    scenario = ScenarioModel(
+        name="test_post_orders_customer_rule",
+        description="happy path should not apply mutation rule",
+        test_type=ScenarioType.HAPPY_PATH,
+        endpoint="/orders",
+        method="POST",
+        expected_status=201,
+        body={"email": "test@example.com", "name": "demo"},
+    )
+
+    prepared = agent._prepare_scenarios_for_execution_and_scripts([scenario])
+    assert prepared
+    prepared_body = prepared[0].body or {}
+    assert prepared_body.get("email") == "test@example.com"
+    assert not any(
+        str(item).startswith("customer_mutation_rules_applied")
+        for item in list(prepared[0].assertions or [])
+    )
 
 
 def test_boundary_unconstrained_path_400_normalizes_to_404(tmp_path: Path) -> None:
@@ -1835,6 +2119,143 @@ def test_summary_emits_llm_degradation_policy_diagnostics(tmp_path: Path) -> Non
     assert "llm_generation_degraded" in summary["quality_gate_fail_reasons"]
 
 
+def test_summary_includes_failure_diagnosis_breakdown(tmp_path: Path) -> None:
+    spec_path = tmp_path / "spec.yaml"
+    _write_spec(spec_path)
+
+    agent = QASpecialistAgent(
+        spec_path=str(spec_path),
+        output_dir=str(tmp_path / "out"),
+        max_scenarios=4,
+    )
+
+    fail_scenario = ScenarioModel(
+        name="test_orders_hard_fail",
+        description="service regression",
+        test_type=ScenarioType.HAPPY_PATH,
+        endpoint="/orders/{orderId}",
+        method="GET",
+        expected_status=200,
+        params={"orderId": "123"},
+    )
+    suspect_scenario = ScenarioModel(
+        name="test_orders_expectation_mismatch",
+        description="expectation mismatch",
+        test_type=ScenarioType.AUTHORIZATION,
+        endpoint="/orders/{orderId}",
+        method="GET",
+        expected_status=403,
+        params={"orderId": "456"},
+    )
+    pass_scenario = ScenarioModel(
+        name="test_orders_pass",
+        description="healthy",
+        test_type=ScenarioType.AUTHENTICATION,
+        endpoint="/orders/{orderId}",
+        method="GET",
+        expected_status=401,
+        params={"orderId": "789"},
+    )
+
+    fail_result = ScenarioExecutionResult(
+        name=fail_scenario.name,
+        test_type=fail_scenario.test_type.value,
+        method=fail_scenario.method,
+        endpoint_template=fail_scenario.endpoint,
+        endpoint_resolved="/orders/123",
+        expected_status=200,
+        actual_status=500,
+        verdict="fail",
+        passed=False,
+        duration_ms=1.2,
+        verification={
+            "passed": False,
+            "verdict": "fail",
+            "status_check": {"expected_status": 200, "actual_status": 500, "corrected": False},
+            "contract_check": {"checked": True, "schema_found": True, "valid": False, "issues": ["status_mismatch"]},
+            "failure_taxonomy": {
+                "category": "behavioral_regression",
+                "kind": "service_or_spec_issue",
+                "reason": "assertion_failed",
+                "confidence": 0.7,
+            },
+            "repair_suggestion": {},
+        },
+    )
+    suspect_result = ScenarioExecutionResult(
+        name=suspect_scenario.name,
+        test_type=suspect_scenario.test_type.value,
+        method=suspect_scenario.method,
+        endpoint_template=suspect_scenario.endpoint,
+        endpoint_resolved="/orders/456",
+        expected_status=403,
+        actual_status=401,
+        verdict="suspect",
+        passed=False,
+        duration_ms=0.9,
+        verification={
+            "passed": False,
+            "verdict": "suspect",
+            "status_check": {"expected_status": 403, "actual_status": 401, "corrected": True},
+            "contract_check": {"checked": True, "schema_found": True, "valid": True, "issues": []},
+            "failure_taxonomy": {
+                "category": "expectation_mismatch_documented",
+                "kind": "agent_issue",
+                "reason": "expected_not_in_documented_statuses",
+                "confidence": 0.9,
+            },
+            "repair_suggestion": {
+                "type": "override_expected_status",
+                "expected_status": 401,
+                "confidence": 0.9,
+                "reason": "expectation_mismatch_documented",
+            },
+        },
+    )
+    pass_result = ScenarioExecutionResult(
+        name=pass_scenario.name,
+        test_type=pass_scenario.test_type.value,
+        method=pass_scenario.method,
+        endpoint_template=pass_scenario.endpoint,
+        endpoint_resolved="/orders/789",
+        expected_status=401,
+        actual_status=401,
+        verdict="pass",
+        passed=True,
+        duration_ms=0.5,
+        verification={
+            "passed": True,
+            "verdict": "pass",
+            "status_check": {"expected_status": 401, "actual_status": 401, "corrected": False},
+            "contract_check": {"checked": True, "schema_found": True, "valid": True, "issues": []},
+            "failure_taxonomy": {"category": "none", "kind": "none", "reason": "passed", "confidence": 1.0},
+        },
+    )
+
+    summary = agent._build_summary(
+        agent._load_spec(),
+        [fail_scenario, suspect_scenario, pass_scenario],
+        [fail_result, suspect_result, pass_result],
+    )
+    diagnosis = summary.get("failure_diagnosis", {})
+    assert isinstance(diagnosis, dict)
+    assert int(diagnosis.get("non_pass_total", 0)) == 2
+    owner_breakdown = diagnosis.get("owner_breakdown", {})
+    assert int(owner_breakdown.get("service_or_spec_issue", 0)) == 1
+    assert int(owner_breakdown.get("agent_or_test_issue", 0)) == 1
+    endpoint_rows = diagnosis.get("endpoint_diagnosis", [])
+    assert isinstance(endpoint_rows, list) and endpoint_rows
+    assert str(endpoint_rows[0].get("operation_key", "")).startswith("GET /orders/{orderId}")
+    assessment = diagnosis.get("agent_assessment", {})
+    assert str(assessment.get("assessment", "")) in {
+        "mixed_signal",
+        "mostly_service_or_spec",
+        "mostly_agent_or_expectation",
+        "mostly_environment_or_policy",
+        "no_failures_detected",
+    }
+
+
 def test_gam_context_pack_requires_direct_weak_signal(tmp_path: Path) -> None:
     spec_path = tmp_path / "spec.yaml"
     _write_spec(spec_path)
@@ -2020,6 +2441,143 @@ def test_verify_response_contract_uses_json_fallback_when_schema_missing(tmp_pat
     assert "json_sanity_check" in " ".join(contract.get("issues", []))
 
 
+def test_verify_response_contract_strict_mode_warns_when_schema_missing(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("QA_STRICT_CONTRACT_CHECKS", "1")
+    monkeypatch.delenv("QA_STRICT_CONTRACT_REQUIRE_RESPONSE_SCHEMA", raising=False)
+    spec_path = tmp_path / "spec.yaml"
+    _write_spec(spec_path)
+    agent = QASpecialistAgent(
+        spec_path=str(spec_path),
+        output_dir=str(tmp_path / "out"),
+        max_scenarios=4,
+        environment_profile="staging",
+    )
+
+    scenario = ScenarioModel(
+        name="test_get_orders_happy_strict",
+        description="happy path",
+        test_type=ScenarioType.HAPPY_PATH,
+        endpoint="/orders/{orderId}",
+        method="GET",
+        expected_status=200,
+    )
+    response = _FakeResponse({"ok": True})
+
+    contract = agent._verify_response_contract(
+        scenario=scenario,
+        actual_status=200,
+        response=response,
+        query_params={},
+        body=None,
+        operation_meta={},
+    )
+
+    assert contract["checked"] is True
+    assert contract["schema_found"] is False
+    assert contract["valid"] is True
+    assert "strict_mode_warn_only" in " ".join(contract.get("issues", []))
+
+
+def test_verify_response_contract_strict_mode_can_enforce_schema_presence(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("QA_STRICT_CONTRACT_CHECKS", "1")
+    monkeypatch.setenv("QA_STRICT_CONTRACT_REQUIRE_RESPONSE_SCHEMA", "1")
+    spec_path = tmp_path / "spec.yaml"
+    _write_spec(spec_path)
+    agent = QASpecialistAgent(
+        spec_path=str(spec_path),
+        output_dir=str(tmp_path / "out"),
+        max_scenarios=4,
+        environment_profile="staging",
+    )
+
+    scenario = ScenarioModel(
+        name="test_get_orders_happy_strict_enforced",
+        description="happy path",
+        test_type=ScenarioType.HAPPY_PATH,
+        endpoint="/orders/{orderId}",
+        method="GET",
+        expected_status=200,
+    )
+    response = _FakeResponse({"ok": True})
+
+    contract = agent._verify_response_contract(
+        scenario=scenario,
+        actual_status=200,
+        response=response,
+        query_params={},
+        body=None,
+        operation_meta={},
+    )
+
+    assert contract["checked"] is True
+    assert contract["schema_found"] is False
+    assert contract["valid"] is False
+    assert "strict_contract_check_enabled" in " ".join(contract.get("issues", []))
+
+
+def test_history_seed_auth_scenario_is_not_forced_on_public_operation(tmp_path: Path) -> None:
+    spec_path = tmp_path / "spec.yaml"
+    spec = {
+        "openapi": "3.0.3",
+        "info": {"title": "Public Login API", "version": "1.0.0"},
+        "paths": {
+            "/auth/login": {
+                "post": {
+                    "security": [],
+                    "responses": {
+                        "200": {"description": "ok"},
+                        "400": {"description": "bad request"},
+                    },
+                }
+            },
+            "/orders/{orderId}": {
+                "get": {
+                    "security": [{"bearerAuth": []}],
+                    "responses": {
+                        "200": {"description": "ok"},
+                        "401": {"description": "unauthorized"},
+                    },
+                }
+            },
+        },
+        "components": {
+            "securitySchemes": {"bearerAuth": {"type": "http", "scheme": "bearer"}}
+        },
+    }
+    spec_path.write_text(yaml.safe_dump(spec, sort_keys=False), encoding="utf-8")
+
+    agent = QASpecialistAgent(
+        spec_path=str(spec_path),
+        output_dir=str(tmp_path / "out"),
+        max_scenarios=8,
+    )
+    loaded = agent._load_spec()
+    agent._auth_required_ops = agent._build_auth_requirement_map(loaded)
+    op_index = agent._build_operation_index(loaded)
+
+    scenario = agent._build_history_seed_scenario(
+        {
+            "endpoint": "/auth/login",
+            "method": "POST",
+            "test_type": "authentication",
+            "expected_status": 401,
+            "has_body": False,
+            "has_params": False,
+            "attempts": 3,
+            "failure_rate": 1.0,
+            "op_meta": op_index["POST /auth/login"],
+        }
+    )
+
+    assert scenario.test_type == ScenarioType.ERROR_HANDLING
+    assert int(scenario.expected_status) not in {401, 403}
+    assert not bool((scenario.headers or {}).get("Authorization"))
+
+
 def test_forced_weak_replay_respects_cadence(tmp_path: Path) -> None:
     spec_path = tmp_path / "spec.yaml"
     _write_spec(spec_path)
@@ -2100,3 +2658,147 @@ def test_selection_summary_contains_portfolio_policy(tmp_path: Path) -> None:
     assert policy.get("stable_ratio") == 0.7
     assert policy.get("focus_ratio") == 0.2
     assert policy.get("explore_ratio") == 0.1
+
+
+def test_operation_auth_profile_override_switches_to_api_key_header(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("QA_AUTH_MODE", "bearer")
+    monkeypatch.setenv(
+        "QA_AUTH_PROFILES_JSON",
+        json.dumps(
+            {
+                "GET /orders/{orderId}": {
+                    "authMode": "api_key",
+                    "apiKeyName": "X-Override-Key",
+                    "apiKeyIn": "header",
+                    "apiKeyValue": "override_live_value",
+                }
+            }
+        ),
+    )
+    spec_path = tmp_path / "spec.yaml"
+    _write_spec(spec_path)
+    agent = QASpecialistAgent(
+        spec_path=str(spec_path),
+        output_dir=str(tmp_path / "out"),
+        max_scenarios=4,
+    )
+    loaded = agent._load_spec()
+    agent._auth_required_ops = agent._build_auth_requirement_map(loaded)
+
+    scenario = ScenarioModel(
+        name="test_get_orders_override_auth",
+        description="auth override path",
+        test_type=ScenarioType.HAPPY_PATH,
+        endpoint="/orders/{orderId}",
+        method="GET",
+        expected_status=200,
+        params={"orderId": "123"},
+    )
+
+    headers = agent._normalize_auth_headers_for_execution(
+        scenario=scenario,
+        method="GET",
+        headers={},
+    )
+    assert headers.get("X-Override-Key") == "override_live_value"
+    assert "Authorization" not in headers
+
+
+def test_critical_operation_no_pass_fails_quality_gate(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv(
+        "QA_CRITICAL_OPERATIONS_JSON",
+        json.dumps(["GET /orders/{orderId}"]),
+    )
+    spec_path = tmp_path / "spec.yaml"
+    _write_spec(spec_path)
+    agent = QASpecialistAgent(
+        spec_path=str(spec_path),
+        output_dir=str(tmp_path / "out"),
+        max_scenarios=4,
+    )
+
+    result = ScenarioExecutionResult(
+        name="test_get_orders_happy",
+        test_type=ScenarioType.HAPPY_PATH.value,
+        method="GET",
+        endpoint_template="/orders/{orderId}",
+        endpoint_resolved="/orders/123",
+        expected_status=200,
+        actual_status=500,
+        verdict="fail",
+        passed=False,
+        duration_ms=1.0,
+        error="AssertionError",
+        verification={},
+    )
+    summary = agent._build_summary(spec={"paths": {}}, scenarios=[], results=[result])
+    reasons = set(summary.get("quality_gate_fail_reasons", []) or [])
+    assert "critical_operation_no_pass:GET /orders/{orderId}" in reasons
+    assert bool((summary.get("critical_gate", {}) or {}).get("enabled", False)) is True
+
+
+def test_customer_mutation_rules_skip_happy_path_and_apply_to_negative(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv(
+        "QA_REQUEST_MUTATION_RULES_JSON",
+        json.dumps(
+            [
+                {
+                    "operationId": "POST /orders",
+                    "requestMode": "body",
+                    "fieldName": "email",
+                    "action": "set_empty",
+                    "value": "",
+                }
+            ]
+        ),
+    )
+    spec_path = tmp_path / "spec.yaml"
+    _write_api_key_spec(spec_path)
+    agent = QASpecialistAgent(
+        spec_path=str(spec_path),
+        output_dir=str(tmp_path / "out"),
+        max_scenarios=8,
+    )
+    loaded = agent._load_spec()
+    op_meta = agent._build_operation_index(loaded)["POST /orders"]
+
+    happy = ScenarioModel(
+        name="test_post_orders_happy",
+        description="happy path",
+        test_type=ScenarioType.HAPPY_PATH,
+        endpoint="/orders",
+        method="POST",
+        expected_status=201,
+        body={"email": "qa@example.com", "name": "QA"},
+    )
+    negative = ScenarioModel(
+        name="test_post_orders_negative",
+        description="invalid payload",
+        test_type=ScenarioType.ERROR_HANDLING,
+        endpoint="/orders",
+        method="POST",
+        expected_status=400,
+        body={"email": "qa@example.com", "name": "QA"},
+    )
+
+    agent._apply_customer_mutation_rules_for_execution(
+        happy,
+        method="POST",
+        op_meta=op_meta,
+    )
+    agent._apply_customer_mutation_rules_for_execution(
+        negative,
+        method="POST",
+        op_meta=op_meta,
+    )
+
+    assert happy.body.get("email") == "qa@example.com"
+    assert "customer_mutation_rules_applied" not in list(happy.assertions or [])
+    assert negative.body.get("email") == ""
+    assert "customer_mutation_rules_applied" in list(negative.assertions or [])

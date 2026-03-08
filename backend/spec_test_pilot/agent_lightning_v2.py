@@ -13,7 +13,9 @@ Key Features:
 
 import asyncio
 import hashlib
+import inspect
 import json
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -211,6 +213,18 @@ class LightningRLAlgorithm:
         self.learning_rate = learning_rate
         self.batch_size = batch_size
         self.state_encoder = "stable_sha256_v2"
+        self.atomic_tmp_max_age_sec = max(
+            60,
+            int(
+                str(
+                    os.getenv(
+                        "QA_ATOMIC_TMP_MAX_AGE_SEC",
+                        "21600",
+                    )
+                ).strip()
+                or "21600"
+            ),
+        )
         self.logger = logging.getLogger(__name__)
         
         # Experience replay buffer
@@ -485,6 +499,7 @@ class LightningRLAlgorithm:
 
         replay_items = payload.get("replay_buffer", [])
         loaded_replay = 0
+        self.replay_buffer.clear()
         if isinstance(replay_items, list):
             for item in replay_items:
                 if not isinstance(item, dict):
@@ -520,6 +535,30 @@ class LightningRLAlgorithm:
             "state_encoder": loaded_encoder,
         }
 
+    def _cleanup_stale_tmp_files(self, target_path: Path) -> int:
+        """Best-effort cleanup for orphaned atomic-write temp files."""
+        cleaned = 0
+        now = time.time()
+        pattern = f".{target_path.name}.tmp.*"
+        try:
+            for candidate in target_path.parent.glob(pattern):
+                if not candidate.is_file():
+                    continue
+                try:
+                    age_sec = now - float(candidate.stat().st_mtime)
+                except Exception:
+                    age_sec = float(self.atomic_tmp_max_age_sec + 1)
+                if age_sec < float(self.atomic_tmp_max_age_sec):
+                    continue
+                try:
+                    candidate.unlink()
+                    cleaned += 1
+                except Exception:
+                    continue
+        except Exception:
+            return int(cleaned)
+        return int(cleaned)
+
     def save_checkpoint(
         self,
         checkpoint_path: Union[str, Path],
@@ -528,15 +567,25 @@ class LightningRLAlgorithm:
     ) -> Dict[str, Any]:
         path = Path(checkpoint_path).expanduser().resolve()
         path.parent.mkdir(parents=True, exist_ok=True)
+        self._cleanup_stale_tmp_files(path)
         payload = self.build_checkpoint_payload(
             include_replay_buffer=include_replay_buffer,
             max_replay_items=max_replay_items,
         )
-        if TORCH_AVAILABLE:
-            torch.save(payload, str(path))
-        else:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(payload, f)
+        tmp_path = path.with_name(f".{path.name}.tmp.{uuid.uuid4().hex}")
+        try:
+            if TORCH_AVAILABLE:
+                torch.save(payload, str(tmp_path))
+            else:
+                with open(tmp_path, "w", encoding="utf-8") as f:
+                    json.dump(payload, f)
+            os.replace(tmp_path, path)
+        finally:
+            if tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except Exception:
+                    pass
         return {
             "status": "saved",
             "path": str(path),
@@ -557,7 +606,33 @@ class LightningRLAlgorithm:
             raise FileNotFoundError(str(path))
 
         if TORCH_AVAILABLE:
-            payload = torch.load(str(path), map_location="cpu")
+            load_kwargs: Dict[str, Any] = {"map_location": "cpu"}
+            supports_weights_only = False
+            try:
+                signature = inspect.signature(torch.load)
+                supports_weights_only = "weights_only" in signature.parameters
+            except Exception:
+                supports_weights_only = False
+            if supports_weights_only:
+                load_kwargs["weights_only"] = True
+            try:
+                payload = torch.load(str(path), **load_kwargs)
+            except Exception as exc:
+                allow_unsafe_fallback = (
+                    str(os.getenv("QA_ALLOW_UNSAFE_CHECKPOINT_LOAD", "0")).strip().lower()
+                    in {"1", "true", "yes", "on"}
+                )
+                if allow_unsafe_fallback and supports_weights_only:
+                    self.logger.warning(
+                        "Safe checkpoint load failed; retrying with unsafe loader "
+                        "because QA_ALLOW_UNSAFE_CHECKPOINT_LOAD=1."
+                    )
+                    payload = torch.load(str(path), map_location="cpu", weights_only=False)
+                else:
+                    raise RuntimeError(
+                        "Checkpoint load failed in safe mode. "
+                        "Set QA_ALLOW_UNSAFE_CHECKPOINT_LOAD=1 only for trusted legacy checkpoints."
+                    ) from exc
         else:
             with open(path, "r", encoding="utf-8") as f:
                 payload = json.load(f)
@@ -583,6 +658,7 @@ class AgentLightningTrainer:
         gam_memory_system = None,
         checkpoint_path: Optional[str] = None,
         checkpoint_autosave: bool = True,
+        checkpoint_max_replay_items: Optional[int] = None,
         gam_writeback: bool = False,
         train_mode: str = "periodic",
     ):
@@ -593,6 +669,16 @@ class AgentLightningTrainer:
         self.gam_memory = gam_memory_system
         self.checkpoint_path = str(checkpoint_path) if checkpoint_path else None
         self.checkpoint_autosave = bool(checkpoint_autosave)
+        if checkpoint_max_replay_items is None:
+            raw_max_replay = str(
+                os.getenv("QA_RL_CHECKPOINT_MAX_REPLAY_ITEMS", "5000")
+            ).strip()
+            try:
+                parsed_max_replay = int(raw_max_replay)
+            except Exception:
+                parsed_max_replay = 5000
+            checkpoint_max_replay_items = max(1, parsed_max_replay)
+        self.checkpoint_max_replay_items = int(checkpoint_max_replay_items)
         # Keep RL observability and training separate from GAM retrieval memory by default.
         # GAM writeback can be enabled explicitly for experiments.
         self.gam_writeback = bool(gam_writeback)
@@ -978,10 +1064,13 @@ class AgentLightningTrainer:
         path = checkpoint_path or self.checkpoint_path
         if not path:
             return {"status": "skipped", "reason": "checkpoint_path_not_set"}
+        effective_max_replay_items = max_replay_items
+        if effective_max_replay_items is None:
+            effective_max_replay_items = int(self.checkpoint_max_replay_items)
         return self.rl_algorithm.save_checkpoint(
             checkpoint_path=path,
             include_replay_buffer=include_replay_buffer,
-            max_replay_items=max_replay_items,
+            max_replay_items=effective_max_replay_items,
         )
 
     def load_checkpoint(
@@ -1008,6 +1097,7 @@ class AgentLightningTrainer:
             "train_mode": self.train_mode,
             "checkpoint_path": self.checkpoint_path,
             "checkpoint_autosave": self.checkpoint_autosave,
+            "checkpoint_max_replay_items": int(self.checkpoint_max_replay_items),
             "rl_model_ready": bool(rl_training_steps >= 3 and rl_buffer_size >= 32),
             "state_encoder": getattr(self.rl_algorithm, "state_encoder", "unknown"),
         }

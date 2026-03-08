@@ -1,0 +1,63 @@
+openapi: "3.0.3"
+info:
+  title: Public Form Webhooks API
+  version: "1.0.0"
+servers:
+  - url: http://127.0.0.1:8000
+paths:
+  /contact/forms:
+    post:
+      security: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+                - name
+                - email
+              properties:
+                name:
+                  type: string
+                email:
+                  type: string
+                  format: email
+                message:
+                  type: string
+                attachment:
+                  type: string
+                  format: binary
+      responses:
+        "201":
+          description: created
+        "400":
+          description: bad request
+  /webhooks/test:
+    post:
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - event
+                - payload
+              properties:
+                event:
+                  type: string
+                payload:
+                  type: object
+      responses:
+        "200":
+          description: ok
+        "400":
+          description: bad request
+  /health:
+    get:
+      security: []
+      responses:
+        "200":
+          description: ok

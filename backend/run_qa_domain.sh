@@ -15,7 +15,7 @@ Options:
   --tenant-id <id>          Tenant id for GAM memory (default: qa_<domain>)
   --output-dir <dir>        Output directory for reports/tests
   --prompt <text>           QA prompt override
-  --max-scenarios <n>       Max scenarios to execute (default: 16)
+  --max-scenarios <n>       Max scenarios to execute (default: 64)
   --max-runtime-sec <n>     Runtime cap in seconds for scenario execution
   --llm-token-cap <n>       Optional token cap for GAM + scenario LLM calls
   --workspace-id <id>       Workspace id for multi-user isolation (default: tenant id)
@@ -23,7 +23,7 @@ Options:
   --pass-threshold <float>  Quality gate threshold (default: 0.70)
   --script-kind <kind>      One generated script kind: python_pytest|javascript_jest|curl_script|java_restassured (default: python_pytest)
   --rl-train-mode <mode>    RL training mode (mandatory): periodic
-  --base-url <url>          Base URL for generated tests (default: http://localhost:8000)
+  --base-url <url>          Base URL for generated tests (default: ${QA_DEFAULT_BASE_URL:-http://localhost:8000})
   --rl-checkpoint <path>    Agent Lightning checkpoint file path (default: /tmp/agent_lightning_<domain>.pt)
   --customer-mode           Customer UX mode: persistent workspace/checkpoint under ~/.spec_test_pilot
   --verify-persistence      In run mode, automatically re-run once and compare RL counters
@@ -62,15 +62,15 @@ ACTION="both"
 TENANT_ID=""
 OUTPUT_DIR=""
 PROMPT="Generate comprehensive QA tests for authentication, validation, error handling, and boundary scenarios."
-MAX_SCENARIOS="16"
+MAX_SCENARIOS="64"
 MAX_RUNTIME_SEC=""
 LLM_TOKEN_CAP=""
 WORKSPACE_ID=""
-ENVIRONMENT_PROFILE="mock"
+ENVIRONMENT_PROFILE="${QA_DEFAULT_ENVIRONMENT_PROFILE:-mock}"
 PASS_THRESHOLD="0.70"
 SCRIPT_KIND="python_pytest"
 RL_TRAIN_MODE="periodic"
-BASE_URL="http://localhost:8000"
+BASE_URL="${QA_DEFAULT_BASE_URL:-http://localhost:8000}"
 RL_CHECKPOINT=""
 CUSTOMER_MODE="0"
 VERIFY_PERSISTENCE="0"
@@ -699,8 +699,8 @@ if [[ "${ACTION}" == "run" || "${ACTION}" == "both" ]]; then
   PYTHON_BIN="$(resolve_python)"
   mkdir -p "${OUTPUT_DIR}"
   export PYTHONUNBUFFERED="1"
-  export GAM_LLM_MODE="on"
-  export GAM_MEMO_LLM_MODE="on"
+  export GAM_LLM_MODE="${GAM_LLM_MODE:-auto}"
+  export GAM_MEMO_LLM_MODE="${GAM_MEMO_LLM_MODE:-${GAM_LLM_MODE}}"
   # Keep scenario LLM reliable by default; callers can still override via env.
   export QA_SCENARIO_LLM_TIMEOUT_SECONDS="${QA_SCENARIO_LLM_TIMEOUT_SECONDS:-45}"
   export QA_SCENARIO_LLM_MAX_RETRIES="${QA_SCENARIO_LLM_MAX_RETRIES:-1}"
@@ -721,7 +721,8 @@ if [[ "${ACTION}" == "run" || "${ACTION}" == "both" ]]; then
   echo "  script_kind:   ${SCRIPT_KIND}"
   echo "  rl_train_mode: ${RL_TRAIN_MODE}"
   echo "  rl_checkpoint: ${RL_CHECKPOINT}"
-  echo "  gam_llm_mode:  ${GAM_LLM_MODE} (enforced)"
+  echo "  gam_llm_mode:  ${GAM_LLM_MODE}"
+  echo "  gam_memo_mode: ${GAM_MEMO_LLM_MODE}"
   echo "  llm_timeout:   ${QA_SCENARIO_LLM_TIMEOUT_SECONDS}s"
   echo "  llm_retries:   ${QA_SCENARIO_LLM_MAX_RETRIES}"
   echo "  ci_gate:       ${CI_GATE}"

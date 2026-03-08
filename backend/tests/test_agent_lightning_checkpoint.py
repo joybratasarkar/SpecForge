@@ -152,3 +152,43 @@ def test_trainer_uses_decision_signals_for_dense_rewards() -> None:
     rewards = [t.reward for t in trainer.rl_algorithm.replay_buffer]
     assert any(abs(r - 1.0) < 1e-6 for r in rewards)
     assert any(abs(r + 0.75) < 1e-6 for r in rewards)
+
+
+def test_load_checkpoint_replaces_existing_replay_buffer(tmp_path: Path) -> None:
+    ckpt = tmp_path / "replace_replay.pt"
+    algo = LightningRLAlgorithm(state_dim=32, hidden_dim=16, batch_size=4, buffer_size=50)
+    algo.add_transition(_make_transition(0))
+    save_result = algo.save_checkpoint(str(ckpt))
+    assert save_result["status"] == "saved"
+
+    # Local runtime may have accumulated newer in-memory transitions.
+    algo.add_transition(_make_transition(1))
+    assert len(algo.replay_buffer) == 2
+
+    load_result = algo.load_checkpoint(str(ckpt), allow_missing=False)
+    assert load_result["status"] == "loaded"
+    # Loading from checkpoint should replace replay state, not append to it.
+    assert len(algo.replay_buffer) == 1
+
+
+def test_trainer_checkpoint_respects_max_replay_items_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("QA_RL_CHECKPOINT_MAX_REPLAY_ITEMS", "2")
+    ckpt = tmp_path / "trainer_replay_cap.pt"
+    trainer = AgentLightningTrainer(
+        rl_algorithm=LightningRLAlgorithm(state_dim=24, hidden_dim=12, batch_size=4, buffer_size=50),
+        checkpoint_path=str(ckpt),
+        checkpoint_autosave=False,
+    )
+
+    for i in range(5):
+        trainer.rl_algorithm.add_transition(_make_transition(i))
+
+    save_result = trainer.save_checkpoint()
+    assert save_result["status"] == "saved"
+
+    restored = LightningRLAlgorithm(state_dim=24, hidden_dim=12, batch_size=4, buffer_size=50)
+    load_result = restored.load_checkpoint(str(ckpt), allow_missing=False)
+    assert load_result["status"] == "loaded"
+    assert len(restored.replay_buffer) == 2

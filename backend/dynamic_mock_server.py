@@ -19,6 +19,8 @@ Works with ANY valid OpenAPI 3.0+ specification!
 import json
 import yaml
 import argparse
+import asyncio
+import os
 import time
 import uvicorn
 from pathlib import Path
@@ -26,20 +28,27 @@ from typing import Dict, List, Any, Optional, Union, get_args
 from datetime import datetime
 import logging
 import re
+from urllib.parse import urlparse
 
 # FastAPI
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, create_model
+
+from spec_test_pilot.runtime_settings import get_runtime_settings
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("DynamicMockServer")
+RUNTIME_SETTINGS = get_runtime_settings()
 
 SQLI_PATTERN = re.compile(
     r"('(?:\s*;)?\s*--|\bunion\b\s+\bselect\b|\bdrop\b\s+\btable\b|\bor\b\s+1\s*=\s*1)",
     re.IGNORECASE,
+)
+EMAIL_PATTERN = re.compile(
+    r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$"
 )
 
 
@@ -152,8 +161,14 @@ class DynamicResponseGenerator:
 class DynamicMockServer:
     """Completely dynamic mock server that works with ANY OpenAPI spec."""
     
-    def __init__(self, spec_file: str, host: str = "localhost", port: int = 8000):
+    def __init__(
+        self,
+        spec_file: str,
+        host: str = str(RUNTIME_SETTINGS.dynamic_mock_host),
+        port: int = int(RUNTIME_SETTINGS.dynamic_mock_port),
+    ):
         """Initialize dynamic mock server."""
+        self.runtime_settings = get_runtime_settings()
         self.host = host
         self.port = port
         self.spec_file = spec_file
@@ -175,16 +190,34 @@ class DynamicMockServer:
         )
         
         # Add CORS
+        raw_allowed_origins = str(
+            os.getenv(
+                "QA_MOCK_ALLOWED_ORIGINS",
+                "http://localhost:3000,http://127.0.0.1:3000",
+            )
+        ).strip()
+        allowed_origins = [
+            item.strip()
+            for item in raw_allowed_origins.split(",")
+            if item.strip()
+        ] or ["http://localhost:3000", "http://127.0.0.1:3000"]
+        allow_credentials = str(
+            os.getenv("QA_MOCK_CORS_ALLOW_CREDENTIALS", "0")
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        if "*" in allowed_origins and allow_credentials:
+            allow_credentials = False
         self.app.add_middleware(
             CORSMiddleware,
-            allow_origins=["*"],
-            allow_credentials=True,
+            allow_origins=allowed_origins,
+            allow_credentials=allow_credentials,
             allow_methods=["*"],
             allow_headers=["*"],
         )
         
         # Request logging
         self.request_log = []
+        self._chaos_once_seen: set[str] = set()
+        self._chaos_concurrency_seen: set[str] = set()
         
         # Setup middleware and routes
         self._setup_middleware()
@@ -344,13 +377,13 @@ class DynamicMockServer:
         if method == "GET":
             self.app.add_api_route(path, dynamic_handler, methods=["GET"])
         elif method == "POST":
-            self.app.add_api_route(path, dynamic_handler, methods=["POST"], status_code=201)
+            self.app.add_api_route(path, dynamic_handler, methods=["POST"])
         elif method == "PUT":
             self.app.add_api_route(path, dynamic_handler, methods=["PUT"])
         elif method == "PATCH":
             self.app.add_api_route(path, dynamic_handler, methods=["PATCH"])
         elif method == "DELETE":
-            self.app.add_api_route(path, dynamic_handler, methods=["DELETE"], status_code=204)
+            self.app.add_api_route(path, dynamic_handler, methods=["DELETE"])
         
         logger.info(f"   📌 {method} {path} ({operation_id})")
     
@@ -366,6 +399,12 @@ class DynamicMockServer:
         try:
             # Check authentication if required
             await self._check_auth_if_required(request, operation)
+            await self._apply_chaos_injection(
+                request=request,
+                path=path,
+                method=method,
+                operation=operation,
+            )
             
             # Validate path parameters
             path_params = self._extract_path_params(request.url.path, path)
@@ -397,6 +436,51 @@ class DynamicMockServer:
         except Exception as e:
             logger.error(f"❌ Error in {method} {path}: {e}")
             raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+    def _chaos_key(self, request: Request, path: str, method: str) -> str:
+        explicit_key = str(request.headers.get("x-qa-chaos-key", "")).strip()
+        if explicit_key:
+            return explicit_key
+        query_text = str(request.url.query or "")
+        return f"{method}:{path}:{query_text}"
+
+    async def _apply_chaos_injection(
+        self,
+        *,
+        request: Request,
+        path: str,
+        method: str,
+        operation: Dict,
+    ) -> None:
+        chaos_mode = str(request.headers.get("x-qa-chaos", "")).strip().lower()
+        if not chaos_mode:
+            return
+
+        key = self._chaos_key(request, path, method)
+        once_key = f"{chaos_mode}:{key}"
+
+        if chaos_mode == str(self.runtime_settings.chaos_once_503_mode):
+            if once_key not in self._chaos_once_seen:
+                self._chaos_once_seen.add(once_key)
+                raise HTTPException(status_code=503, detail="Chaos injection: temporary upstream failure")
+            return
+
+        if chaos_mode == str(self.runtime_settings.chaos_once_timeout_mode):
+            if once_key not in self._chaos_once_seen:
+                self._chaos_once_seen.add(once_key)
+                # Long enough to trigger client timeout probes.
+                await asyncio.sleep(1.25)
+            return
+
+        if chaos_mode == str(self.runtime_settings.chaos_concurrency_mode):
+            # First request wins, subsequent request with same key conflicts.
+            if once_key in self._chaos_concurrency_seen:
+                raise HTTPException(status_code=409, detail="Concurrency conflict detected")
+            self._chaos_concurrency_seen.add(once_key)
+            return
+
+        # Unknown chaos mode: ignore instead of failing user traffic.
+        return
 
     def _collect_operation_parameters(
         self,
@@ -534,9 +618,11 @@ class DynamicMockServer:
             for p in query_specs
             if str((p or {}).get("name", ""))
         }
+        security_query_params = self._allowed_security_query_params(operation)
+        allowed_query_names = set(query_spec_map.keys()) | set(security_query_params)
         incoming = dict(request.query_params)
 
-        if incoming and not query_spec_map:
+        if incoming and not allowed_query_names:
             unknown = ", ".join(sorted(incoming.keys())[:5])
             raise HTTPException(
                 status_code=400,
@@ -544,7 +630,7 @@ class DynamicMockServer:
             )
 
         for name in incoming.keys():
-            if name not in query_spec_map:
+            if name not in allowed_query_names:
                 raise HTTPException(
                     status_code=400,
                     detail=f"Unexpected query parameter: {name}",
@@ -558,6 +644,29 @@ class DynamicMockServer:
                 )
             if name in incoming:
                 self._validate_query_param_value(name, incoming[name], param)
+
+    def _allowed_security_query_params(self, operation: Dict[str, Any]) -> set[str]:
+        security = operation.get("security", self.security)
+        if not security:
+            return set()
+        requirements = security if isinstance(security, list) else [security]
+        schemes = self._security_schemes()
+        names: set[str] = set()
+        for requirement in requirements:
+            if not isinstance(requirement, dict):
+                continue
+            for scheme_name in requirement.keys():
+                payload = schemes.get(str(scheme_name), {})
+                if not isinstance(payload, dict):
+                    continue
+                if str(payload.get("type", "")).strip().lower() != "apikey":
+                    continue
+                if str(payload.get("in", "")).strip().lower() != "query":
+                    continue
+                name = str(payload.get("name", "")).strip()
+                if name:
+                    names.add(name)
+        return names
 
     def _validate_query_param_value(self, name: str, raw_value: str, param: Dict) -> None:
         schema = self._resolve_refs(param.get("schema", {}))
@@ -680,27 +789,87 @@ class DynamicMockServer:
                 status_code=400,
                 detail=f"Query parameter '{name}' must be < {maximum}",
             )
-    
+
+    def _security_schemes(self) -> Dict[str, Any]:
+        components = self.components if isinstance(self.components, dict) else {}
+        schemes = components.get("securitySchemes", {})
+        return schemes if isinstance(schemes, dict) else {}
+
+    def _credential_looks_invalid(self, value: str) -> bool:
+        token = str(value or "").strip().lower()
+        if not token:
+            return True
+        invalid_markers = {
+            str(self.runtime_settings.auth_token_invalid).strip().lower(),
+            str(self.runtime_settings.auth_token_expired).strip().lower(),
+            str(os.getenv("QA_AUTH_API_KEY_INVALID_VALUE", "invalid_api_key")).strip().lower(),
+            "invalid",
+            "expired",
+        }
+        return any(marker and marker in token for marker in invalid_markers)
+
+    def _request_satisfies_security_scheme(
+        self, request: Request, scheme_name: str, scheme: Dict[str, Any]
+    ) -> bool:
+        payload = scheme if isinstance(scheme, dict) else {}
+        scheme_type = str(payload.get("type", "")).strip().lower()
+
+        if scheme_type == "http" and str(payload.get("scheme", "")).strip().lower() == "bearer":
+            auth_header = str(request.headers.get("authorization", "")).strip()
+            if not auth_header.lower().startswith("bearer "):
+                return False
+            token = auth_header.split(" ", 1)[1] if " " in auth_header else ""
+            return not self._credential_looks_invalid(token)
+
+        if scheme_type == "apikey":
+            key_name = str(payload.get("name", "")).strip() or "X-API-Key"
+            key_in = str(payload.get("in", "header")).strip().lower() or "header"
+            credential = ""
+            if key_in == "query":
+                credential = str(request.query_params.get(key_name, "")).strip()
+            elif key_in == "cookie":
+                credential = str(request.cookies.get(key_name, "")).strip()
+            else:
+                credential = str(request.headers.get(key_name, "")).strip()
+            return not self._credential_looks_invalid(credential)
+
+        # Fallback: accept bearer-style credential for unknown schemes.
+        auth_header = str(request.headers.get("authorization", "")).strip()
+        if auth_header.lower().startswith("bearer "):
+            token = auth_header.split(" ", 1)[1] if " " in auth_header else ""
+            return not self._credential_looks_invalid(token)
+        fallback = str(request.headers.get(str(scheme_name), "")).strip()
+        return not self._credential_looks_invalid(fallback)
+
     async def _check_auth_if_required(self, request: Request, operation: Dict):
         """Check authentication if required by operation."""
-        # Check if this operation requires auth
         security = operation.get("security", self.security)
-        
+        if security is None:
+            return
         if not security:
-            return  # No auth required
-        
-        auth_header = request.headers.get("authorization", "")
-        
-        if not auth_header:
-            raise HTTPException(status_code=401, detail="Authorization header required")
-        
-        if not auth_header.lower().startswith("bearer "):
-            raise HTTPException(status_code=401, detail="Invalid authorization format. Expected: Bearer <token>")
-        
-        token = auth_header.split(" ", 1)[1] if " " in auth_header else ""
-        
-        if token in ["invalid", "expired", ""]:
-            raise HTTPException(status_code=401, detail="Invalid or expired token")
+            return
+
+        requirements = security if isinstance(security, list) else [security]
+        schemes = self._security_schemes()
+        for requirement in requirements:
+            if requirement in ({}, None):
+                return
+            if not isinstance(requirement, dict) or not requirement:
+                continue
+            requirement_ok = True
+            for scheme_name in requirement.keys():
+                scheme_payload = schemes.get(str(scheme_name), {})
+                if not self._request_satisfies_security_scheme(
+                    request=request,
+                    scheme_name=str(scheme_name),
+                    scheme=scheme_payload if isinstance(scheme_payload, dict) else {},
+                ):
+                    requirement_ok = False
+                    break
+            if requirement_ok:
+                return
+
+        raise HTTPException(status_code=401, detail="Missing or invalid authentication credentials")
     
     def _extract_path_params(self, request_path: str, spec_path: str) -> Dict[str, str]:
         """Extract path parameters from request URL."""
@@ -723,6 +892,26 @@ class DynamicMockServer:
     
     async def _handle_special_cases(self, request: Request, path: str, method: str, path_params: Dict):
         """Handle special test cases for specific parameter values."""
+        auth_header = str(request.headers.get("authorization", "")).strip()
+        tenant_header = str(request.headers.get("x-tenant-id", "")).strip().lower()
+
+        if auth_header.lower().startswith("bearer ") and tenant_header in {
+            "unauthorized_tenant",
+            "other_tenant",
+            "cross_tenant",
+            "tenant_b",
+        }:
+            raise HTTPException(status_code=403, detail="Cross-tenant access is forbidden")
+
+        # BOLA-style probe: valid token with a cross-tenant/forbidden resource id.
+        for param_name, param_value in path_params.items():
+            value_text = str(param_value).strip().lower()
+            if any(marker in value_text for marker in ("other_tenant", "cross_tenant", "forbidden")):
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"Access denied for resource identifier: {param_name}",
+                )
+
         # Simulate 404 for specific test values
         for param_name, param_value in path_params.items():
             value = str(param_value).strip()
@@ -830,11 +1019,49 @@ class DynamicMockServer:
         if schema_type == "string":
             if not isinstance(value, str):
                 raise HTTPException(status_code=400, detail=f"Field '{field_name}' must be a string")
+            normalized_value = value.strip()
+            field_format = str(schema.get("format", "") or "").strip().lower()
+            field_name_lower = str(field_name or "").strip().lower()
+            # Many customer specs omit `format: email`; fallback to field-name intent.
+            if field_format == "email" or "email" in field_name_lower:
+                if EMAIL_PATTERN.fullmatch(normalized_value) is None:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Field '{field_name}' must be a valid email address",
+                    )
             if SQLI_PATTERN.search(value):
                 raise HTTPException(
                     status_code=400,
                     detail=f"Potentially unsafe input detected for field '{field_name}'",
                 )
+            url_text = value.strip().lower()
+            ssrf_host = (
+                urlparse(str(self.runtime_settings.ssrf_probe_url)).hostname or ""
+            ).strip().lower()
+            if url_text.startswith(("http://", "https://", "file://", "gopher://")):
+                ssrf_markers = [
+                    marker
+                    for marker in (
+                        ssrf_host,
+                        "169.254.169.254",
+                        "metadata.google.internal",
+                        "127.0.0.1",
+                        "localhost",
+                        "0.0.0.0",
+                        "::1",
+                        "kubernetes.default",
+                        ".internal",
+                    )
+                    if str(marker).strip()
+                ]
+                if any(
+                    marker in url_text
+                    for marker in ssrf_markers
+                ):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Potential SSRF payload rejected for field '{field_name}'",
+                    )
             min_length = schema.get("minLength")
             max_length = schema.get("maxLength")
             if isinstance(min_length, int) and len(value) < min_length:
@@ -962,14 +1189,10 @@ class DynamicMockServer:
     ) -> Any:
         """Generate response dynamically based on operation definition."""
         responses = self._resolve_refs(operation.get("responses", {}))
-        
-        # Determine success status code
-        if method == "POST":
-            success_code = "201"
-        elif method == "DELETE":
-            success_code = "204"  
-        else:
-            success_code = "200"
+
+        # Determine success status code from documented operation responses.
+        success_code = self._pick_success_status_code(method=method, responses=responses)
+        success_status = int(success_code)
         
         # Get success response schema
         success_response = self._resolve_refs(
@@ -1008,13 +1231,41 @@ class DynamicMockServer:
                             response_data[id_field] = existing_value
                     else:
                         response_data[id_field] = param_value
-        
-        # Handle DELETE (204 No Content)
-        if method == "DELETE":
-            return {"message": f"Resource deleted successfully"}
-        
-        return response_data
-    
+
+        if success_status in {204, 205, 304}:
+            return Response(status_code=success_status)
+        return JSONResponse(status_code=success_status, content=response_data)
+
+    def _pick_success_status_code(self, *, method: str, responses: Dict[str, Any]) -> str:
+        documented_success: List[int] = []
+        if isinstance(responses, dict):
+            for raw_code in responses.keys():
+                code_text = str(raw_code).strip()
+                if not code_text.isdigit():
+                    continue
+                code_int = int(code_text)
+                if 200 <= code_int < 300:
+                    documented_success.append(code_int)
+        if documented_success:
+            ordered_unique = sorted(set(documented_success))
+            preferred_map = {
+                "POST": [201, 200, 202, 204],
+                "DELETE": [204, 200, 202],
+                "PUT": [200, 201, 202, 204],
+                "PATCH": [200, 204, 202],
+                "GET": [200, 206, 204],
+            }
+            preferred = preferred_map.get(str(method).upper(), [200, 201, 202, 204])
+            for code in preferred:
+                if code in ordered_unique:
+                    return str(code)
+            return str(ordered_unique[0])
+        if str(method).upper() == "POST":
+            return "201"
+        if str(method).upper() == "DELETE":
+            return "204"
+        return "200"
+
     def _generate_fallback_response(self, method: str, path: str, path_params: Dict, body: Optional[Dict]) -> Dict:
         """Generate fallback response when no schema is available."""
         base_response = {
@@ -1071,6 +1322,13 @@ class DynamicMockServer:
         
         print(f"\n🧪 Authentication: Bearer tokens (any token except 'invalid')")
         print(f"🔧 Special test values: '999'/'nonexistent' → 404, 'duplicate' → 409")
+        print(
+            "🔧 Chaos headers: X-QA-Chaos="
+            + f"{self.runtime_settings.chaos_once_503_mode}|"
+            + f"{self.runtime_settings.chaos_once_timeout_mode}|"
+            + f"{self.runtime_settings.chaos_concurrency_mode}"
+        )
+        print(f"🔧 Security probes: X-Tenant-Id=unauthorized_tenant → 403, SSRF-style URL fields → 400")
         print(f"{'='*70}\n")
         
         try:
@@ -1104,10 +1362,10 @@ Examples:
     
     parser.add_argument("--spec", "-s", required=True,
                        help="OpenAPI specification file (YAML or JSON)")
-    parser.add_argument("--host", default="localhost",
-                       help="Server host (default: localhost)")
-    parser.add_argument("--port", "-p", type=int, default=8000,
-                       help="Server port (default: 8000)")
+    parser.add_argument("--host", default=str(RUNTIME_SETTINGS.dynamic_mock_host),
+                       help=f"Server host (default: {RUNTIME_SETTINGS.dynamic_mock_host})")
+    parser.add_argument("--port", "-p", type=int, default=int(RUNTIME_SETTINGS.dynamic_mock_port),
+                       help=f"Server port (default: {RUNTIME_SETTINGS.dynamic_mock_port})")
     parser.add_argument("--debug", action="store_true",
                        help="Enable debug mode")
     

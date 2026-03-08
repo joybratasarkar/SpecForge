@@ -13,6 +13,7 @@ End-to-end flow:
 from __future__ import annotations
 
 import argparse
+import ast
 import asyncio
 import hashlib
 import importlib.util
@@ -23,10 +24,12 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import time
 import uuid
 from copy import deepcopy
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -35,6 +38,13 @@ from urllib.parse import parse_qsl, urlencode, urlparse
 
 import yaml
 from fastapi.testclient import TestClient
+
+# Support direct script execution (`python .../qa_specialist_agent.py`) by
+# ensuring the backend package root is importable.
+if __package__ in {None, ""}:
+    _backend_root = Path(__file__).resolve().parent.parent
+    if str(_backend_root) not in sys.path:
+        sys.path.insert(0, str(_backend_root))
 
 from spec_test_pilot.adaptive_policy import (
     AdaptiveScenarioPolicy,
@@ -48,6 +58,13 @@ from spec_test_pilot.multi_language_tester import (
     TestType,
     TestScenario,
 )
+from spec_test_pilot.runtime_settings import (
+    env_bool,
+    env_float,
+    env_int,
+    get_learning_policy,
+    get_runtime_settings,
+)
 
 
 PATH_PARAM_PATTERN = re.compile(r"\{([^}]+)\}")
@@ -55,47 +72,174 @@ MISSING_PATH_PARAM_SENTINEL = "__qa_missing_path_param__"
 NEGATIVE_STATUS_CODES = {400, 401, 403, 404, 405, 409, 422}
 AUTH_NEGATIVE_STATUS_CODES = {401, 403}
 HTTP_METHODS = {"get", "post", "put", "patch", "delete"}
-UNCERTAINTY_COVERAGE_QUANTILE = 0.75
-REPAIR_RULE_MIN_ATTEMPTS = 3
-REPAIR_RULE_MIN_FAILURE_RATE = 0.85
-REPAIR_RULE_DOMINANT_RATIO = 0.70
-REPAIR_RULE_MAX_ITEMS = 500
-DEFAULT_DECISION_WEIGHT = 1.0
-MIN_DECISION_WEIGHT = 0.2
-MAX_DECISION_WEIGHT = 5.0
-DECISION_LEARNING_RATE = 0.20
-LEARNING_HISTORY_LIMIT = 200
-SCENARIO_STATS_LIMIT = 4000
-SELECTION_TRACE_LIMIT = 60
-GAM_CONTEXT_MIN_QUALITY = 0.55
-RL_MUTATION_TARGET_LIMIT = 20
-RL_MUTATION_PER_TARGET_LIMIT = 2
-RL_MUTATION_MAX_VARIANTS_PER_TARGET = 5
-RL_MUTATION_MAX_NEW_SCENARIOS = 48
-RL_MUTATION_MIN_PRIORITY = 0.08
-RL_HISTORY_SEED_TARGET_LIMIT = 20
-RL_HISTORY_SEED_MAX_NEW_SCENARIOS = 24
-RL_HISTORY_SEED_MIN_ATTEMPTS = 1
-RL_HISTORY_SEED_MIN_PRIORITY = 0.12
-RL_WEAK_MIN_ATTEMPTS = 3
-RL_WEAK_FAILURE_RATE_THRESHOLD = 0.20
-PORTFOLIO_STABLE_RATIO = 0.70
-PORTFOLIO_FOCUS_RATIO = 0.20
-PORTFOLIO_EXPLORE_RATIO = 0.10
-FORCED_REPLAY_CADENCE_RUNS = 2
-GAM_RECENT_FOCUS_WINDOW = 3
-GAM_RECENT_FOCUS_LIMIT = 40
-FLAKY_RERUN_MAX_ATTEMPTS = 3
-RUNTIME_REPAIR_SUGGESTION_LIMIT = 50
+_RUNTIME_SETTINGS = get_runtime_settings()
+_LEARNING_POLICY = get_learning_policy()
+
+UNCERTAINTY_COVERAGE_QUANTILE = float(
+    _LEARNING_POLICY.get("uncertainty_coverage_quantile", 0.75)
+)
+REPAIR_RULE_MIN_ATTEMPTS = max(1, int(_LEARNING_POLICY.get("repair_rule_min_attempts", 3)))
+REPAIR_RULE_MIN_FAILURE_RATE = float(_LEARNING_POLICY.get("repair_rule_min_failure_rate", 0.85))
+REPAIR_RULE_DOMINANT_RATIO = float(_LEARNING_POLICY.get("repair_rule_dominant_ratio", 0.70))
+REPAIR_RULE_MAX_ITEMS = max(1, int(_LEARNING_POLICY.get("repair_rule_max_items", 500)))
+DEFAULT_DECISION_WEIGHT = float(_LEARNING_POLICY.get("default_decision_weight", 1.0))
+MIN_DECISION_WEIGHT = float(_LEARNING_POLICY.get("min_decision_weight", 0.2))
+MAX_DECISION_WEIGHT = float(_LEARNING_POLICY.get("max_decision_weight", 5.0))
+DECISION_LEARNING_RATE = float(_LEARNING_POLICY.get("decision_learning_rate", 0.20))
+LEARNING_HISTORY_LIMIT = max(1, int(_LEARNING_POLICY.get("learning_history_limit", 200)))
+SCENARIO_STATS_LIMIT = max(100, int(_LEARNING_POLICY.get("scenario_stats_limit", 4000)))
+SELECTION_TRACE_LIMIT = max(10, int(_LEARNING_POLICY.get("selection_trace_limit", 60)))
+GAM_CONTEXT_MIN_QUALITY = float(_LEARNING_POLICY.get("gam_context_min_quality", 0.55))
+RL_MUTATION_TARGET_LIMIT = max(1, int(_LEARNING_POLICY.get("rl_mutation_target_limit", 20)))
+RL_MUTATION_PER_TARGET_LIMIT = max(1, int(_LEARNING_POLICY.get("rl_mutation_per_target_limit", 2)))
+RL_MUTATION_MAX_VARIANTS_PER_TARGET = max(
+    1, int(_LEARNING_POLICY.get("rl_mutation_max_variants_per_target", 5))
+)
+RL_MUTATION_MAX_NEW_SCENARIOS = max(1, int(_LEARNING_POLICY.get("rl_mutation_max_new_scenarios", 48)))
+RL_MUTATION_MIN_PRIORITY = float(_LEARNING_POLICY.get("rl_mutation_min_priority", 0.08))
+RL_HISTORY_SEED_TARGET_LIMIT = max(1, int(_LEARNING_POLICY.get("rl_history_seed_target_limit", 20)))
+RL_HISTORY_SEED_MAX_NEW_SCENARIOS = max(
+    1, int(_LEARNING_POLICY.get("rl_history_seed_max_new_scenarios", 24))
+)
+RL_HISTORY_SEED_MIN_ATTEMPTS = max(1, int(_LEARNING_POLICY.get("rl_history_seed_min_attempts", 1)))
+RL_HISTORY_SEED_MIN_PRIORITY = float(_LEARNING_POLICY.get("rl_history_seed_min_priority", 0.12))
+RL_WEAK_MIN_ATTEMPTS = max(1, int(_LEARNING_POLICY.get("rl_weak_min_attempts", 3)))
+RL_WEAK_FAILURE_RATE_THRESHOLD = float(
+    _LEARNING_POLICY.get("rl_weak_failure_rate_threshold", 0.20)
+)
+AUTO_SCENARIO_EXPAND_ENABLED = env_bool("QA_AUTO_SCENARIO_EXPAND", True)
+AUTO_SCENARIO_PER_OPERATION = max(
+    4,
+    env_int("QA_MIN_SCENARIOS_PER_OPERATION", default=10, minimum=1),
+)
+AUTO_SCENARIO_GLOBAL_CAP = max(
+    20,
+    env_int("QA_AUTO_SCENARIO_CAP", default=240, minimum=1),
+)
+PORTFOLIO_STABLE_RATIO = float(_LEARNING_POLICY.get("portfolio_stable_ratio", 0.70))
+PORTFOLIO_FOCUS_RATIO = float(_LEARNING_POLICY.get("portfolio_focus_ratio", 0.20))
+PORTFOLIO_EXPLORE_RATIO = float(_LEARNING_POLICY.get("portfolio_explore_ratio", 0.10))
+FORCED_REPLAY_CADENCE_RUNS = max(1, int(_LEARNING_POLICY.get("forced_replay_cadence_runs", 2)))
+GAM_RECENT_FOCUS_WINDOW = max(1, int(_LEARNING_POLICY.get("gam_recent_focus_window", 3)))
+GAM_RECENT_FOCUS_LIMIT = max(1, int(_LEARNING_POLICY.get("gam_recent_focus_limit", 40)))
+FLAKY_RERUN_MAX_ATTEMPTS = max(1, int(_LEARNING_POLICY.get("flaky_rerun_max_attempts", 3)))
+RUNTIME_REPAIR_SUGGESTION_LIMIT = max(
+    1, int(_LEARNING_POLICY.get("runtime_repair_suggestion_limit", 50))
+)
+ATOMIC_TMP_MAX_AGE_SEC = max(
+    60,
+    env_int("QA_ATOMIC_TMP_MAX_AGE_SEC", default=21600, minimum=60),
+)
+REAL_LIFE_MANDATORY_STRATEGIES = tuple(
+    str(item).strip()
+    for item in list(_LEARNING_POLICY.get("real_life_mandatory_strategies", []) or [])
+    if str(item).strip()
+)
 SUPPORTED_SCRIPT_KINDS = {
     "python_pytest",
     "javascript_jest",
     "curl_script",
     "java_restassured",
 }
+SUPPORTED_REPORT_MODES = {"full", "executive", "summary", "technical"}
 DEFAULT_SCRIPT_KIND = "python_pytest"
-DEFAULT_ENVIRONMENT_PROFILE = "mock"
-SUPPORTED_ENVIRONMENT_PROFILES = {"mock", "staging", "prod_safe"}
+DEFAULT_ENVIRONMENT_PROFILE = str(
+    _RUNTIME_SETTINGS.default_environment_profile or "mock"
+).lower()
+SUPPORTED_ENVIRONMENT_PROFILES = {
+    str(item).strip().lower()
+    for item in _RUNTIME_SETTINGS.supported_environment_profiles
+    if str(item).strip()
+}
+if DEFAULT_ENVIRONMENT_PROFILE not in SUPPORTED_ENVIRONMENT_PROFILES:
+    DEFAULT_ENVIRONMENT_PROFILE = "mock"
+DEFAULT_BASE_URL = str(_RUNTIME_SETTINGS.default_base_url)
+DEFAULT_LIVE_REQUEST_TIMEOUT_SEC = float(_RUNTIME_SETTINGS.live_request_timeout_sec)
+SECURITY_FOCUSED_TEST_TYPES = {"security", "authentication", "authorization"}
+SECURITY_SIGNAL_CATEGORIES = {"authorization_bypass", "security_regression", "data_leakage"}
+GENERATED_PYTHON_ALLOWED_IMPORTS = {"json", "pytest", "requests"}
+GENERATED_PYTHON_BLOCKED_CALLS = {
+    "eval",
+    "exec",
+    "compile",
+    "open",
+    "input",
+    "__import__",
+}
+GENERATED_PYTHON_BLOCKED_ATTRIBUTE_CALLS = {
+    ("os", "system"),
+    ("os", "popen"),
+    ("subprocess", "Popen"),
+    ("subprocess", "call"),
+    ("subprocess", "run"),
+}
+ALLOWED_CURL_FLAGS_WITH_VALUE = {
+    "-X",
+    "--request",
+    "-H",
+    "--header",
+    "-d",
+    "--data",
+    "--data-raw",
+    "--data-binary",
+    "--connect-timeout",
+    "--max-time",
+    "-m",
+    "--retry",
+    "--retry-delay",
+    "--retry-max-time",
+    "--url",
+}
+ALLOWED_CURL_FLAGS_NO_VALUE = {
+    "-s",
+    "--silent",
+    "-S",
+    "--show-error",
+    "-L",
+    "--location",
+    "--compressed",
+}
+BLOCKED_CURL_FLAGS = {
+    "-K",
+    "--config",
+    "--proxy",
+    "-x",
+    "--socks4",
+    "--socks5",
+    "--socks5-hostname",
+    "--interface",
+    "--resolve",
+    "--connect-to",
+    "--unix-socket",
+    "-o",
+    "--output",
+    "-O",
+    "--remote-name",
+    "-T",
+    "--upload-file",
+    "-F",
+    "--form",
+    "--next",
+}
+CUSTOMER_MUTATION_ALLOWED_ACTIONS = {
+    "delete",
+    "set_empty",
+    "invalid_type",
+    "override_value",
+}
+CUSTOMER_MUTATION_ALLOWED_REQUEST_MODES = {"auto", "body", "query", "header"}
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    return env_bool(name, default)
+
+
+def _env_int(name: str, default: int, minimum: int = 0) -> int:
+    return env_int(name, default, minimum=minimum)
+
+
+def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
+    return env_float(name, default, minimum=minimum)
 
 
 def _bootstrap_runtime_env() -> None:
@@ -190,8 +334,23 @@ class _ScriptResponseProxy:
 class _TestClientRequestsAdapter:
     """Adapter exposing requests-style APIs over FastAPI TestClient."""
 
-    def __init__(self, client: TestClient):
+    def __init__(self, client: TestClient, default_timeout: Optional[float] = None):
         self.client = client
+        self.default_timeout = (
+            float(default_timeout) if default_timeout is not None else None
+        )
+        # Execute TestClient requests in worker threads so timeout behavior
+        # can be enforced without waiting for full response completion.
+        self._executor = ThreadPoolExecutor(max_workers=4)
+
+    def close(self) -> None:
+        try:
+            self._executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+
+    def __del__(self) -> None:  # pragma: no cover - best-effort cleanup
+        self.close()
 
     def request(
         self,
@@ -200,6 +359,7 @@ class _TestClientRequestsAdapter:
         headers: Optional[Dict[str, str]] = None,
         params: Optional[Dict[str, Any]] = None,
         json: Optional[Dict[str, Any]] = None,
+        timeout: Optional[float] = None,
         **_: Any,
     ) -> _ScriptResponseProxy:
         parsed = urlparse(str(url))
@@ -211,13 +371,32 @@ class _TestClientRequestsAdapter:
         if isinstance(params, dict):
             merged_params.update(params)
 
-        response = self.client.request(
-            method=str(method).upper(),
-            url=path,
-            headers=headers or {},
-            params=merged_params or None,
-            json=json,
+        def _dispatch() -> Any:
+            return self.client.request(
+                method=str(method).upper(),
+                url=path,
+                headers=headers or {},
+                params=merged_params or None,
+                json=json,
+            )
+
+        effective_timeout = (
+            float(timeout)
+            if timeout is not None
+            else (float(self.default_timeout) if self.default_timeout is not None else None)
         )
+
+        if effective_timeout is None:
+            response = _dispatch()
+        else:
+            future = self._executor.submit(_dispatch)
+            try:
+                response = future.result(timeout=float(effective_timeout))
+            except FuturesTimeoutError as exc:
+                future.cancel()
+                raise TimeoutError(
+                    f"request timeout exceeded: timeout={float(effective_timeout):.3f}s"
+                ) from exc
         return _ScriptResponseProxy(response)
 
     def get(self, url: str, **kwargs: Any) -> _ScriptResponseProxy:
@@ -239,7 +418,7 @@ class _TestClientRequestsAdapter:
 class _LiveRequestsAdapter:
     """Adapter exposing requests-style APIs against a real base URL."""
 
-    def __init__(self, base_url: str, timeout_sec: float = 12.0):
+    def __init__(self, base_url: str, timeout_sec: float = DEFAULT_LIVE_REQUEST_TIMEOUT_SEC):
         self.base_url = str(base_url or "").rstrip("/")
         self.timeout_sec = max(1.0, float(timeout_sec))
         self._session = None
@@ -314,7 +493,7 @@ class QASpecialistAgent:
         nlp_prompt: Optional[str] = None,
         tenant_id: str = "default_tenant",
         workspace_id: Optional[str] = None,
-        base_url: str = "http://localhost:8000",
+        base_url: str = DEFAULT_BASE_URL,
         output_dir: Optional[str] = None,
         max_scenarios: int = 200,
         max_runtime_sec: Optional[int] = None,
@@ -327,6 +506,7 @@ class QASpecialistAgent:
         rl_train_mode: str = "periodic",
     ):
         _bootstrap_runtime_env()
+        self.runtime_settings = get_runtime_settings()
         self.spec_path = str(spec_path)
         self.nlp_prompt = nlp_prompt
         self.tenant_id = tenant_id
@@ -348,6 +528,14 @@ class QASpecialistAgent:
         if env_profile not in SUPPORTED_ENVIRONMENT_PROFILES:
             env_profile = DEFAULT_ENVIRONMENT_PROFILE
         self.environment_profile = env_profile
+        self.strict_contract_checks = _env_bool(
+            "QA_STRICT_CONTRACT_CHECKS",
+            env_profile != DEFAULT_ENVIRONMENT_PROFILE,
+        )
+        self.strict_contract_require_response_schema = _env_bool(
+            "QA_STRICT_CONTRACT_REQUIRE_RESPONSE_SCHEMA",
+            False,
+        )
         self.pass_threshold = max(0.0, min(1.0, float(pass_threshold)))
         normalized_script_kind = str(script_kind or DEFAULT_SCRIPT_KIND).strip().lower()
         if normalized_script_kind not in SUPPORTED_SCRIPT_KINDS:
@@ -376,6 +564,9 @@ class QASpecialistAgent:
             learning_state_path
         )
         self.gam_storage_path = self.learning_state_path.with_name("gam_memory_pages.json")
+        self._cleanup_stale_atomic_temp_files(Path(self.rl_checkpoint_path).expanduser().resolve())
+        self._cleanup_stale_atomic_temp_files(self.learning_state_path)
+        self._cleanup_stale_atomic_temp_files(self.gam_storage_path)
         self.gam = GAMMemorySystem(
             use_vector_search=False,
             storage_path=str(self.gam_storage_path),
@@ -398,8 +589,44 @@ class QASpecialistAgent:
         self.learning_state["scenario_stats"] = dict(self.adaptive_policy.scenario_stats)
         self._last_selection_trace: List[Dict[str, Any]] = []
         self._last_selection_summary: Dict[str, Any] = {}
+        self._runtime_auth_mode: str = self._normalize_runtime_auth_mode(
+            os.getenv("QA_AUTH_MODE", "bearer")
+        )
+        self._runtime_api_key_name: str = (
+            str(os.getenv("QA_AUTH_API_KEY_NAME", "X-API-Key")).strip() or "X-API-Key"
+        )
+        self._runtime_api_key_in: str = (
+            "query"
+            if str(os.getenv("QA_AUTH_API_KEY_IN", "header")).strip().lower() == "query"
+            else "header"
+        )
+        self._runtime_api_key_value: str = str(
+            os.getenv("QA_AUTH_API_KEY_VALUE", "")
+        ).strip()
+        self._runtime_api_key_invalid_value: str = (
+            str(os.getenv("QA_AUTH_API_KEY_INVALID_VALUE", "invalid_api_key")).strip()
+            or "invalid_api_key"
+        )
         self._auth_required_ops: set[str] = set()
         self._operation_index: Dict[str, Dict[str, Any]] = {}
+        self._customer_mutation_rules: List[Dict[str, Any]] = (
+            self._load_customer_mutation_rules_from_env()
+        )
+        self._customer_mutation_rules_by_operation: Dict[str, List[Dict[str, Any]]] = (
+            self._index_customer_mutation_rules(self._customer_mutation_rules)
+        )
+        self._operation_auth_profiles: Dict[str, Dict[str, Any]] = (
+            self._load_operation_auth_profiles_from_env()
+        )
+        self._critical_operations: set[str] = set(
+            self._load_critical_operations_from_env()
+        )
+        self._critical_assertions: List[Dict[str, Any]] = (
+            self._load_critical_assertions_from_env()
+        )
+        self._report_mode: str = self._normalize_report_mode(
+            os.getenv("QA_REPORT_MODE", "full")
+        )
         self._spec_paths: set[str] = set()
         self._spec_scope_key: str = ""
         self._spec_memory_tags: set[str] = set()
@@ -413,6 +640,36 @@ class QASpecialistAgent:
         self._scenario_llm_mode: str = (
             str(os.getenv("QA_SCENARIO_LLM_MODE", "auto")).strip().lower() or "auto"
         )
+        self._live_preflight_enabled: bool = _env_bool(
+            "QA_LIVE_PREFLIGHT_ENABLED",
+            True,
+        )
+        self._mcp_enabled: bool = _env_bool("QA_MCP_ENABLED", False)
+        self._mcp_max_tools_per_server: int = _env_int(
+            "QA_MCP_MAX_TOOLS_PER_SERVER",
+            default=2,
+            minimum=1,
+        )
+        self._mcp_max_excerpts: int = _env_int(
+            "QA_MCP_MAX_EXCERPTS",
+            default=6,
+            minimum=1,
+        )
+        self._mcp_timeout_sec: float = _env_float(
+            "QA_MCP_TIMEOUT_SECONDS",
+            default=8.0,
+            minimum=0.5,
+        )
+        self._mcp_max_calls_total: int = int(self.runtime_settings.mcp_max_calls_total)
+        self._mcp_allowed_tools_by_server: Dict[str, List[str]] = dict(
+            self.runtime_settings.mcp_allowed_tools_by_server
+        )
+        self._mcp_require_allowlist: bool = bool(
+            self.runtime_settings.mcp_require_allowlist
+        )
+        self._mcp_allow_mutating_tools: bool = bool(
+            self.runtime_settings.mcp_allow_mutating_tools
+        )
 
     def _resolve_learning_state_path(self, learning_state_path: Optional[str]) -> Path:
         if learning_state_path:
@@ -425,6 +682,29 @@ class QASpecialistAgent:
         return checkpoint_path.with_name(
             f"{checkpoint_path.stem}_learning_state.json"
         )
+
+    def _cleanup_stale_atomic_temp_files(self, target: Path) -> int:
+        cleaned = 0
+        now = time.time()
+        pattern = f".{target.name}.tmp.*"
+        try:
+            for candidate in target.parent.glob(pattern):
+                if not candidate.is_file():
+                    continue
+                try:
+                    age_sec = now - float(candidate.stat().st_mtime)
+                except Exception:
+                    age_sec = float(ATOMIC_TMP_MAX_AGE_SEC + 1)
+                if age_sec < float(ATOMIC_TMP_MAX_AGE_SEC):
+                    continue
+                try:
+                    candidate.unlink()
+                    cleaned += 1
+                except Exception:
+                    continue
+        except Exception:
+            return int(cleaned)
+        return int(cleaned)
 
     def run(self) -> Dict[str, Any]:
         """Run the full QA specialist workflow."""
@@ -456,6 +736,16 @@ class QASpecialistAgent:
         spec_title = spec.get("info", {}).get("title", "Unknown API")
         spec_version = spec.get("info", {}).get("version", "unknown")
         self._spec_memory_tags = set(self._build_spec_memory_tags(spec_title))
+        mcp_context: Dict[str, Any] = {
+            "enabled": bool(self._mcp_enabled),
+            "configured_servers": 0,
+            "connected_servers": 0,
+            "tool_calls_attempted": 0,
+            "tool_calls_succeeded": 0,
+            "errors": [],
+            "server_traces": [],
+            "excerpts": [],
+        }
 
         stage_started = time.perf_counter()
         session_id = self.gam.start_session(
@@ -540,6 +830,23 @@ class QASpecialistAgent:
                     + list(external_fallback_excerpts)
                 )
                 gam_diagnostics = self._build_gam_diagnostics(research_result.memory_excerpts)
+        mcp_context = self._collect_mcp_tool_excerpts(
+            spec_title=spec_title,
+            auth_type=str(research_context.get("auth_type", "")),
+            endpoint_metadata=research_context.get("endpoints", []),
+            learning_hints=research_context.get("learning_weakness_hints", []),
+        )
+        mcp_excerpts = [
+            item
+            for item in (mcp_context.get("excerpts", []) if isinstance(mcp_context, dict) else [])
+            if isinstance(item, dict)
+        ]
+        if mcp_excerpts:
+            research_result.memory_excerpts = (
+                list(research_result.memory_excerpts)
+                + list(mcp_excerpts)
+            )
+            gam_diagnostics = self._build_gam_diagnostics(research_result.memory_excerpts)
         stage_metrics_ms["stage_2_gam_memory_research"] = round(
             (time.perf_counter() - stage_started) * 1000.0,
             3,
@@ -557,6 +864,11 @@ class QASpecialistAgent:
                         "excerpt_count": len(research_result.memory_excerpts),
                         "diagnostics": gam_diagnostics,
                         "fallback_external_excerpt_count": len(external_fallback_excerpts),
+                        "mcp_enabled": bool(mcp_context.get("enabled", False)),
+                        "mcp_excerpt_count": int(len(mcp_excerpts)),
+                        "mcp_tool_calls_succeeded": int(
+                            mcp_context.get("tool_calls_succeeded", 0)
+                        ),
                         "learning_signal_page_id": learning_signal_page_id,
                         "spec_context_page_id": spec_context_page_id,
                     },
@@ -591,6 +903,9 @@ class QASpecialistAgent:
             spec_intelligence=spec_intelligence,
             limit=6,
         )
+        base_scenarios, real_life_guardrail_summary = self._inject_real_life_guardrail_scenarios(
+            base_scenarios
+        )
         base_scenarios = self._dedupe_scenarios_by_fingerprint(base_scenarios)
         prompt_trace["scenario_generation"] = {
             "engine": str(getattr(simulator, "last_generation_engine", "unknown")),
@@ -608,6 +923,7 @@ class QASpecialistAgent:
             "base_scenario_count": int(len(base_scenarios)),
             "happy_path_guardrail": happy_guardrail_summary,
             "workflow_guardrail": workflow_guardrail_summary,
+            "real_life_guardrail": real_life_guardrail_summary,
         }
         llm_stats = prompt_trace["scenario_generation"].get("llm_stats", {})
         llm_success = (
@@ -647,14 +963,29 @@ class QASpecialistAgent:
         )
 
         stage_started = time.perf_counter()
-        execution_results = self._execute_scenarios(spec, scenarios)
+        execution_deadline: Optional[float] = None
+        if self.max_runtime_sec is not None:
+            execution_deadline = stage_started + float(self.max_runtime_sec)
+
+        execution_results = self._execute_scenarios(
+            spec,
+            scenarios,
+            execution_deadline=execution_deadline,
+        )
         runtime_repair_ingest = self._ingest_runtime_repair_suggestions(
             scenarios=scenarios,
             results=execution_results,
         )
         script_scenarios = list(scenarios)
         generated_files = self._generate_test_files(script_scenarios)
-        generated_script_execution = self._execute_generated_script(spec, generated_files)
+        script_budget_sec: Optional[float] = None
+        if execution_deadline is not None:
+            script_budget_sec = max(0.0, float(execution_deadline) - time.perf_counter())
+        generated_script_execution = self._execute_generated_script(
+            spec,
+            generated_files,
+            max_exec_sec=script_budget_sec,
+        )
         stage_metrics_ms["stage_6_execute_verify"] = round(
             (time.perf_counter() - stage_started) * 1000.0,
             3,
@@ -795,6 +1126,23 @@ class QASpecialistAgent:
                 },
                 "script_kind": self.script_kind,
                 "rl_train_mode": self.rl_train_mode,
+                "runtime_auth_mode": self._runtime_auth_mode,
+                "runtime_api_key_name": self._runtime_api_key_name
+                if self._runtime_auth_mode == "api_key"
+                else None,
+                "runtime_api_key_in": self._runtime_api_key_in
+                if self._runtime_auth_mode == "api_key"
+                else None,
+                "report_mode": self._report_mode,
+                "customer_mutation_rule_count": int(len(self._customer_mutation_rules)),
+                "auth_profile_override_count": int(
+                    len(self._operation_auth_profiles or {})
+                ),
+                "critical_operations_count": int(len(self._critical_operations or set())),
+                "critical_assertions_count": int(len(self._critical_assertions or [])),
+                "strict_contract_checks": bool(self.strict_contract_checks),
+                "mcp_enabled": bool(mcp_context.get("enabled", False)),
+                "mcp_configured_servers": int(mcp_context.get("configured_servers", 0)),
                 "llm_scenario_debug_log": self.llm_scenario_debug_log_path,
                 "llm_generation_degraded": bool(self._llm_generation_degraded),
                 "llm_generation_degraded_reason": str(
@@ -821,6 +1169,21 @@ class QASpecialistAgent:
                 "selected_count": len(scenarios),
                 "base_max_scenarios": int(
                     self._last_selection_summary.get("base_max_scenarios", self.max_scenarios)
+                ),
+                "auto_floor_budget": int(
+                    self._last_selection_summary.get("auto_floor_budget", self.max_scenarios)
+                ),
+                "auto_budget_expanded": bool(
+                    self._last_selection_summary.get("auto_budget_expanded", False)
+                ),
+                "auto_expand_enabled": bool(
+                    self._last_selection_summary.get("auto_expand_enabled", False)
+                ),
+                "auto_min_per_operation": int(
+                    self._last_selection_summary.get("auto_min_per_operation", AUTO_SCENARIO_PER_OPERATION)
+                ),
+                "auto_budget_cap": int(
+                    self._last_selection_summary.get("auto_budget_cap", AUTO_SCENARIO_GLOBAL_CAP)
                 ),
                 "effective_budget": int(
                     self._last_selection_summary.get("effective_budget", len(scenarios))
@@ -853,6 +1216,21 @@ class QASpecialistAgent:
                 "novel_selected_count": int(
                     self._last_selection_summary.get("novel_selected_count", 0)
                 ),
+                "real_life_mandatory_strategies": list(
+                    self._last_selection_summary.get(
+                        "real_life_mandatory_strategies",
+                        list(REAL_LIFE_MANDATORY_STRATEGIES),
+                    )
+                ),
+                "real_life_mandatory_selected": int(
+                    self._last_selection_summary.get("real_life_mandatory_selected", 0)
+                ),
+                "real_life_mandatory_breakdown": dict(
+                    self._last_selection_summary.get(
+                        "real_life_mandatory_breakdown",
+                        {},
+                    )
+                ),
                 "top_decisions": self._last_selection_trace[:20],
             },
             "selection_decision_trace": self._last_selection_trace[:120],
@@ -881,6 +1259,7 @@ class QASpecialistAgent:
             "spec_intelligence": spec_intelligence,
             "oss_tooling": oss_tooling,
             "oss_checks": oss_checks,
+            "mcp": mcp_context,
             "gam": {
                 "session_id": session_id,
                 "memo_page_id": memo_page.id,
@@ -899,6 +1278,7 @@ class QASpecialistAgent:
                 "research_excerpt_count": len(research_result.memory_excerpts),
                 "research_excerpts": research_result.memory_excerpts,
                 "fallback_external_excerpts": external_fallback_excerpts,
+                "mcp_excerpts": mcp_context.get("excerpts", []),
                 "context_pack": gam_context_pack,
                 "learning_signal_page_id": learning_signal_page_id,
                 "learning_trend_page_id": learning_trend_page_id,
@@ -933,13 +1313,30 @@ class QASpecialistAgent:
             raise FileNotFoundError(f"Spec file not found: {self.spec_path}")
 
         content = spec_path.read_text(encoding="utf-8")
-        if spec_path.suffix.lower() in [".yaml", ".yml"]:
-            parsed = yaml.safe_load(content)
-        else:
-            parsed = json.loads(content)
+        try:
+            if spec_path.suffix.lower() in [".yaml", ".yml"]:
+                parsed = yaml.safe_load(content)
+            else:
+                parsed = json.loads(content)
+        except yaml.YAMLError as exc:
+            raise ValueError(f"Invalid YAML OpenAPI spec: {exc}") from exc
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid JSON OpenAPI spec: {exc}") from exc
 
         if not isinstance(parsed, dict):
             raise ValueError("OpenAPI spec must parse to a JSON/YAML object.")
+        if not str(parsed.get("openapi", "")).strip():
+            raise ValueError("OpenAPI spec missing required 'openapi' version field.")
+        info = parsed.get("info", {})
+        if not isinstance(info, dict):
+            raise ValueError("OpenAPI spec missing required object field 'info'.")
+        if not str(info.get("title", "")).strip():
+            raise ValueError("OpenAPI spec missing required field 'info.title'.")
+        if not str(info.get("version", "")).strip():
+            raise ValueError("OpenAPI spec missing required field 'info.version'.")
+        paths = parsed.get("paths", {})
+        if not isinstance(paths, dict):
+            raise ValueError("OpenAPI spec field 'paths' must be an object.")
         return parsed
 
     def _generate_test_files(self, scenarios: List[TestScenario]) -> Dict[str, str]:
@@ -972,7 +1369,10 @@ class QASpecialistAgent:
         return {self.script_kind: str(output_path)}
 
     def _execute_generated_script(
-        self, spec: Dict[str, Any], generated_files: Dict[str, str]
+        self,
+        spec: Dict[str, Any],
+        generated_files: Dict[str, str],
+        max_exec_sec: Optional[float] = None,
     ) -> Dict[str, Any]:
         script_path_raw = generated_files.get(self.script_kind)
         if not script_path_raw:
@@ -993,14 +1393,18 @@ class QASpecialistAgent:
                 "error": "Generated script file not found",
             }
 
-        if self.script_kind != "python_pytest":
-            return {
-                "kind": self.script_kind,
-                "status": "skipped",
-                "executed": False,
-                "script_path": str(script_path),
-                "reason": "Automatic script execution currently supports python_pytest only",
-            }
+        execution_deadline: Optional[float] = None
+        if max_exec_sec is not None:
+            budget_sec = max(0.0, float(max_exec_sec))
+            if budget_sec <= 0.0:
+                return {
+                    "kind": self.script_kind,
+                    "status": "skipped",
+                    "executed": False,
+                    "script_path": str(script_path),
+                    "reason": self._runtime_cap_error_label(),
+                }
+            execution_deadline = time.perf_counter() + float(budget_sec)
 
         profile = str(self.environment_profile or DEFAULT_ENVIRONMENT_PROFILE).lower()
         if profile == "prod_safe":
@@ -1011,176 +1415,509 @@ class QASpecialistAgent:
                 "script_path": str(script_path),
                 "reason": "Generated script execution is disabled for prod_safe profile",
             }
+
+        if self.script_kind == "python_pytest":
+            try:
+                self._assert_generated_python_script_safe(script_path)
+            except Exception as exc:
+                return {
+                    "kind": self.script_kind,
+                    "status": "error",
+                    "executed": False,
+                    "script_path": str(script_path),
+                    "error": str(exc),
+                }
+            remaining_exec_sec: Optional[float] = max_exec_sec
+            if execution_deadline is not None:
+                remaining_exec_sec = max(
+                    0.0, float(execution_deadline) - time.perf_counter()
+                )
+            if profile == "mock":
+                return self._execute_python_script_in_isolated_mock(
+                    spec,
+                    script_path,
+                    max_exec_sec=remaining_exec_sec,
+                )
+            return self._execute_python_script_live(
+                script_path,
+                max_exec_sec=remaining_exec_sec,
+            )
+
+        if self.script_kind == "javascript_jest":
+            return self._validate_javascript_script(script_path)
+        if self.script_kind == "java_restassured":
+            return self._validate_java_script(script_path)
+        if self.script_kind == "curl_script":
+            return self._execute_curl_script(
+                script_path,
+                execution_deadline=execution_deadline,
+            )
+
+        return {
+            "kind": self.script_kind,
+            "status": "skipped",
+            "executed": False,
+            "script_path": str(script_path),
+            "reason": "Unsupported generated script kind",
+        }
+
+    def _assert_generated_python_script_safe(self, script_path: Path) -> None:
+        source = script_path.read_text(encoding="utf-8")
+        try:
+            tree = ast.parse(source, filename=str(script_path))
+        except SyntaxError as exc:
+            raise RuntimeError(f"Generated python script syntax error: {exc}") from exc
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    root = str(alias.name).split(".", 1)[0]
+                    if root not in GENERATED_PYTHON_ALLOWED_IMPORTS:
+                        raise RuntimeError(
+                            f"Unsafe python script import blocked: {alias.name}"
+                        )
+            elif isinstance(node, ast.ImportFrom):
+                module_root = str(node.module or "").split(".", 1)[0]
+                if module_root not in GENERATED_PYTHON_ALLOWED_IMPORTS:
+                    raise RuntimeError(
+                        f"Unsafe python script import blocked: {node.module or ''}"
+                    )
+            elif isinstance(node, ast.Call):
+                if isinstance(node.func, ast.Name):
+                    if node.func.id in GENERATED_PYTHON_BLOCKED_CALLS:
+                        raise RuntimeError(
+                            f"Unsafe python script call blocked: {node.func.id}"
+                        )
+                elif isinstance(node.func, ast.Attribute) and isinstance(
+                    node.func.value, ast.Name
+                ):
+                    pair = (str(node.func.value.id), str(node.func.attr))
+                    if pair in GENERATED_PYTHON_BLOCKED_ATTRIBUTE_CALLS:
+                        raise RuntimeError(
+                            f"Unsafe python script call blocked: {pair[0]}.{pair[1]}"
+                        )
+        for node in tree.body:
+            if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
+                raise RuntimeError("Unsafe top-level python call blocked")
+            if isinstance(
+                node,
+                (ast.With, ast.AsyncWith, ast.For, ast.AsyncFor, ast.While, ast.Try),
+            ):
+                raise RuntimeError("Unsafe top-level python control flow blocked")
+
+    def _validate_javascript_script(self, script_path: Path) -> Dict[str, Any]:
+        content = script_path.read_text(encoding="utf-8")
+        required_markers = ("axios", "describe(", "expect(")
+        missing = [item for item in required_markers if item not in content]
+        if missing:
+            return {
+                "kind": self.script_kind,
+                "status": "error",
+                "executed": False,
+                "script_path": str(script_path),
+                "error": "Invalid javascript test script: missing markers "
+                + ", ".join(missing),
+            }
+        return {
+            "kind": self.script_kind,
+            "status": "validated",
+            "executed": False,
+            "script_path": str(script_path),
+            "validated": True,
+            "checks": ["contains axios import", "contains describe block", "contains expect assertions"],
+        }
+
+    def _validate_java_script(self, script_path: Path) -> Dict[str, Any]:
+        content = script_path.read_text(encoding="utf-8")
+        required_markers = ("class APITests", "@Test", "statusCode(")
+        missing = [item for item in required_markers if item not in content]
+        if missing:
+            return {
+                "kind": self.script_kind,
+                "status": "error",
+                "executed": False,
+                "script_path": str(script_path),
+                "error": "Invalid java test script: missing markers "
+                + ", ".join(missing),
+            }
+        return {
+            "kind": self.script_kind,
+            "status": "validated",
+            "executed": False,
+            "script_path": str(script_path),
+            "validated": True,
+            "checks": ["contains APITests class", "contains JUnit tests", "contains status assertions"],
+        }
+
+    def _validate_curl_target_url(self, raw_url: str) -> Tuple[bool, str]:
+        value = str(raw_url or "").strip()
+        if not value:
+            return False, "missing_url"
+
+        def _effective_port(scheme: str, explicit_port: Optional[int]) -> int:
+            if explicit_port is not None:
+                return int(explicit_port)
+            return 443 if scheme == "https" else 80
+
+        base = urlparse(str(self.base_url or "").strip())
+        base_scheme = str(base.scheme or "").lower()
+        base_host = str(base.hostname or "").lower()
+        if base_scheme not in {"http", "https"} or not base_host:
+            return False, "invalid_base_url"
+        base_port = _effective_port(base_scheme, base.port)
+
+        parsed = urlparse(value)
+        if value.startswith("/"):
+            target_scheme = base_scheme
+            target_host = base_host
+            target_port = base_port
+        elif parsed.scheme in {"http", "https"} and parsed.hostname:
+            target_scheme = str(parsed.scheme or "").lower()
+            target_host = str(parsed.hostname or "").lower()
+            target_port = _effective_port(target_scheme, parsed.port)
+        else:
+            return False, "relative_or_malformed_url_not_allowed"
+
+        if target_scheme != base_scheme:
+            return False, "url_scheme_mismatch"
+        if target_host != base_host:
+            return False, "url_host_mismatch"
+        if target_port != base_port:
+            return False, "url_port_mismatch"
+        return True, ""
+
+    def _validate_curl_command_argv(self, argv: List[str]) -> Tuple[bool, str]:
+        if not argv or str(argv[0]).strip() != "curl":
+            return False, "curl_command_required"
+
+        target_url = ""
+        idx = 1
+        while idx < len(argv):
+            token = str(argv[idx]).strip()
+            if not token:
+                idx += 1
+                continue
+
+            if token.startswith("-"):
+                if token in BLOCKED_CURL_FLAGS:
+                    return False, f"blocked_flag:{token}"
+                if token.startswith("--url="):
+                    target_url = token.split("=", 1)[1].strip()
+                    idx += 1
+                    continue
+                if token.startswith("--request="):
+                    idx += 1
+                    continue
+                if token.startswith("-X") and token not in {"-X"}:
+                    idx += 1
+                    continue
+                if token in ALLOWED_CURL_FLAGS_NO_VALUE:
+                    idx += 1
+                    continue
+                if token in ALLOWED_CURL_FLAGS_WITH_VALUE:
+                    if idx + 1 >= len(argv):
+                        return False, f"missing_flag_value:{token}"
+                    next_value = str(argv[idx + 1]).strip()
+                    if token == "--url":
+                        target_url = next_value
+                    idx += 2
+                    continue
+                return False, f"unsupported_flag:{token}"
+
+            if not target_url:
+                target_url = token
+            else:
+                return False, "multiple_url_targets_not_allowed"
+            idx += 1
+
+        ok, reason = self._validate_curl_target_url(target_url)
+        if not ok:
+            return False, reason
+        return True, ""
+
+    def _execute_curl_script(
+        self,
+        script_path: Path,
+        *,
+        execution_deadline: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        profile = str(self.environment_profile or DEFAULT_ENVIRONMENT_PROFILE).lower()
         if profile == "mock":
-            return self._execute_python_script_in_isolated_mock(spec, script_path)
-        return self._execute_python_script_live(script_path)
+            return {
+                "kind": self.script_kind,
+                "status": "skipped",
+                "executed": False,
+                "script_path": str(script_path),
+                "reason": "curl execution requires a reachable HTTP base URL; mock profile uses in-memory execution",
+            }
+
+        commands: List[str] = []
+        for raw_line in script_path.read_text(encoding="utf-8").splitlines():
+            stripped = str(raw_line).strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if not stripped.startswith("curl "):
+                return {
+                    "kind": self.script_kind,
+                    "status": "error",
+                    "executed": False,
+                    "script_path": str(script_path),
+                    "error": f"Invalid curl script line: {stripped[:120]}",
+                }
+            commands.append(stripped)
+
+        if not commands:
+            return {
+                "kind": self.script_kind,
+                "status": "missing",
+                "executed": False,
+                "script_path": str(script_path),
+                "error": "No curl commands found in generated script",
+            }
+
+        started = time.perf_counter()
+        command_results: List[Dict[str, Any]] = []
+        runtime_cap_reached = False
+        for index, command in enumerate(commands, start=1):
+            try:
+                timeout_sec = self._remaining_timeout_until_deadline(
+                    execution_deadline,
+                    default_timeout=12.0,
+                )
+            except TimeoutError:
+                runtime_cap_reached = True
+                break
+
+            try:
+                argv = shlex.split(command)
+            except ValueError as exc:
+                command_results.append(
+                    {
+                        "index": int(index),
+                        "exit_code": None,
+                        "error": f"invalid_curl_command:{exc}",
+                    }
+                )
+                break
+            is_valid, invalid_reason = self._validate_curl_command_argv(argv)
+            if not is_valid:
+                command_results.append(
+                    {
+                        "index": int(index),
+                        "exit_code": None,
+                        "error": f"unsafe_curl_command:{invalid_reason}",
+                    }
+                )
+                break
+            try:
+                completed = subprocess.run(
+                    argv,
+                    capture_output=True,
+                    text=True,
+                    timeout=float(timeout_sec) if timeout_sec is not None else None,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired:
+                runtime_cap_reached = True
+                command_results.append(
+                    {
+                        "index": int(index),
+                        "exit_code": None,
+                        "error": self._runtime_cap_error_label(),
+                    }
+                )
+                break
+
+            stdout_excerpt = str(completed.stdout or "").strip()
+            stderr_excerpt = str(completed.stderr or "").strip()
+            command_results.append(
+                {
+                    "index": int(index),
+                    "exit_code": int(completed.returncode),
+                    "stdout_excerpt": stdout_excerpt[:500],
+                    "stderr_excerpt": stderr_excerpt[:500],
+                }
+            )
+
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        non_zero = [
+            item
+            for item in command_results
+            if item.get("error") or item.get("exit_code") not in {0, None}
+        ]
+        status = "executed"
+        executed = True
+        if runtime_cap_reached and not command_results:
+            status = "skipped"
+            executed = False
+            self._runtime_cap_hit = True
+        elif runtime_cap_reached:
+            status = "partial"
+            self._runtime_cap_hit = True
+        elif non_zero:
+            status = "error"
+
+        result: Dict[str, Any] = {
+            "kind": self.script_kind,
+            "status": status,
+            "executed": bool(executed),
+            "script_path": str(script_path),
+            "commands_total": int(len(commands)),
+            "commands_executed": int(len(command_results)),
+            "command_results": command_results,
+            "execution_ms": round(elapsed_ms, 3),
+        }
+        if runtime_cap_reached:
+            result["error"] = self._runtime_cap_error_label()
+        elif non_zero:
+            first_error = str(non_zero[0].get("error", "")).strip() if non_zero else ""
+            if first_error:
+                result["error"] = first_error
+            else:
+                result["error"] = "One or more curl commands exited non-zero"
+        return result
+
+    def _subprocess_exec_env(self) -> Dict[str, str]:
+        backend_root = Path(__file__).resolve().parent.parent
+        return {
+            "PYTHONPATH": str(backend_root),
+            "PYTHONUNBUFFERED": "1",
+            "PYTHONIOENCODING": "utf-8",
+            "HOME": str(Path.home()),
+            "TMPDIR": str(Path("/tmp")),
+        }
+
+    def _execute_python_script_subprocess(
+        self,
+        *,
+        script_path: Path,
+        mode: str,
+        base_url: str,
+        spec_path: Optional[Path] = None,
+        max_exec_sec: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        started = time.perf_counter()
+        runtime_cap_label = self._runtime_cap_error_label()
+
+        default_cap = float(self.runtime_settings.script_exec_max_runtime_sec)
+        budget_sec = float(default_cap)
+        if max_exec_sec is not None:
+            budget_sec = min(float(default_cap), max(0.0, float(max_exec_sec)))
+        if budget_sec <= 0.0:
+            self._runtime_cap_hit = True
+            return {
+                "kind": self.script_kind,
+                "status": "skipped",
+                "executed": False,
+                "script_path": str(script_path),
+                "reason": runtime_cap_label,
+            }
+
+        cmd: List[str] = [
+            sys.executable,
+            "-m",
+            "spec_test_pilot.script_runner",
+            "--script-path",
+            str(script_path),
+            "--mode",
+            str(mode),
+            "--base-url",
+            str(base_url),
+            "--request-timeout-sec",
+            str(float(self.runtime_settings.live_request_timeout_sec)),
+        ]
+        if mode == "mock" and spec_path is not None:
+            cmd.extend(["--spec-path", str(spec_path)])
+
+        try:
+            completed = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=float(budget_sec),
+                env=self._subprocess_exec_env(),
+                cwd=str(Path(__file__).resolve().parent.parent),
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            self._runtime_cap_hit = True
+            return {
+                "kind": self.script_kind,
+                "status": "skipped",
+                "executed": False,
+                "script_path": str(script_path),
+                "execution_ms": round(elapsed_ms, 3),
+                "error": runtime_cap_label,
+            }
+
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        stdout = str(completed.stdout or "").strip()
+        stderr = str(completed.stderr or "").strip()
+        payload: Dict[str, Any] = {}
+        if stdout:
+            for line in reversed(stdout.splitlines()):
+                text = str(line).strip()
+                if not text:
+                    continue
+                try:
+                    parsed = json.loads(text)
+                except Exception:
+                    continue
+                if isinstance(parsed, dict):
+                    payload = parsed
+                    break
+
+        if not payload:
+            status = "error" if completed.returncode != 0 else "executed"
+            payload = {
+                "status": status,
+                "executed": bool(completed.returncode == 0),
+                "error": f"runner_output_unparseable:rc={completed.returncode}",
+            }
+            if stderr:
+                payload["stderr_excerpt"] = stderr[-500:]
+
+        payload["kind"] = self.script_kind
+        payload["script_path"] = str(script_path)
+        payload["execution_ms"] = round(
+            float(payload.get("execution_ms", elapsed_ms) or elapsed_ms), 3
+        )
+        if stderr and not payload.get("stderr_excerpt"):
+            payload["stderr_excerpt"] = stderr[-500:]
+        if str(payload.get("error", "")).startswith(runtime_cap_label):
+            self._runtime_cap_hit = True
+        return payload
 
     def _execute_python_script_in_isolated_mock(
-        self, spec: Dict[str, Any], script_path: Path
+        self,
+        spec: Dict[str, Any],
+        script_path: Path,
+        max_exec_sec: Optional[float] = None,
     ) -> Dict[str, Any]:
-        # Imported lazily so this module can be used without server startup paths.
-        from dynamic_mock_server import DynamicMockServer
-
+        self._assert_generated_python_script_safe(script_path)
         spec_copy = self.output_dir / "openapi_under_test_script_exec.yaml"
         spec_copy.write_text(yaml.safe_dump(spec, sort_keys=False), encoding="utf-8")
+        return self._execute_python_script_subprocess(
+            script_path=script_path,
+            mode="mock",
+            base_url=str(self.runtime_settings.script_exec_base_url_hint),
+            spec_path=spec_copy,
+            max_exec_sec=max_exec_sec,
+        )
 
-        started = time.perf_counter()
-        try:
-            with TestClient(DynamicMockServer(str(spec_copy), host="127.0.0.1", port=0).app) as client:
-                module_name = f"generated_python_tests_{int(time.time() * 1000)}"
-                module_spec = importlib.util.spec_from_file_location(module_name, str(script_path))
-                if module_spec is None or module_spec.loader is None:
-                    raise RuntimeError("Unable to load generated python test module")
-
-                module = importlib.util.module_from_spec(module_spec)
-                module_spec.loader.exec_module(module)
-                setattr(module, "requests", _TestClientRequestsAdapter(client))
-                setattr(module, "BASE_URL", "http://testserver")
-
-                test_class = getattr(module, "TestAPI", None)
-                if test_class is None:
-                    raise RuntimeError("Generated python script missing TestAPI class")
-
-                test_instance = test_class()
-                test_methods = sorted(
-                    name
-                    for name in dir(test_instance)
-                    if name.startswith("test_") and callable(getattr(test_instance, name))
-                )
-
-                method_results: List[Dict[str, Any]] = []
-                passed_count = 0
-                for method_name in test_methods:
-                    fn = getattr(test_instance, method_name)
-                    method_started = time.perf_counter()
-                    try:
-                        fn()
-                        passed = True
-                        error_msg = ""
-                    except AssertionError as exc:
-                        passed = False
-                        error_msg = str(exc) or "AssertionError"
-                    except Exception as exc:
-                        passed = False
-                        error_msg = f"{type(exc).__name__}: {exc}"
-
-                    duration_ms = (time.perf_counter() - method_started) * 1000.0
-                    if passed:
-                        passed_count += 1
-                    method_results.append(
-                        {
-                            "name": method_name,
-                            "passed": passed,
-                            "error": error_msg,
-                            "duration_ms": round(duration_ms, 3),
-                        }
-                    )
-
-                total_count = len(method_results)
-                failed_count = total_count - passed_count
-                elapsed_ms = (time.perf_counter() - started) * 1000.0
-
-                return {
-                    "kind": self.script_kind,
-                    "status": "executed",
-                    "executed": True,
-                    "script_path": str(script_path),
-                    "total_tests": total_count,
-                    "passed_tests": passed_count,
-                    "failed_tests": failed_count,
-                    "pass_rate": round((passed_count / total_count), 4) if total_count else 0.0,
-                    "execution_ms": round(elapsed_ms, 3),
-                    "results": method_results,
-                }
-        except Exception as exc:
-            elapsed_ms = (time.perf_counter() - started) * 1000.0
-            return {
-                "kind": self.script_kind,
-                "status": "error",
-                "executed": False,
-                "script_path": str(script_path),
-                "execution_ms": round(elapsed_ms, 3),
-                "error": str(exc),
-            }
-
-    def _execute_python_script_live(self, script_path: Path) -> Dict[str, Any]:
-        started = time.perf_counter()
-        try:
-            with _LiveRequestsAdapter(self.base_url, timeout_sec=12.0) as client:
-                module_name = f"generated_python_tests_live_{int(time.time() * 1000)}"
-                module_spec = importlib.util.spec_from_file_location(module_name, str(script_path))
-                if module_spec is None or module_spec.loader is None:
-                    raise RuntimeError("Unable to load generated python test module")
-
-                module = importlib.util.module_from_spec(module_spec)
-                module_spec.loader.exec_module(module)
-                setattr(module, "requests", client)
-                setattr(module, "BASE_URL", str(self.base_url))
-
-                test_class = getattr(module, "TestAPI", None)
-                if test_class is None:
-                    raise RuntimeError("Generated python script missing TestAPI class")
-
-                test_instance = test_class()
-                test_methods = sorted(
-                    name
-                    for name in dir(test_instance)
-                    if name.startswith("test_") and callable(getattr(test_instance, name))
-                )
-
-                method_results: List[Dict[str, Any]] = []
-                passed_count = 0
-                for method_name in test_methods:
-                    fn = getattr(test_instance, method_name)
-                    method_started = time.perf_counter()
-                    try:
-                        fn()
-                        passed = True
-                        error_msg = ""
-                    except AssertionError as exc:
-                        passed = False
-                        error_msg = str(exc) or "AssertionError"
-                    except Exception as exc:
-                        passed = False
-                        error_msg = f"{type(exc).__name__}: {exc}"
-
-                    duration_ms = (time.perf_counter() - method_started) * 1000.0
-                    if passed:
-                        passed_count += 1
-                    method_results.append(
-                        {
-                            "name": method_name,
-                            "passed": passed,
-                            "error": error_msg,
-                            "duration_ms": round(duration_ms, 3),
-                        }
-                    )
-
-                total_count = len(method_results)
-                failed_count = total_count - passed_count
-                elapsed_ms = (time.perf_counter() - started) * 1000.0
-                return {
-                    "kind": self.script_kind,
-                    "status": "executed",
-                    "executed": True,
-                    "script_path": str(script_path),
-                    "total_tests": total_count,
-                    "passed_tests": passed_count,
-                    "failed_tests": failed_count,
-                    "pass_rate": round((passed_count / total_count), 4) if total_count else 0.0,
-                    "execution_ms": round(elapsed_ms, 3),
-                    "results": method_results,
-                }
-        except Exception as exc:
-            elapsed_ms = (time.perf_counter() - started) * 1000.0
-            return {
-                "kind": self.script_kind,
-                "status": "error",
-                "executed": False,
-                "script_path": str(script_path),
-                "execution_ms": round(elapsed_ms, 3),
-                "error": str(exc),
-            }
+    def _execute_python_script_live(
+        self,
+        script_path: Path,
+        max_exec_sec: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        self._assert_generated_python_script_safe(script_path)
+        return self._execute_python_script_subprocess(
+            script_path=script_path,
+            mode="live",
+            base_url=str(self.base_url),
+            max_exec_sec=max_exec_sec,
+        )
 
     def _load_learning_state(self) -> Dict[str, Any]:
         if self.learning_state_path.exists():
@@ -1804,6 +2541,68 @@ class QASpecialistAgent:
                 else "real_dependency_isolation_enabled"
             ),
         }
+        enablement_recommendations: List[str] = []
+        if not bool(packages.get("openapi_spec_validator", False)):
+            enablement_recommendations.append(
+                "Install `openapi-spec-validator` to enforce OpenAPI schema validation in CI."
+            )
+        if not schemathesis_available:
+            enablement_recommendations.append(
+                "Install `schemathesis` to run stateful contract fuzzing against API workflows."
+            )
+        if not restler_available:
+            enablement_recommendations.append(
+                "Install RESTler CLI for sequence-based fuzzing of dependent API calls."
+            )
+        if not evomaster_available:
+            enablement_recommendations.append(
+                "Install EvoMaster to add search-based API test generation."
+            )
+        if not bool(packages.get("pact", False)):
+            enablement_recommendations.append(
+                "Install `pact-python` for consumer/provider contract checks."
+            )
+        if not zap_available:
+            enablement_recommendations.append(
+                "Install OWASP ZAP baseline CLI for API security scanning."
+            )
+        if not load_available:
+            enablement_recommendations.append(
+                "Install k6 or Locust to enable p95/p99 load probes."
+            )
+        if not bool(packages.get("testcontainers", False)):
+            enablement_recommendations.append(
+                "Install `testcontainers` to run dependency-realistic isolation tests."
+            )
+
+        oss_stage_keys = [
+            "schemathesis_stateful_smoke",
+            "restler_sequence_seed",
+            "evomaster_search_based",
+            "pact_contract_check",
+            "zap_api_scan",
+            "k6_load_probe",
+            "testcontainers_isolation",
+        ]
+        active_stage_count = 0
+        for key in oss_stage_keys:
+            stage = checks.get(key, {})
+            stage_status = (
+                str(stage.get("status", "")).strip().lower()
+                if isinstance(stage, dict)
+                else ""
+            )
+            if stage_status == "active":
+                active_stage_count += 1
+        checks["oss_enablement"] = {
+            "active_stage_count": int(active_stage_count),
+            "total_optional_stages": int(len(oss_stage_keys)),
+            "coverage_ratio": round(
+                active_stage_count / float(max(1, len(oss_stage_keys))),
+                4,
+            ),
+            "recommendations": enablement_recommendations,
+        }
         return checks
 
     def _validate_openapi_contract(
@@ -1903,6 +2702,60 @@ class QASpecialistAgent:
             },
         ]
         return hints
+
+    def _collect_mcp_tool_excerpts(
+        self,
+        *,
+        spec_title: str,
+        auth_type: str,
+        endpoint_metadata: Optional[List[Dict[str, Any]]] = None,
+        learning_hints: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        status: Dict[str, Any] = {
+            "enabled": bool(self._mcp_enabled),
+            "configured_servers": 0,
+            "connected_servers": 0,
+            "tool_calls_attempted": 0,
+            "tool_calls_succeeded": 0,
+            "errors": [],
+            "server_traces": [],
+            "excerpts": [],
+        }
+        if not self._mcp_enabled:
+            return status
+
+        try:
+            from spec_test_pilot.mcp_tools import collect_mcp_tool_excerpts
+        except Exception as exc:
+            status["errors"] = [f"mcp_module_import_failed:{exc}"]
+            return status
+
+        try:
+            return collect_mcp_tool_excerpts(
+                enabled=bool(self._mcp_enabled),
+                spec_title=spec_title,
+                auth_type=auth_type,
+                endpoint_metadata=[
+                    item
+                    for item in (endpoint_metadata or [])
+                    if isinstance(item, dict)
+                ],
+                learning_hints=[
+                    item
+                    for item in (learning_hints or [])
+                    if isinstance(item, dict)
+                ],
+                max_tools_per_server=int(self._mcp_max_tools_per_server),
+                max_excerpts=int(self._mcp_max_excerpts),
+                timeout_sec=float(self._mcp_timeout_sec),
+                max_calls_total=int(self._mcp_max_calls_total),
+                allowed_tools_by_server=dict(self._mcp_allowed_tools_by_server),
+                require_allowlist=bool(self._mcp_require_allowlist),
+                allow_mutating_tools=bool(self._mcp_allow_mutating_tools),
+            )
+        except Exception as exc:
+            status["errors"] = [f"mcp_collection_failed:{exc}"]
+            return status
 
     def _filter_memory_excerpts_for_current_spec(
         self,
@@ -2111,9 +2964,22 @@ class QASpecialistAgent:
                 reverse=True,
             )[:REPAIR_RULE_MAX_ITEMS]
             payload["scenario_repair_rules"] = {k: v for k, v in ranked_rules}
-
-        with open(self.learning_state_path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2)
+        target = self.learning_state_path.expanduser().resolve()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        self._cleanup_stale_atomic_temp_files(target)
+        tmp_path = target.with_name(f".{target.name}.tmp.{uuid.uuid4().hex}")
+        try:
+            tmp_path.write_text(
+                json.dumps(payload, indent=2, ensure_ascii=True),
+                encoding="utf-8",
+            )
+            os.replace(tmp_path, target)
+        finally:
+            if tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except Exception:
+                    pass
 
     def _learning_state_snapshot(self) -> Dict[str, Any]:
         type_weights = self.learning_state.get("test_type_weights", {})
@@ -2353,6 +3219,14 @@ class QASpecialistAgent:
         existing = list(scenarios)
         existing_fingerprints = {self._scenario_fingerprint(item) for item in existing}
         existing_names = {str(item.name) for item in existing}
+        mutation_new_cap = max(
+            int(RL_MUTATION_MAX_NEW_SCENARIOS),
+            min(int(AUTO_SCENARIO_GLOBAL_CAP), int(self.max_scenarios) * 3),
+        )
+        history_seed_cap = max(
+            int(RL_HISTORY_SEED_MAX_NEW_SCENARIOS),
+            min(int(AUTO_SCENARIO_GLOBAL_CAP // 2), int(self.max_scenarios)),
+        )
 
         mutated: List[TestScenario] = []
         applied_examples: List[Dict[str, Any]] = []
@@ -2366,7 +3240,7 @@ class QASpecialistAgent:
                 target_context=target,
             )
             for variant in variants:
-                if len(mutated) >= RL_MUTATION_MAX_NEW_SCENARIOS:
+                if len(mutated) >= int(mutation_new_cap):
                     break
                 fingerprint = self._scenario_fingerprint(variant)
                 if fingerprint in existing_fingerprints:
@@ -2397,7 +3271,7 @@ class QASpecialistAgent:
                             "strategy": self._extract_rl_mutation_strategy(variant),
                         }
                     )
-            if len(mutated) >= RL_MUTATION_MAX_NEW_SCENARIOS:
+            if len(mutated) >= int(mutation_new_cap):
                 break
 
         history_seeded, history_seed_examples, history_seed_targets = (
@@ -2405,7 +3279,7 @@ class QASpecialistAgent:
                 spec,
                 existing_fingerprints=existing_fingerprints,
                 existing_names=existing_names,
-                max_new=RL_HISTORY_SEED_MAX_NEW_SCENARIOS,
+                max_new=int(history_seed_cap),
             )
         )
 
@@ -2426,8 +3300,10 @@ class QASpecialistAgent:
             "final_candidate_count": int(len(final_candidates)),
             "priority_threshold": float(RL_MUTATION_MIN_PRIORITY),
             "max_new_candidates": int(
-                RL_MUTATION_MAX_NEW_SCENARIOS + RL_HISTORY_SEED_MAX_NEW_SCENARIOS
+                int(mutation_new_cap) + int(history_seed_cap)
             ),
+            "direct_mutation_cap": int(mutation_new_cap),
+            "history_seed_cap": int(history_seed_cap),
             "max_variants_per_target": int(RL_MUTATION_MAX_VARIANTS_PER_TARGET),
             "history_seed_priority_threshold": float(RL_HISTORY_SEED_MIN_PRIORITY),
             "operation_profiles_tracked": int(len(operation_profiles)),
@@ -2538,11 +3414,15 @@ class QASpecialistAgent:
     def _extract_rl_mutation_strategy(self, scenario: TestScenario) -> str:
         saw_history_seed = False
         for item in list(scenario.assertions or []):
-            value = str(item)
+            value = str(item).strip()
             if value.startswith("rl_mutation:"):
                 strategy = value.split(":", 1)[1].strip()
                 if strategy:
                     return strategy
+            if value.startswith("real_life:"):
+                strategy = value.split(":", 1)[1].strip()
+                if strategy:
+                    return f"real_life_{strategy}"
             if value == "rl_history_seed":
                 saw_history_seed = True
         return "history_seed" if saw_history_seed else "unknown"
@@ -2558,6 +3438,42 @@ class QASpecialistAgent:
         normalized = re.sub(r"_+", "_", normalized).strip("_")
         if not normalized:
             return "scenario check"
+        if normalized.startswith("real_life_"):
+            normalized = normalized[len("real_life_") :]
+        if normalized == "expired_token":
+            return "expired auth token"
+        if normalized == "invalid_token":
+            return "invalid auth token"
+        if normalized == "cross_tenant":
+            return "cross-tenant access attempt"
+        if normalized == "sql_injection_body":
+            return "sql injection payload"
+        if normalized == "unknown_query_param":
+            return "unexpected query parameter payload"
+        if normalized == "required_null":
+            return "required field set to null"
+        if normalized == "performance_baseline":
+            return "performance baseline probe"
+        if normalized == "idempotency_replay":
+            return "idempotency replay probe"
+        if normalized == "retry_on_503":
+            return "retry on 503 probe"
+        if normalized == "timeout_retry":
+            return "timeout retry probe"
+        if normalized == "p95_p99_probe":
+            return "p95/p99 latency probe"
+        if normalized == "bola_probe":
+            return "bola access-control probe"
+        if normalized == "ssrf_probe":
+            return "ssrf payload probe"
+        if normalized == "data_leakage_probe":
+            return "data leakage probe"
+        if normalized == "concurrency_conflict":
+            return "concurrency conflict probe"
+        if normalized == "old_client_compat":
+            return "old-client backward compatibility probe"
+        if normalized == "payload_drift_probe":
+            return "web/mobile payload drift probe"
         if normalized == "missing_auth":
             return "missing auth token"
         if normalized == "invalid_auth":
@@ -2793,6 +3709,20 @@ class QASpecialistAgent:
             op_meta = {}
 
         response_statuses = op_meta.get("response_statuses", [])
+        operation_key = self._operation_key(method, endpoint)
+        operation_requires_auth = operation_key in self._auth_required_ops
+        if (
+            test_type in {TestType.AUTHENTICATION, TestType.AUTHORIZATION}
+            and not operation_requires_auth
+        ):
+            # RL memory can carry stale auth-negative hints from prior runs/specs.
+            # Public operations should not be forced into auth-negative assertions.
+            test_type = TestType.ERROR_HANDLING
+            expected_status = self._pick_non_auth_negative_status_for_operation(
+                op_meta,
+                fallback=400,
+            )
+
         is_auth_seed = test_type in {TestType.AUTHENTICATION, TestType.AUTHORIZATION}
         if isinstance(response_statuses, list) and response_statuses:
             if is_auth_seed and int(expected_status) in AUTH_NEGATIVE_STATUS_CODES:
@@ -2842,12 +3772,23 @@ class QASpecialistAgent:
             params[str(path_name)] = "999999" if expected_status == 404 else "123"
 
         query_names = op_meta.get("query_param_names", []) or []
+        query_param_schemas = (
+            op_meta.get("query_param_schemas", {})
+            if isinstance(op_meta.get("query_param_schemas", {}), dict)
+            else {}
+        )
         if has_params:
             if query_names:
                 for query_name in query_names[:2]:
+                    schema = (
+                        query_param_schemas.get(str(query_name), {})
+                        if isinstance(query_param_schemas.get(str(query_name), {}), dict)
+                        else None
+                    )
                     params[str(query_name)] = self._sample_query_value(
                         str(query_name),
                         expected_status,
+                        schema=schema,
                     )
             elif not params:
                 params["q"] = self._sample_query_value("q", expected_status)
@@ -2869,7 +3810,6 @@ class QASpecialistAgent:
                 expect_negative=expected_status in NEGATIVE_STATUS_CODES,
             )
 
-        operation_key = self._operation_key(method, endpoint)
         headers: Dict[str, str] = {}
         if operation_key in self._auth_required_ops:
             if expected_status in AUTH_NEGATIVE_STATUS_CODES or test_type in {
@@ -2877,9 +3817,9 @@ class QASpecialistAgent:
                 TestType.AUTHORIZATION,
             }:
                 if expected_status == 403:
-                    headers["Authorization"] = "Bearer invalid"
+                    headers["Authorization"] = self._auth_bearer_invalid()
             else:
-                headers["Authorization"] = "Bearer valid_token_123"
+                headers["Authorization"] = self._auth_bearer_valid()
 
         slug = re.sub(r"[^a-zA-Z0-9]+", "_", endpoint).strip("_") or "root"
         name = (
@@ -2955,7 +3895,12 @@ class QASpecialistAgent:
             return body
         return {"name": "sample_value"}
 
-    def _sample_query_value(self, query_name: str, expected_status: int) -> Any:
+    def _sample_query_value(
+        self,
+        query_name: str,
+        expected_status: int,
+        schema: Optional[Dict[str, Any]] = None,
+    ) -> Any:
         qname = str(query_name).lower()
         if expected_status in NEGATIVE_STATUS_CODES:
             if "page" in qname or "offset" in qname:
@@ -2963,6 +3908,30 @@ class QASpecialistAgent:
             if "limit" in qname or "size" in qname:
                 return 999999
             return "'; DROP TABLE users; --"
+        if isinstance(schema, dict):
+            enum_values = schema.get("enum", [])
+            if isinstance(enum_values, list) and enum_values:
+                return enum_values[0]
+            type_name = str(schema.get("type", "")).strip().lower()
+            if type_name == "boolean":
+                return True
+            if type_name == "integer":
+                minimum = schema.get("minimum")
+                maximum = schema.get("maximum")
+                if isinstance(minimum, (int, float)):
+                    value = int(math.ceil(float(minimum)))
+                else:
+                    value = 1 if ("page" in qname or "offset" in qname) else 10
+                if isinstance(maximum, (int, float)):
+                    value = min(value, int(math.floor(float(maximum))))
+                return value
+            if type_name == "number":
+                minimum = schema.get("minimum")
+                maximum = schema.get("maximum")
+                value_num = float(minimum) if isinstance(minimum, (int, float)) else 1.0
+                if isinstance(maximum, (int, float)):
+                    value_num = min(float(value_num), float(maximum))
+                return value_num
         if "page" in qname:
             return 1
         if "limit" in qname or "size" in qname:
@@ -3076,6 +4045,11 @@ class QASpecialistAgent:
             for item in (op_meta.get("query_param_names", []) or [])
             if str(item).strip()
         ]
+        query_param_schemas = (
+            op_meta.get("query_param_schemas", {})
+            if isinstance(op_meta.get("query_param_schemas", {}), dict)
+            else {}
+        )
         required_fields = [
             str(item)
             for item in (op_meta.get("required_fields", []) or [])
@@ -3099,6 +4073,11 @@ class QASpecialistAgent:
         base_expected_status = int(getattr(scenario, "expected_status", 0))
         base_is_auth_negative = self._is_auth_negative_scenario(scenario)
         base_is_method_not_allowed = base_expected_status == 405
+        base_strategy = str(self._extract_rl_mutation_strategy(scenario))
+        if base_strategy.startswith("real_life_"):
+            # Preserve deep real-world probe semantics; avoid mutating into unrelated
+            # static negatives (for example missing-required on retry probes).
+            return []
 
         def enqueue(weight: float, variant: TestScenario) -> None:
             weighted_variants.append((float(weight), variant))
@@ -3237,7 +4216,12 @@ class QASpecialistAgent:
             if boundary_fields:
                 boundary_params = dict(scenario.params or {})
                 for name in boundary_fields[:2]:
-                    boundary_params[name] = self._sample_query_value(name, 400)
+                    schema = (
+                        query_param_schemas.get(str(name), {})
+                        if isinstance(query_param_schemas.get(str(name), {}), dict)
+                        else None
+                    )
+                    boundary_params[name] = self._sample_query_value(name, 400, schema=schema)
                 enqueue(
                     0.98 + risk_boost,
                     self._make_mutation_scenario(
@@ -3272,7 +4256,7 @@ class QASpecialistAgent:
                     )
                 else:
                     invalid_headers = dict(scenario.headers or {})
-                    invalid_headers["Authorization"] = "Bearer invalid"
+                    invalid_headers["Authorization"] = self._auth_bearer_invalid()
                     invalid_headers.pop("authorization", None)
                     invalid_params = dict(path_safe_params)
                     enqueue(
@@ -3289,7 +4273,7 @@ class QASpecialistAgent:
                     )
             else:
                 headers = dict(scenario.headers or {})
-                headers["Authorization"] = "Bearer invalid"
+                headers["Authorization"] = self._auth_bearer_invalid()
                 headers.pop("authorization", None)
                 auth_params = dict(path_safe_params)
                 enqueue(
@@ -3759,6 +4743,26 @@ class QASpecialistAgent:
             remainder -= 1
         return {"stable": stable, "focus": focus, "explore": explore}
 
+    def _compute_auto_scenario_floor_budget(self, *, base_budget: int) -> int:
+        budget = max(1, int(base_budget))
+        if not AUTO_SCENARIO_EXPAND_ENABLED:
+            return budget
+        operation_index = self._operation_index if isinstance(self._operation_index, dict) else {}
+        op_count = int(len(operation_index))
+        if op_count <= 0:
+            return budget
+        auth_ops = int(len(self._auth_required_ops or set()))
+        write_ops = int(
+            sum(
+                1
+                for op_key in operation_index.keys()
+                if str(op_key).split(" ", 1)[0].upper() in {"POST", "PUT", "PATCH", "DELETE"}
+            )
+        )
+        coverage_floor = int(op_count * AUTO_SCENARIO_PER_OPERATION) + max(auth_ops, 0) + max(write_ops, 0)
+        coverage_floor = min(AUTO_SCENARIO_GLOBAL_CAP, max(1, coverage_floor))
+        return max(budget, int(coverage_floor))
+
     def _candidate_portfolio_bucket(
         self,
         *,
@@ -3885,6 +4889,7 @@ class QASpecialistAgent:
                 }
             )
 
+        all_candidates = list(candidates)
         selected: List[TestScenario] = []
         selection_trace: List[Dict[str, Any]] = []
         endpoint_counter: Counter[str] = Counter()
@@ -3955,9 +4960,13 @@ class QASpecialistAgent:
         # when available, so policy doesn't collapse into one class of tests.
         core_types = [
             TestType.AUTHENTICATION.value,
+            TestType.AUTHORIZATION.value,
             TestType.INPUT_VALIDATION.value,
             TestType.ERROR_HANDLING.value,
             TestType.BOUNDARY_TESTING.value,
+            TestType.SECURITY.value,
+            TestType.PERFORMANCE.value,
+            TestType.INTEGRATION.value,
         ]
         for core_type in core_types:
             if len(selected) >= int(self.max_scenarios):
@@ -3989,6 +4998,56 @@ class QASpecialistAgent:
                         "endpoint": chosen["endpoint_key"],
                         "fingerprint": fp,
                         "selection_reason": "core_type_coverage",
+                        "score": round(float(parts["score"]), 4),
+                        "expected_reward": round(float(parts["expected_reward"]), 4),
+                        "uncertainty": round(float(parts["uncertainty"]), 4),
+                        "exploration_bonus": round(float(parts["exploration_bonus"]), 4),
+                        "failure_focus_bonus": round(float(parts["failure_focus_bonus"]), 4),
+                        "historical_reward": round(float(parts["historical_reward"]), 4),
+                        "novelty_bonus": round(float(chosen["novelty_bonus"]), 4),
+                        "diversity_penalty": 0.0,
+                    }
+                )
+            candidates = [item for item in candidates if item["fingerprint"] != fp]
+
+        # Real-life guardrail: keep at least one selected scenario for each
+        # critical real-world probe strategy when available in the candidate pool.
+        real_life_coverage_counts: Dict[str, int] = {
+            strategy: 0 for strategy in REAL_LIFE_MANDATORY_STRATEGIES
+        }
+        for strategy in REAL_LIFE_MANDATORY_STRATEGIES:
+            matching = [
+                item
+                for item in candidates
+                if (
+                    item["fingerprint"] not in selected_fingerprints
+                    and str(self._extract_rl_mutation_strategy(item["scenario"])) == strategy
+                )
+            ]
+            if not matching:
+                continue
+            chosen = max(
+                matching,
+                key=lambda item: float(item["score_parts"].get("score", 0.0)),
+            )
+            fp = chosen["fingerprint"]
+            scenario = chosen["scenario"]
+            selected.append(scenario)
+            selected_fingerprints.add(fp)
+            real_life_coverage_counts[strategy] = (
+                int(real_life_coverage_counts.get(strategy, 0)) + 1
+            )
+            endpoint_counter[chosen["endpoint_key"]] += 1
+            type_counter[chosen["type_key"]] += 1
+            if len(selection_trace) < SELECTION_TRACE_LIMIT:
+                parts = chosen["score_parts"]
+                selection_trace.append(
+                    {
+                        "name": scenario.name,
+                        "test_type": chosen["type_key"],
+                        "endpoint": chosen["endpoint_key"],
+                        "fingerprint": fp,
+                        "selection_reason": "real_life_coverage",
                         "score": round(float(parts["score"]), 4),
                         "expected_reward": round(float(parts["expected_reward"]), 4),
                         "uncertainty": round(float(parts["uncertainty"]), 4),
@@ -4051,12 +5110,12 @@ class QASpecialistAgent:
                 candidates = [item for item in candidates if item["fingerprint"] != fp]
 
         uncertainty_values = [
-            float(item["score_parts"].get("uncertainty", 0.0)) for item in candidates
+            float(item["score_parts"].get("uncertainty", 0.0)) for item in all_candidates
         ]
         uncertainty_threshold = self._compute_uncertainty_threshold(uncertainty_values)
-        uncertain_candidates = [
+        uncertain_candidates_all = [
             item
-            for item in candidates
+            for item in all_candidates
             if float(item["score_parts"].get("uncertainty", 0.0)) >= uncertainty_threshold
             and float(item["score_parts"].get("uncertainty", 0.0)) > 0.0
             and (
@@ -4066,8 +5125,25 @@ class QASpecialistAgent:
                 or float(item.get("historical_avg_reward", 0.0)) < 0.55
             )
         ]
-        effective_budget = max(int(self.max_scenarios), len(uncertain_candidates), len(selected))
-        budget_expanded = effective_budget > int(self.max_scenarios)
+        uncertain_fingerprints = {
+            str(item.get("fingerprint", "")) for item in uncertain_candidates_all
+        }
+        uncertain_candidates = [
+            item
+            for item in candidates
+            if str(item.get("fingerprint", "")) in uncertain_fingerprints
+        ]
+        uncertain_target_count = int(len(uncertain_candidates_all))
+        base_budget = int(self.max_scenarios)
+        auto_floor_budget = self._compute_auto_scenario_floor_budget(base_budget=base_budget)
+        effective_budget = max(
+            base_budget,
+            int(auto_floor_budget),
+            int(uncertain_target_count),
+            len(selected),
+        )
+        budget_expanded = effective_budget > base_budget
+        auto_budget_expanded = int(auto_floor_budget) > base_budget
 
         if uncertain_candidates:
             uncertain_sorted = sorted(
@@ -4249,20 +5325,22 @@ class QASpecialistAgent:
             trace_item["mutation_strategy"] = self._extract_rl_mutation_strategy(scenario)
             trace_item["history_seeded"] = bool(self._is_history_seeded_scenario(scenario))
         self._last_selection_trace = selection_trace
+        uncertain_selected_total = int(
+            sum(1 for fp in selected_fingerprints if str(fp) in uncertain_fingerprints)
+        )
         self._last_selection_summary = {
-            "base_max_scenarios": int(self.max_scenarios),
+            "base_max_scenarios": int(base_budget),
+            "auto_floor_budget": int(auto_floor_budget),
+            "auto_budget_expanded": bool(auto_budget_expanded),
+            "auto_expand_enabled": bool(AUTO_SCENARIO_EXPAND_ENABLED),
+            "auto_min_per_operation": int(AUTO_SCENARIO_PER_OPERATION),
+            "auto_budget_cap": int(AUTO_SCENARIO_GLOBAL_CAP),
             "effective_budget": int(effective_budget),
             "budget_expanded_for_uncertainty": bool(budget_expanded),
             "uncertainty_quantile": float(UNCERTAINTY_COVERAGE_QUANTILE),
             "uncertainty_threshold": float(uncertainty_threshold),
-            "uncertain_candidate_count": int(len(uncertain_candidates)),
-            "uncertain_selected_count": int(
-                sum(
-                    1
-                    for item in selection_trace
-                    if item.get("selection_reason") == "uncertainty_coverage"
-                )
-            ),
+            "uncertain_candidate_count": int(uncertain_target_count),
+            "uncertain_selected_count": int(uncertain_selected_total),
             "novelty_target": int(novelty_target),
             "novel_selected_count": int(final_novel_selected_count),
             "portfolio_policy": {
@@ -4271,6 +5349,13 @@ class QASpecialistAgent:
                 "explore_ratio": PORTFOLIO_EXPLORE_RATIO,
                 "targets": {k: int(v) for k, v in portfolio_targets.items()},
                 "selected": {k: int(v) for k, v in bucket_counts.items()},
+            },
+            "real_life_mandatory_strategies": list(REAL_LIFE_MANDATORY_STRATEGIES),
+            "real_life_mandatory_selected": int(sum(real_life_coverage_counts.values())),
+            "real_life_mandatory_breakdown": {
+                key: int(value)
+                for key, value in real_life_coverage_counts.items()
+                if int(value) > 0
             },
         }
         self.learning_state["selection_trace"] = list(selection_trace)
@@ -4458,6 +5543,8 @@ class QASpecialistAgent:
         novel_count = 0
         redundant_easy_pass_count = 0
         unsafe_action_blocked_count = 0
+        security_surface_count = 0
+        security_signal_count = 0
         for scenario, result in zip(scenarios, results):
             expected = int(result.expected_status)
             fingerprint = self._scenario_fingerprint(scenario)
@@ -4492,6 +5579,19 @@ class QASpecialistAgent:
                 if contract_valid_raw is not None
                 else None
             )
+            taxonomy = (
+                verification.get("failure_taxonomy", {})
+                if isinstance(verification.get("failure_taxonomy", {}), dict)
+                else {}
+            )
+            taxonomy_category = str(taxonomy.get("category", "") or "").strip().lower()
+            scenario_test_type = str(result.test_type or "").strip().lower()
+            is_security_surface = (
+                scenario_test_type in SECURITY_FOCUSED_TEST_TYPES
+                or taxonomy_category in SECURITY_SIGNAL_CATEGORIES
+            )
+            if is_security_surface:
+                security_surface_count += 1
             if not seen_before:
                 novel_count += 1
 
@@ -4509,6 +5609,8 @@ class QASpecialistAgent:
                     decision_reward = 0.65 if not seen_before else 0.22
                 else:
                     decision_reward = 0.50 if not seen_before else 0.20
+                if is_security_surface:
+                    decision_reward += 0.08 if not seen_before else 0.04
                 if seen_before:
                     redundant_easy_pass_count += 1
                     decision_reward -= 0.08
@@ -4519,12 +5621,17 @@ class QASpecialistAgent:
                     decision_reward = 0.95
                 else:
                     decision_reward = -1.10
+                if is_security_surface:
+                    decision_reward += 0.15
+                    security_signal_count += 1
 
             if corrected_expectation:
                 # Corrected expectations indicate expectation drift; keep as suspect.
                 decision_reward -= 0.15
             if contract_valid is False:
                 decision_reward -= 0.35
+            if taxonomy_category in SECURITY_SIGNAL_CATEGORIES:
+                decision_reward += 0.12
 
             if not seen_before and decision_reward > 0:
                 decision_reward += 0.15
@@ -4565,6 +5672,11 @@ class QASpecialistAgent:
         novelty_success_ratio = novel_positive_count / max(1, novel_count)
         redundancy_ratio = redundant_easy_pass_count / total
         unsafe_action_ratio = unsafe_action_blocked_count / total
+        security_signal_ratio = (
+            security_signal_count / float(max(1, security_surface_count))
+            if security_surface_count > 0
+            else 0.0
+        )
         repro_list = [
             item for item in (repro_artifacts or [])
             if isinstance(item, dict)
@@ -4590,6 +5702,7 @@ class QASpecialistAgent:
             + 0.30 * informative_failure_ratio
             + 0.18 * novelty_success_ratio
             + 0.14 * reproducible_failure_ratio
+            + 0.08 * security_signal_ratio
             - 0.10 * latency_penalty
             - 0.20 * redundancy_ratio
             - 0.20 * unsafe_action_ratio
@@ -4608,6 +5721,7 @@ class QASpecialistAgent:
                 "informative_failure_component": round(0.30 * informative_failure_ratio, 4),
                 "novelty_component": round(0.18 * novelty_success_ratio, 4),
                 "reproducible_failure_component": round(0.14 * reproducible_failure_ratio, 4),
+                "security_signal_component": round(0.08 * security_signal_ratio, 4),
                 "latency_penalty_component": round(-0.10 * latency_penalty, 4),
                 "redundancy_penalty_component": round(-0.20 * redundancy_ratio, 4),
                 "unsafe_action_penalty_component": round(-0.20 * unsafe_action_ratio, 4),
@@ -4620,6 +5734,7 @@ class QASpecialistAgent:
             "redundancy_ratio": round(redundancy_ratio, 4),
             "reproducible_failure_ratio": round(reproducible_failure_ratio, 4),
             "unsafe_action_ratio": round(unsafe_action_ratio, 4),
+            "security_signal_ratio": round(security_signal_ratio, 4),
             "penalized_decisions": penalties,
             "rewarded_decisions": rewards,
             "decision_signals": [asdict(signal) for signal in signals],
@@ -5041,6 +6156,7 @@ class QASpecialistAgent:
                 path_param_names = set(PATH_PARAM_PATTERN.findall(path))
                 path_param_schemas: Dict[str, Dict[str, Any]] = {}
                 query_param_names: List[str] = []
+                query_param_schemas: Dict[str, Dict[str, Any]] = {}
                 for param in merged_parameters:
                     if not isinstance(param, dict):
                         continue
@@ -5055,6 +6171,9 @@ class QASpecialistAgent:
                             path_param_schemas[name] = deepcopy(schema)
                     elif location == "query":
                         query_param_names.append(name)
+                        schema = self._resolve_refs(spec, param.get("schema", {}))
+                        if isinstance(schema, dict):
+                            query_param_schemas[name] = deepcopy(schema)
 
                 index[self._operation_key(str(method).upper(), path)] = {
                     "request_schema": request_schema,
@@ -5064,6 +6183,7 @@ class QASpecialistAgent:
                     "path_param_names": sorted(path_param_names),
                     "path_param_schemas": path_param_schemas,
                     "query_param_names": sorted(dict.fromkeys(query_param_names)),
+                    "query_param_schemas": query_param_schemas,
                     "auth_required": bool(self._operation_key(str(method).upper(), path) in self._auth_required_ops),
                 }
         return index
@@ -5244,6 +6364,671 @@ class QASpecialistAgent:
             return int(sorted(happy_codes)[0])
         return 201 if str(method).upper() == "POST" else 200
 
+    def _pick_negative_status_for_operation(
+        self,
+        op_meta: Dict[str, Any],
+        *,
+        preferred: Optional[List[int]] = None,
+        fallback: int = 400,
+    ) -> int:
+        response_statuses = op_meta.get("response_statuses", [])
+        documented: List[int] = []
+        if isinstance(response_statuses, list):
+            for raw in response_statuses:
+                try:
+                    code = int(raw)
+                except Exception:
+                    continue
+                if 400 <= code < 600:
+                    documented.append(code)
+        if documented:
+            preferred_list = preferred or []
+            for code in preferred_list:
+                if int(code) in documented:
+                    return int(code)
+            return int(sorted(documented)[0])
+        return int(fallback)
+
+    def _pick_non_auth_negative_status_for_operation(
+        self,
+        op_meta: Dict[str, Any],
+        *,
+        fallback: int = 400,
+    ) -> int:
+        response_statuses = op_meta.get("response_statuses", [])
+        documented: List[int] = []
+        if isinstance(response_statuses, list):
+            for raw in response_statuses:
+                try:
+                    code = int(raw)
+                except Exception:
+                    continue
+                if 400 <= code < 600 and code not in AUTH_NEGATIVE_STATUS_CODES:
+                    documented.append(code)
+        if documented:
+            for preferred in (400, 404, 405, 409, 422):
+                if preferred in documented:
+                    return int(preferred)
+            return int(sorted(documented)[0])
+        return int(fallback)
+
+    def _inject_real_life_guardrail_scenarios(
+        self,
+        scenarios: List[TestScenario],
+    ) -> tuple[List[TestScenario], Dict[str, Any]]:
+        base = list(scenarios or [])
+        if not isinstance(self._operation_index, dict) or not self._operation_index:
+            return base, {
+                "max_added": 0,
+                "added_total": 0,
+                "expired_token_added": 0,
+                "invalid_token_added": 0,
+                "cross_tenant_added": 0,
+                "required_null_added": 0,
+                "security_injection_added": 0,
+                "unknown_query_param_added": 0,
+                "performance_baseline_added": 0,
+                "idempotency_replay_added": 0,
+                "retry_on_503_added": 0,
+                "timeout_retry_added": 0,
+                "p95_p99_probe_added": 0,
+                "bola_probe_added": 0,
+                "ssrf_probe_added": 0,
+                "data_leakage_probe_added": 0,
+                "concurrency_conflict_added": 0,
+                "old_client_compat_added": 0,
+                "payload_drift_probe_added": 0,
+            }
+
+        existing_fingerprints = {self._scenario_fingerprint(item) for item in base}
+        existing_names = {str(item.name).strip() for item in base}
+        added = {
+            "expired_token": 0,
+            "invalid_token": 0,
+            "cross_tenant": 0,
+            "required_null": 0,
+            "security_injection": 0,
+            "unknown_query_param": 0,
+            "performance_baseline": 0,
+            "idempotency_replay": 0,
+            "retry_on_503": 0,
+            "timeout_retry": 0,
+            "p95_p99_probe": 0,
+            "bola_probe": 0,
+            "ssrf_probe": 0,
+            "data_leakage_probe": 0,
+            "concurrency_conflict": 0,
+            "old_client_compat": 0,
+            "payload_drift_probe": 0,
+        }
+        max_added = max(8, min(AUTO_SCENARIO_GLOBAL_CAP, int(self.max_scenarios) * 3))
+        added_total = 0
+
+        def _add_candidate(candidate: TestScenario, bucket: str) -> None:
+            nonlocal added_total
+            if added_total >= max_added:
+                return
+            fp = self._scenario_fingerprint(candidate)
+            if fp in existing_fingerprints:
+                return
+            candidate.name = self._dedupe_mutation_name(str(candidate.name), existing_names)
+            existing_names.add(str(candidate.name))
+            existing_fingerprints.add(fp)
+            base.append(candidate)
+            added_total += 1
+            added[bucket] = int(added.get(bucket, 0)) + 1
+
+        for operation_key in sorted(self._operation_index.keys()):
+            if added_total >= max_added:
+                break
+            op_text = str(operation_key).strip()
+            if " " not in op_text:
+                continue
+            method, endpoint = op_text.split(" ", 1)
+            method = str(method).upper().strip()
+            endpoint = str(endpoint).strip()
+            op_meta = self._operation_index.get(operation_key, {})
+            if not isinstance(op_meta, dict):
+                op_meta = {}
+            auth_required = bool(operation_key in self._auth_required_ops)
+
+            path_params: Dict[str, Any] = {}
+            for path_name in list(op_meta.get("path_param_names", []) or []):
+                pname = str(path_name).strip()
+                if pname:
+                    path_params[pname] = "123"
+            query_params: Dict[str, Any] = {}
+            query_param_schemas = (
+                op_meta.get("query_param_schemas", {})
+                if isinstance(op_meta.get("query_param_schemas", {}), dict)
+                else {}
+            )
+            for query_name in list(op_meta.get("query_param_names", []) or [])[:2]:
+                qname = str(query_name).strip()
+                if qname:
+                    schema = (
+                        query_param_schemas.get(qname, {})
+                        if isinstance(query_param_schemas.get(qname, {}), dict)
+                        else None
+                    )
+                    query_params[qname] = self._sample_query_value(qname, 200, schema=schema)
+            scenario_params: Dict[str, Any] = dict(path_params)
+            scenario_params.update(query_params)
+
+            base_headers: Dict[str, str] = {}
+            if auth_required:
+                base_headers["Authorization"] = self._auth_bearer_valid()
+
+            request_schema = op_meta.get("request_schema", {})
+            if not isinstance(request_schema, dict):
+                request_schema = {}
+            properties = request_schema.get("properties", {})
+            if not isinstance(properties, dict):
+                properties = {}
+            required_fields = [
+                str(item).strip()
+                for item in list(op_meta.get("required_fields", []) or [])
+                if str(item).strip()
+            ]
+            seed_body = (
+                self._build_seed_body_from_operation_meta(op_meta, expect_negative=False)
+                if method in {"POST", "PUT", "PATCH"}
+                else None
+            )
+            if not isinstance(seed_body, dict):
+                seed_body = None
+
+            slug = re.sub(r"[^a-zA-Z0-9]+", "_", endpoint).strip("_") or "root"
+            happy_status = self._pick_happy_status_for_operation(method, op_meta)
+            required_only_body: Optional[Dict[str, Any]] = None
+            if isinstance(seed_body, dict) and required_fields:
+                compact_body = {
+                    str(field): deepcopy(seed_body.get(str(field)))
+                    for field in required_fields
+                    if str(field) in seed_body
+                }
+                if compact_body:
+                    required_only_body = compact_body
+
+            if method == "GET" and int(added.get("performance_baseline", 0)) < 6:
+                _add_candidate(
+                    TestScenario(
+                        name=f"test_{method.lower()}_{slug}_performance_baseline",
+                        description=f"Performance baseline for {method} {endpoint} under nominal request shape.",
+                        test_type=TestType.PERFORMANCE,
+                        endpoint=endpoint,
+                        method=method,
+                        headers=dict(base_headers),
+                        params=dict(scenario_params),
+                        expected_status=int(happy_status),
+                        assertions=["real_life:performance_baseline"],
+                    ),
+                    "performance_baseline",
+                )
+
+            if method == "GET" and int(added.get("p95_p99_probe", 0)) < 4:
+                _add_candidate(
+                    TestScenario(
+                        name=f"test_{method.lower()}_{slug}_p95_p99_probe",
+                        description=f"p95/p99 latency profile probe for {method} {endpoint}.",
+                        test_type=TestType.PERFORMANCE,
+                        endpoint=endpoint,
+                        method=method,
+                        headers=dict(base_headers),
+                        params=dict(scenario_params),
+                        expected_status=int(happy_status),
+                        assertions=["real_life:p95_p99_probe"],
+                    ),
+                    "p95_p99_probe",
+                )
+
+            if int(added.get("retry_on_503", 0)) < 8:
+                chaos_headers = dict(base_headers)
+                chaos_headers["X-QA-Chaos"] = self._chaos_mode_once_503()
+                chaos_headers["X-QA-Chaos-Key"] = f"{method}:{endpoint}:retry503"
+                _add_candidate(
+                    TestScenario(
+                        name=f"test_{method.lower()}_{slug}_retry_on_503",
+                        description=f"Retry recovery probe for transient 503 on {method} {endpoint}.",
+                        test_type=TestType.INTEGRATION,
+                        endpoint=endpoint,
+                        method=method,
+                        headers=chaos_headers,
+                        params=dict(scenario_params),
+                        body=(deepcopy(seed_body) if isinstance(seed_body, dict) else None),
+                        expected_status=int(happy_status),
+                        assertions=["real_life:retry_on_503"],
+                    ),
+                    "retry_on_503",
+                )
+
+            if int(added.get("timeout_retry", 0)) < 8:
+                timeout_headers = dict(base_headers)
+                timeout_headers["X-QA-Chaos"] = self._chaos_mode_once_timeout()
+                timeout_headers["X-QA-Chaos-Key"] = f"{method}:{endpoint}:timeout"
+                _add_candidate(
+                    TestScenario(
+                        name=f"test_{method.lower()}_{slug}_timeout_retry",
+                        description=f"Timeout and retry recovery probe for {method} {endpoint}.",
+                        test_type=TestType.INTEGRATION,
+                        endpoint=endpoint,
+                        method=method,
+                        headers=timeout_headers,
+                        params=dict(scenario_params),
+                        body=(deepcopy(seed_body) if isinstance(seed_body, dict) else None),
+                        expected_status=int(happy_status),
+                        assertions=["real_life:timeout_retry"],
+                    ),
+                    "timeout_retry",
+                )
+
+            if auth_required and int(added.get("expired_token", 0)) < 8:
+                expired_headers = dict(base_headers)
+                expired_headers["Authorization"] = self._auth_bearer_expired()
+                expected_expired = self._pick_negative_status_for_operation(
+                    op_meta,
+                    preferred=[401, 403],
+                    fallback=401,
+                )
+                _add_candidate(
+                    TestScenario(
+                        name=f"test_{method.lower()}_{slug}_auth_expired_token",
+                        description=f"Token expiry probe for {method} {endpoint}.",
+                        test_type=TestType.AUTHENTICATION,
+                        endpoint=endpoint,
+                        method=method,
+                        headers=expired_headers,
+                        params=dict(scenario_params),
+                        body=(deepcopy(seed_body) if isinstance(seed_body, dict) else None),
+                        expected_status=int(expected_expired),
+                        assertions=["real_life:expired_token"],
+                    ),
+                    "expired_token",
+                )
+
+            if auth_required and int(added.get("invalid_token", 0)) < 8:
+                invalid_headers = dict(base_headers)
+                invalid_headers["Authorization"] = self._auth_bearer_invalid()
+                expected_invalid = self._pick_negative_status_for_operation(
+                    op_meta,
+                    preferred=[401, 403],
+                    fallback=401,
+                )
+                _add_candidate(
+                    TestScenario(
+                        name=f"test_{method.lower()}_{slug}_auth_invalid_token",
+                        description=f"Invalid token probe for {method} {endpoint}.",
+                        test_type=TestType.AUTHENTICATION,
+                        endpoint=endpoint,
+                        method=method,
+                        headers=invalid_headers,
+                        params=dict(scenario_params),
+                        body=(deepcopy(seed_body) if isinstance(seed_body, dict) else None),
+                        expected_status=int(expected_invalid),
+                        assertions=["real_life:invalid_token"],
+                    ),
+                    "invalid_token",
+                )
+
+            if auth_required and int(added.get("cross_tenant", 0)) < 6:
+                tenant_headers = dict(base_headers)
+                tenant_headers["X-Tenant-Id"] = "unauthorized_tenant"
+                expected_authz = self._pick_negative_status_for_operation(
+                    op_meta,
+                    preferred=[403, 401],
+                    fallback=403,
+                )
+                _add_candidate(
+                    TestScenario(
+                        name=f"test_{method.lower()}_{slug}_cross_tenant_access",
+                        description=f"Cross-tenant authorization probe for {method} {endpoint}.",
+                        test_type=TestType.AUTHORIZATION,
+                        endpoint=endpoint,
+                        method=method,
+                        headers=tenant_headers,
+                        params=dict(scenario_params),
+                        body=(deepcopy(seed_body) if isinstance(seed_body, dict) else None),
+                        expected_status=int(expected_authz),
+                        assertions=["real_life:cross_tenant"],
+                    ),
+                    "cross_tenant",
+                )
+
+            if auth_required and path_params and int(added.get("bola_probe", 0)) < 8:
+                bola_params = dict(scenario_params)
+                for param_name in list(op_meta.get("path_param_names", []) or []):
+                    pname = str(param_name).strip()
+                    if pname:
+                        bola_params[pname] = "other_tenant_resource"
+                expected_bola = self._pick_negative_status_for_operation(
+                    op_meta,
+                    preferred=[403, 404, 401],
+                    fallback=403,
+                )
+                _add_candidate(
+                    TestScenario(
+                        name=f"test_{method.lower()}_{slug}_bola_probe",
+                        description=f"BOLA access-control probe for {method} {endpoint}.",
+                        test_type=TestType.SECURITY,
+                        endpoint=endpoint,
+                        method=method,
+                        headers=dict(base_headers),
+                        params=bola_params,
+                        body=(deepcopy(seed_body) if isinstance(seed_body, dict) else None),
+                        expected_status=int(expected_bola),
+                        assertions=["real_life:bola_probe"],
+                    ),
+                    "bola_probe",
+                )
+
+            if auth_required and int(added.get("data_leakage_probe", 0)) < 8:
+                leak_headers = dict(base_headers)
+                leak_headers["Authorization"] = self._auth_bearer_invalid()
+                expected_leakage = self._pick_negative_status_for_operation(
+                    op_meta,
+                    preferred=[401, 403],
+                    fallback=401,
+                )
+                _add_candidate(
+                    TestScenario(
+                        name=f"test_{method.lower()}_{slug}_data_leakage_probe",
+                        description=f"Unauthorized response data-leakage probe for {method} {endpoint}.",
+                        test_type=TestType.SECURITY,
+                        endpoint=endpoint,
+                        method=method,
+                        headers=leak_headers,
+                        params=dict(scenario_params),
+                        body=(deepcopy(seed_body) if isinstance(seed_body, dict) else None),
+                        expected_status=int(expected_leakage),
+                        assertions=["real_life:data_leakage_probe"],
+                    ),
+                    "data_leakage_probe",
+                )
+
+            if (
+                method in {"POST", "PUT", "PATCH"}
+                and isinstance(seed_body, dict)
+                and int(added.get("security_injection", 0)) < 8
+            ):
+                injection_body = deepcopy(seed_body)
+                string_fields = [
+                    str(key)
+                    for key, schema in properties.items()
+                    if isinstance(schema, dict)
+                    and str(schema.get("type", "string")).lower() == "string"
+                ]
+                target_field = ""
+                for key in string_fields:
+                    if key in injection_body:
+                        target_field = key
+                        break
+                if not target_field and string_fields:
+                    target_field = string_fields[0]
+                if target_field:
+                    injection_body[target_field] = "'; DROP TABLE users; --"
+                    expected_security = self._pick_negative_status_for_operation(
+                        op_meta,
+                        preferred=[400, 422, 403],
+                        fallback=400,
+                    )
+                    _add_candidate(
+                        TestScenario(
+                            name=f"test_{method.lower()}_{slug}_security_sql_injection",
+                            description=f"SQL-injection style payload probe for {method} {endpoint}.",
+                            test_type=TestType.SECURITY,
+                            endpoint=endpoint,
+                            method=method,
+                            headers=dict(base_headers),
+                            params=dict(scenario_params),
+                            body=injection_body,
+                            expected_status=int(expected_security),
+                            assertions=["real_life:sql_injection_body"],
+                    ),
+                        "security_injection",
+                    )
+
+            if (
+                method in {"POST", "PUT", "PATCH"}
+                and isinstance(seed_body, dict)
+                and int(added.get("ssrf_probe", 0)) < 8
+            ):
+                ssrf_body = deepcopy(seed_body)
+                url_like_fields = [
+                    str(key)
+                    for key, schema in properties.items()
+                    if isinstance(schema, dict)
+                    and str(schema.get("type", "string")).lower() == "string"
+                    and any(
+                        marker in str(key).strip().lower()
+                        for marker in ("url", "uri", "callback", "webhook", "endpoint", "redirect")
+                    )
+                ]
+                ssrf_target = ""
+                for key in url_like_fields:
+                    if key in ssrf_body:
+                        ssrf_target = key
+                        break
+                if not ssrf_target:
+                    for key, value in ssrf_body.items():
+                        if isinstance(value, str):
+                            ssrf_target = str(key)
+                            break
+                if ssrf_target:
+                    ssrf_body[ssrf_target] = self._ssrf_probe_url()
+                    expected_ssrf = self._pick_negative_status_for_operation(
+                        op_meta,
+                        preferred=[400, 403, 422],
+                        fallback=400,
+                    )
+                    _add_candidate(
+                        TestScenario(
+                            name=f"test_{method.lower()}_{slug}_ssrf_probe",
+                            description=f"SSRF payload probe for {method} {endpoint}.",
+                            test_type=TestType.SECURITY,
+                            endpoint=endpoint,
+                            method=method,
+                            headers=dict(base_headers),
+                            params=dict(scenario_params),
+                            body=ssrf_body,
+                            expected_status=int(expected_ssrf),
+                            assertions=["real_life:ssrf_probe"],
+                        ),
+                        "ssrf_probe",
+                    )
+
+            if (
+                method in {"POST", "PUT", "PATCH"}
+                and isinstance(seed_body, dict)
+                and required_fields
+                and int(added.get("required_null", 0)) < 8
+            ):
+                required_null_body = deepcopy(seed_body)
+                target_required = str(required_fields[0])
+                required_null_body[target_required] = None
+                expected_required_null = self._pick_negative_status_for_operation(
+                    op_meta,
+                    preferred=[400, 422],
+                    fallback=400,
+                )
+                _add_candidate(
+                    TestScenario(
+                        name=f"test_{method.lower()}_{slug}_required_null",
+                        description=f"Set required field `{target_required}` to null for {method} {endpoint}.",
+                        test_type=TestType.INPUT_VALIDATION,
+                        endpoint=endpoint,
+                        method=method,
+                        headers=dict(base_headers),
+                        params=dict(scenario_params),
+                        body=required_null_body,
+                        expected_status=int(expected_required_null),
+                        assertions=["real_life:required_null"],
+                    ),
+                    "required_null",
+                )
+
+            if method == "GET" and int(added.get("unknown_query_param", 0)) < 8:
+                query_fuzz_params = dict(scenario_params)
+                query_fuzz_params["unexpected_q"] = "' OR 1=1 --"
+                expected_query_fuzz = self._pick_negative_status_for_operation(
+                    op_meta,
+                    preferred=[400, 422, 403],
+                    fallback=400,
+                )
+                _add_candidate(
+                    TestScenario(
+                        name=f"test_{method.lower()}_{slug}_unknown_query_param",
+                        description=f"Unexpected query parameter probe for {method} {endpoint}.",
+                        test_type=TestType.SECURITY,
+                        endpoint=endpoint,
+                        method=method,
+                        headers=dict(base_headers),
+                        params=query_fuzz_params,
+                        expected_status=int(expected_query_fuzz),
+                        assertions=["real_life:unknown_query_param"],
+                    ),
+                    "unknown_query_param",
+                )
+
+            if (
+                method == "POST"
+                and isinstance(seed_body, dict)
+                and int(added.get("idempotency_replay", 0)) < 8
+            ):
+                replay_body = deepcopy(seed_body)
+                expected_replay_status = self._pick_negative_status_for_operation(
+                    op_meta,
+                    preferred=[409],
+                    fallback=int(happy_status),
+                )
+                if int(expected_replay_status) == 409:
+                    duplicate_field = ""
+                    if "name" in replay_body:
+                        duplicate_field = "name"
+                    else:
+                        for key, value in replay_body.items():
+                            if isinstance(value, str):
+                                duplicate_field = str(key)
+                                break
+                    if duplicate_field:
+                        replay_body[duplicate_field] = "duplicate"
+                    else:
+                        expected_replay_status = int(happy_status)
+
+                _add_candidate(
+                    TestScenario(
+                        name=f"test_{method.lower()}_{slug}_idempotency_replay",
+                        description=(
+                            f"Replay identical {method} request to probe duplicate handling/idempotency behavior."
+                        ),
+                        test_type=TestType.INTEGRATION,
+                        endpoint=endpoint,
+                        method=method,
+                        headers=dict(base_headers),
+                        params=dict(scenario_params),
+                        body=replay_body,
+                        expected_status=int(expected_replay_status),
+                        assertions=["real_life:idempotency_replay"],
+                    ),
+                    "idempotency_replay",
+                )
+
+            if (
+                method in {"POST", "PUT", "PATCH"}
+                and isinstance(seed_body, dict)
+                and int(added.get("concurrency_conflict", 0)) < 8
+            ):
+                concurrency_headers = dict(base_headers)
+                concurrency_headers["X-QA-Chaos"] = self._chaos_mode_concurrency_conflict()
+                concurrency_headers["X-QA-Chaos-Key"] = f"{method}:{endpoint}:conflict"
+                _add_candidate(
+                    TestScenario(
+                        name=f"test_{method.lower()}_{slug}_concurrency_conflict",
+                        description=f"Concurrent update conflict probe for {method} {endpoint}.",
+                        test_type=TestType.INTEGRATION,
+                        endpoint=endpoint,
+                        method=method,
+                        headers=concurrency_headers,
+                        params=dict(scenario_params),
+                        body=deepcopy(seed_body),
+                        expected_status=409,
+                        assertions=["real_life:concurrency_conflict"],
+                    ),
+                    "concurrency_conflict",
+                )
+
+            if (
+                method in {"POST", "PUT", "PATCH"}
+                and isinstance(seed_body, dict)
+                and int(added.get("old_client_compat", 0)) < 8
+            ):
+                compat_headers = dict(base_headers)
+                compat_headers["X-Client-Version"] = "1.0"
+                compat_body = (
+                    deepcopy(required_only_body)
+                    if isinstance(required_only_body, dict) and required_only_body
+                    else deepcopy(seed_body)
+                )
+                _add_candidate(
+                    TestScenario(
+                        name=f"test_{method.lower()}_{slug}_old_client_compat",
+                        description=f"Backward compatibility probe for legacy client payloads on {method} {endpoint}.",
+                        test_type=TestType.INTEGRATION,
+                        endpoint=endpoint,
+                        method=method,
+                        headers=compat_headers,
+                        params=dict(scenario_params),
+                        body=compat_body,
+                        expected_status=int(happy_status),
+                        assertions=["real_life:old_client_compat"],
+                    ),
+                    "old_client_compat",
+                )
+
+            if (
+                method in {"POST", "PUT", "PATCH"}
+                and isinstance(seed_body, dict)
+                and int(added.get("payload_drift_probe", 0)) < 8
+            ):
+                drift_headers = dict(base_headers)
+                drift_headers["X-Client-Platform"] = "web"
+                _add_candidate(
+                    TestScenario(
+                        name=f"test_{method.lower()}_{slug}_payload_drift_probe",
+                        description=f"Web/mobile payload drift compatibility probe for {method} {endpoint}.",
+                        test_type=TestType.INTEGRATION,
+                        endpoint=endpoint,
+                        method=method,
+                        headers=drift_headers,
+                        params=dict(scenario_params),
+                        body=deepcopy(seed_body),
+                        expected_status=int(happy_status),
+                        assertions=["real_life:payload_drift_probe"],
+                    ),
+                    "payload_drift_probe",
+                )
+
+        return base, {
+            "max_added": int(max_added),
+            "added_total": int(added_total),
+            "expired_token_added": int(added.get("expired_token", 0)),
+            "invalid_token_added": int(added.get("invalid_token", 0)),
+            "cross_tenant_added": int(added.get("cross_tenant", 0)),
+            "required_null_added": int(added.get("required_null", 0)),
+            "security_injection_added": int(added.get("security_injection", 0)),
+            "unknown_query_param_added": int(added.get("unknown_query_param", 0)),
+            "performance_baseline_added": int(added.get("performance_baseline", 0)),
+            "idempotency_replay_added": int(added.get("idempotency_replay", 0)),
+            "retry_on_503_added": int(added.get("retry_on_503", 0)),
+            "timeout_retry_added": int(added.get("timeout_retry", 0)),
+            "p95_p99_probe_added": int(added.get("p95_p99_probe", 0)),
+            "bola_probe_added": int(added.get("bola_probe", 0)),
+            "ssrf_probe_added": int(added.get("ssrf_probe", 0)),
+            "data_leakage_probe_added": int(added.get("data_leakage_probe", 0)),
+            "concurrency_conflict_added": int(added.get("concurrency_conflict", 0)),
+            "old_client_compat_added": int(added.get("old_client_compat", 0)),
+            "payload_drift_probe_added": int(added.get("payload_drift_probe", 0)),
+        }
+
     def _build_happy_path_guardrail_scenario(
         self,
         *,
@@ -5265,10 +7050,24 @@ class QASpecialistAgent:
             pname = str(path_name).strip()
             if pname:
                 params[pname] = "123"
+        query_param_schemas = (
+            op_meta.get("query_param_schemas", {})
+            if isinstance(op_meta.get("query_param_schemas", {}), dict)
+            else {}
+        )
         for query_name in list(op_meta.get("query_param_names", []) or [])[:2]:
             qname = str(query_name).strip()
             if qname:
-                params[qname] = self._sample_query_value(qname, expected_status)
+                schema = (
+                    query_param_schemas.get(qname, {})
+                    if isinstance(query_param_schemas.get(qname, {}), dict)
+                    else None
+                )
+                params[qname] = self._sample_query_value(
+                    qname,
+                    expected_status,
+                    schema=schema,
+                )
 
         body: Optional[Dict[str, Any]] = None
         if method in {"POST", "PUT", "PATCH"}:
@@ -5285,7 +7084,7 @@ class QASpecialistAgent:
 
         headers: Dict[str, str] = {}
         if bool(op_meta.get("auth_required", False)):
-            headers["Authorization"] = "Bearer valid_token_123"
+            headers["Authorization"] = self._auth_bearer_valid()
 
         slug = re.sub(r"[^a-zA-Z0-9]+", "_", endpoint).strip("_") or "root"
         name = f"test_{method.lower()}_{slug}_happy_path_guardrail"
@@ -5442,7 +7241,7 @@ class QASpecialistAgent:
                     params[pname] = "123"
             headers: Dict[str, str] = {}
             if bool(op_meta.get("auth_required", False)):
-                headers["Authorization"] = "Bearer valid_token_123"
+                headers["Authorization"] = self._auth_bearer_valid()
 
             slug = re.sub(r"[^a-zA-Z0-9]+", "_", endpoint).strip("_") or "root"
             sequence_probe = TestScenario(
@@ -5663,10 +7462,406 @@ class QASpecialistAgent:
             has_params=bool(has_params),
         )
 
+    def _runtime_cap_error_label(self) -> str:
+        if self.max_runtime_sec is not None:
+            return f"runtime_cap_exceeded_{self.max_runtime_sec}s"
+        return "runtime_cap_exceeded"
+
+    def _remaining_timeout_until_deadline(
+        self,
+        deadline: Optional[float],
+        *,
+        default_timeout: Optional[float] = None,
+        min_timeout: float = 0.05,
+    ) -> Optional[float]:
+        if deadline is None:
+            return float(default_timeout) if default_timeout is not None else None
+
+        remaining_sec = float(deadline) - time.perf_counter()
+        if remaining_sec <= 0.0:
+            raise TimeoutError(self._runtime_cap_error_label())
+
+        if default_timeout is None:
+            return max(float(min_timeout), float(remaining_sec))
+        return max(
+            float(min_timeout),
+            min(float(default_timeout), float(remaining_sec)),
+        )
+
+    def _normalize_runtime_auth_mode(self, value: Any) -> str:
+        mode = str(value or "").strip().lower()
+        if mode in {"none", "bearer", "api_key"}:
+            return mode
+        return "bearer"
+
+    def _normalize_operation_identifier(self, value: Any) -> str:
+        raw = str(value or "").strip()
+        if not raw:
+            return ""
+        parts = raw.split(None, 1)
+        if len(parts) != 2:
+            return ""
+        method = str(parts[0]).strip().upper()
+        endpoint = str(parts[1]).strip()
+        if method.lower() not in HTTP_METHODS:
+            return ""
+        if not endpoint.startswith("/"):
+            endpoint = "/" + endpoint
+        return self._operation_key(method, endpoint)
+
+    def _normalize_report_mode(self, value: Any) -> str:
+        mode = str(value or "full").strip().lower() or "full"
+        if mode in SUPPORTED_REPORT_MODES:
+            return mode
+        return "full"
+
+    def _load_operation_auth_profiles_from_env(self) -> Dict[str, Dict[str, Any]]:
+        raw = str(os.getenv("QA_AUTH_PROFILES_JSON", "")).strip()
+        if not raw:
+            return {}
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            return {}
+        if not isinstance(parsed, dict):
+            return {}
+
+        profiles: Dict[str, Dict[str, Any]] = {}
+        for raw_operation, row in list(parsed.items())[:300]:
+            operation_id = self._normalize_operation_identifier(raw_operation)
+            if not operation_id or not isinstance(row, dict):
+                continue
+            mode_raw = str(row.get("authMode", row.get("mode", "none"))).strip().lower()
+            mode = mode_raw if mode_raw in {"none", "bearer", "api_key"} else "none"
+            profile: Dict[str, Any] = {"authMode": mode}
+            if mode == "bearer":
+                token = str(row.get("bearerToken", "")).strip()
+                if token:
+                    profile["bearerToken"] = token
+            elif mode == "api_key":
+                profile["apiKeyName"] = (
+                    str(row.get("apiKeyName", "")).strip() or self._runtime_api_key_name
+                )
+                profile["apiKeyIn"] = (
+                    "query"
+                    if str(row.get("apiKeyIn", "header")).strip().lower() == "query"
+                    else "header"
+                )
+                api_key_value = str(row.get("apiKeyValue", "")).strip()
+                if api_key_value:
+                    profile["apiKeyValue"] = api_key_value
+            profiles[operation_id] = profile
+        return profiles
+
+    def _load_critical_operations_from_env(self) -> List[str]:
+        raw = str(os.getenv("QA_CRITICAL_OPERATIONS_JSON", "")).strip()
+        if not raw:
+            return []
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            return []
+        if not isinstance(parsed, list):
+            return []
+        out: List[str] = []
+        for item in parsed[:300]:
+            operation_id = self._normalize_operation_identifier(item)
+            if operation_id:
+                out.append(operation_id)
+        return list(dict.fromkeys(out))
+
+    def _load_critical_assertions_from_env(self) -> List[Dict[str, Any]]:
+        raw = str(os.getenv("QA_CRITICAL_ASSERTIONS_JSON", "")).strip()
+        if not raw:
+            return []
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            return []
+        if not isinstance(parsed, list):
+            return []
+
+        out: List[Dict[str, Any]] = []
+        for row in parsed[:300]:
+            if not isinstance(row, dict):
+                continue
+            operation_id = self._normalize_operation_identifier(row.get("operationId", ""))
+            if not operation_id:
+                continue
+            expected_status: Optional[int] = None
+            try:
+                if row.get("expectedStatus") is not None:
+                    expected_status = int(row.get("expectedStatus"))
+            except Exception:
+                expected_status = None
+            allowed_statuses: List[int] = []
+            if isinstance(row.get("allowedStatuses"), list):
+                for status_raw in row.get("allowedStatuses", []):
+                    try:
+                        allowed_statuses.append(int(status_raw))
+                    except Exception:
+                        continue
+            min_pass_count = 1
+            try:
+                min_pass_count = max(1, int(row.get("minPassCount", 1)))
+            except Exception:
+                min_pass_count = 1
+            out.append(
+                {
+                    "operationId": operation_id,
+                    "expectedStatus": expected_status,
+                    "allowedStatuses": sorted(set(allowed_statuses)),
+                    "minPassCount": int(min_pass_count),
+                    "note": str(row.get("note", "")).strip(),
+                }
+            )
+        return out
+
+    def _load_customer_mutation_rules_from_env(self) -> List[Dict[str, Any]]:
+        raw = str(os.getenv("QA_REQUEST_MUTATION_RULES_JSON", "")).strip()
+        if not raw:
+            return []
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            return []
+        if not isinstance(parsed, list):
+            return []
+
+        rules: List[Dict[str, Any]] = []
+        for item in parsed[:200]:
+            if not isinstance(item, dict):
+                continue
+            operation_id = self._normalize_operation_identifier(item.get("operationId"))
+            field_name = str(item.get("fieldName", "")).strip()
+            action = str(item.get("action", "")).strip().lower()
+            request_mode = str(item.get("requestMode", "auto")).strip().lower() or "auto"
+            if (
+                not operation_id
+                or not field_name
+                or action not in CUSTOMER_MUTATION_ALLOWED_ACTIONS
+                or request_mode not in CUSTOMER_MUTATION_ALLOWED_REQUEST_MODES
+            ):
+                continue
+            rules.append(
+                {
+                    "operationId": operation_id,
+                    "requestMode": request_mode,
+                    "fieldName": field_name,
+                    "action": action,
+                    "value": str(item.get("value", "")),
+                    "note": str(item.get("note", "")).strip(),
+                }
+            )
+        return rules
+
+    def _index_customer_mutation_rules(
+        self, rules: List[Dict[str, Any]]
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        indexed: Dict[str, List[Dict[str, Any]]] = {}
+        for item in list(rules or []):
+            if not isinstance(item, dict):
+                continue
+            operation_id = self._normalize_operation_identifier(item.get("operationId"))
+            if not operation_id:
+                continue
+            indexed.setdefault(operation_id, []).append(item)
+        return indexed
+
+    def _select_target_key(
+        self, payload: Dict[str, Any], field_name: str
+    ) -> Optional[str]:
+        if field_name in payload:
+            return field_name
+        lower_target = str(field_name).lower()
+        for key in payload.keys():
+            if str(key).lower() == lower_target:
+                return str(key)
+        return None
+
+    def _apply_customer_mutation_action(
+        self,
+        payload: Dict[str, Any],
+        *,
+        field_name: str,
+        action: str,
+        value: str,
+    ) -> bool:
+        target_key = self._select_target_key(payload, field_name)
+        if action == "delete":
+            if target_key is None:
+                return False
+            payload.pop(target_key, None)
+            return True
+        if action == "set_empty":
+            key = target_key or field_name
+            payload[key] = ""
+            return True
+        if action == "invalid_type":
+            key = target_key or field_name
+            existing = payload.get(key, None)
+            if isinstance(existing, (int, float, bool)):
+                payload[key] = "invalid_type"
+            elif isinstance(existing, list):
+                payload[key] = {"invalid": "type"}
+            elif isinstance(existing, dict):
+                payload[key] = "invalid_type"
+            else:
+                payload[key] = 12345
+            return True
+        if action == "override_value":
+            key = target_key or field_name
+            payload[key] = str(value)
+            return True
+        return False
+
+    def _apply_customer_mutation_rules_for_execution(
+        self,
+        scenario: TestScenario,
+        *,
+        method: str,
+        op_meta: Dict[str, Any],
+    ) -> None:
+        if not self._customer_mutation_rules_by_operation:
+            return
+        try:
+            expected_status = int(getattr(scenario, "expected_status", 0) or 0)
+        except Exception:
+            expected_status = 0
+        test_type_value = str(
+            getattr(getattr(scenario, "test_type", None), "value", getattr(scenario, "test_type", ""))
+        ).strip().lower()
+        negative_intent = (
+            expected_status >= 400
+            or test_type_value
+            in {
+                "authentication",
+                "authorization",
+                "input_validation",
+                "error_handling",
+                "boundary_testing",
+                "security",
+            }
+        )
+        if not negative_intent:
+            # Customer mutation rules are intended for negative probes.
+            # Applying them to happy-path scenarios causes false failures.
+            return
+        operation_key = self._operation_key(method, str(scenario.endpoint))
+        rules = list(self._customer_mutation_rules_by_operation.get(operation_key, []))
+        if not rules:
+            return
+
+        path_names = set(PATH_PARAM_PATTERN.findall(str(scenario.endpoint or "")))
+        query_names = {
+            str(item).strip()
+            for item in list(op_meta.get("query_param_names", []) or [])
+            if str(item).strip()
+        }
+        body = deepcopy(scenario.body) if isinstance(scenario.body, dict) else {}
+        params = dict(scenario.params or {})
+        headers = dict(scenario.headers or {})
+
+        applied: List[str] = []
+        for rule in rules:
+            field_name = str(rule.get("fieldName", "")).strip()
+            action = str(rule.get("action", "")).strip().lower()
+            value = str(rule.get("value", ""))
+            request_mode = str(rule.get("requestMode", "auto")).strip().lower() or "auto"
+            if not field_name or action not in CUSTOMER_MUTATION_ALLOWED_ACTIONS:
+                continue
+
+            target_mode = request_mode
+            if target_mode == "auto":
+                if field_name in body:
+                    target_mode = "body"
+                elif (
+                    field_name in query_names
+                    or field_name in params
+                    or self._select_target_key(params, field_name) is not None
+                ):
+                    target_mode = "query"
+                elif self._select_target_key(headers, field_name) is not None:
+                    target_mode = "header"
+                else:
+                    target_mode = "body" if method in {"POST", "PUT", "PATCH"} else "query"
+
+            changed = False
+            if target_mode == "body":
+                changed = self._apply_customer_mutation_action(
+                    body,
+                    field_name=field_name,
+                    action=action,
+                    value=value,
+                )
+            elif target_mode == "query":
+                if field_name in path_names:
+                    continue
+                changed = self._apply_customer_mutation_action(
+                    params,
+                    field_name=field_name,
+                    action=action,
+                    value=value,
+                )
+            elif target_mode == "header":
+                changed = self._apply_customer_mutation_action(
+                    headers,
+                    field_name=field_name,
+                    action=action,
+                    value=value,
+                )
+
+            if changed:
+                applied.append(f"{action}({field_name})@{target_mode}")
+
+        if applied:
+            scenario.body = body if body else None
+            scenario.params = params
+            scenario.headers = headers
+            assertions = list(scenario.assertions or [])
+            assertions.append("customer_mutation_rules_applied")
+            for item in applied[:8]:
+                assertions.append(f"customer_mutation:{item}")
+            scenario.assertions = assertions
+
+    def _auth_bearer_valid(self) -> str:
+        return str(self.runtime_settings.bearer_valid())
+
+    def _auth_bearer_admin(self) -> str:
+        return str(self.runtime_settings.bearer_admin())
+
+    def _auth_bearer_invalid(self) -> str:
+        return str(self.runtime_settings.bearer_invalid())
+
+    def _auth_bearer_expired(self) -> str:
+        return str(self.runtime_settings.bearer_expired())
+
+    def _auth_token_invalid_markers(self) -> Tuple[str, ...]:
+        invalid_markers = {
+            str(self.runtime_settings.auth_token_invalid).strip().lower(),
+            str(self.runtime_settings.auth_token_expired).strip().lower(),
+            "invalid",
+            "expired",
+        }
+        return tuple(sorted(marker for marker in invalid_markers if marker))
+
+    def _chaos_mode_once_503(self) -> str:
+        return str(self.runtime_settings.chaos_once_503_mode)
+
+    def _chaos_mode_once_timeout(self) -> str:
+        return str(self.runtime_settings.chaos_once_timeout_mode)
+
+    def _chaos_mode_concurrency_conflict(self) -> str:
+        return str(self.runtime_settings.chaos_concurrency_mode)
+
+    def _ssrf_probe_url(self) -> str:
+        return str(self.runtime_settings.ssrf_probe_url)
+
     def _runtime_cap_result(self, scenario: TestScenario) -> ScenarioExecutionResult:
         display_name = self._scenario_display_name(scenario)
         mutation_strategy = self._extract_rl_mutation_strategy(scenario)
         history_seeded = self._is_history_seeded_scenario(scenario)
+        runtime_error = self._runtime_cap_error_label()
         return ScenarioExecutionResult(
             name=str(scenario.name),
             test_type=str(scenario.test_type.value),
@@ -5682,7 +7877,7 @@ class QASpecialistAgent:
             verdict="blocked",
             passed=False,
             duration_ms=0.0,
-            error=f"runtime_cap_exceeded_{self.max_runtime_sec}s",
+            error=runtime_error,
             response_excerpt="",
             verification={
                 "passed": False,
@@ -5698,7 +7893,7 @@ class QASpecialistAgent:
                     "checked": False,
                     "schema_found": False,
                     "valid": None,
-                    "issues": [f"runtime_cap_exceeded_{self.max_runtime_sec}s"],
+                    "issues": [runtime_error],
                 },
             },
             display_name=display_name,
@@ -5751,6 +7946,72 @@ class QASpecialistAgent:
             history_seeded=bool(history_seeded),
         )
 
+    def _environment_preflight_result(
+        self,
+        scenario: TestScenario,
+        *,
+        reason: str,
+    ) -> ScenarioExecutionResult:
+        display_name = self._scenario_display_name(scenario)
+        mutation_strategy = self._extract_rl_mutation_strategy(scenario)
+        history_seeded = self._is_history_seeded_scenario(scenario)
+        error_text = f"environment_preflight_failed:{str(reason or '').strip()}"
+        return ScenarioExecutionResult(
+            name=str(scenario.name),
+            test_type=str(scenario.test_type.value),
+            method=str(scenario.method).upper(),
+            endpoint_template=str(scenario.endpoint),
+            endpoint_resolved=self._resolve_endpoint_path(
+                scenario.endpoint,
+                scenario.params,
+                scenario.expected_status,
+            ),
+            expected_status=int(scenario.expected_status),
+            actual_status=None,
+            verdict="blocked",
+            passed=False,
+            duration_ms=0.0,
+            error=error_text,
+            response_excerpt="",
+            verification={
+                "passed": False,
+                "verdict": "blocked",
+                "status_check": {
+                    "expected_status": int(scenario.expected_status),
+                    "actual_status": None,
+                    "corrected_expected_status": None,
+                    "corrected": False,
+                    "matched": False,
+                },
+                "contract_check": {
+                    "checked": False,
+                    "schema_found": False,
+                    "valid": None,
+                    "issues": [error_text],
+                },
+                "failure_taxonomy": {
+                    "category": "environment_error",
+                    "kind": "env_issue",
+                    "reason": "preflight_connectivity_failed",
+                    "confidence": 0.99,
+                },
+            },
+            display_name=display_name,
+            name_raw=str(scenario.name),
+            mutation_strategy=str(mutation_strategy),
+            history_seeded=bool(history_seeded),
+        )
+
+    def _preflight_live_connectivity(self) -> Tuple[bool, str]:
+        timeout_sec = min(5.0, float(self.runtime_settings.live_request_timeout_sec))
+        with _LiveRequestsAdapter(self.base_url, timeout_sec=timeout_sec) as client:
+            try:
+                response = client.get("/")
+                status_code = int(getattr(response, "status_code", 0) or 0)
+                return True, f"http_status_{status_code}"
+            except Exception as exc:
+                return False, str(exc)
+
     def _is_safe_method_for_profile(self, method: str) -> bool:
         profile = str(self.environment_profile or DEFAULT_ENVIRONMENT_PROFILE).lower()
         normalized_method = str(method or "").upper()
@@ -5759,14 +8020,24 @@ class QASpecialistAgent:
         return normalized_method in {"GET", "HEAD", "OPTIONS"}
 
     def _execute_scenarios(
-        self, spec: Dict[str, Any], scenarios: List[TestScenario]
+        self,
+        spec: Dict[str, Any],
+        scenarios: List[TestScenario],
+        execution_deadline: Optional[float] = None,
     ) -> List[ScenarioExecutionResult]:
         profile = str(self.environment_profile or DEFAULT_ENVIRONMENT_PROFILE).lower()
         if profile == "mock":
             self._execution_isolation_mode = "in_memory_fastapi_testclient"
-            return self._execute_in_isolated_mock(spec, scenarios)
+            return self._execute_in_isolated_mock(
+                spec,
+                scenarios,
+                execution_deadline=execution_deadline,
+            )
         self._execution_isolation_mode = "live_http_base_url"
-        return self._execute_against_live_api(scenarios)
+        return self._execute_against_live_api(
+            scenarios,
+            execution_deadline=execution_deadline,
+        )
 
     def _sync_scenarios_with_corrected_expectations(
         self,
@@ -5778,7 +8049,10 @@ class QASpecialistAgent:
         return list(scenarios or [])
 
     def _execute_in_isolated_mock(
-        self, spec: Dict[str, Any], scenarios: List[TestScenario]
+        self,
+        spec: Dict[str, Any],
+        scenarios: List[TestScenario],
+        execution_deadline: Optional[float] = None,
     ) -> List[ScenarioExecutionResult]:
         # Imported lazily so this module can be used without server startup paths.
         from dynamic_mock_server import DynamicMockServer
@@ -5786,52 +8060,101 @@ class QASpecialistAgent:
         spec_copy = self.output_dir / "openapi_under_test.yaml"
         spec_copy.write_text(yaml.safe_dump(spec, sort_keys=False), encoding="utf-8")
 
-        server = DynamicMockServer(str(spec_copy), host="127.0.0.1", port=0)
+        server = DynamicMockServer(
+            str(spec_copy),
+            host=str(self.runtime_settings.dynamic_mock_host),
+            port=0,
+        )
         results: List[ScenarioExecutionResult] = []
 
         run_started = time.perf_counter()
+        deadline = execution_deadline
+        if deadline is None and self.max_runtime_sec is not None:
+            deadline = run_started + float(self.max_runtime_sec)
         with TestClient(server.app) as client:
             adapter = _TestClientRequestsAdapter(client)
-            for scenario in scenarios:
-                if self.max_runtime_sec is not None:
-                    elapsed = time.perf_counter() - run_started
-                    if elapsed >= float(self.max_runtime_sec):
+            try:
+                for scenario in scenarios:
+                    if deadline is not None and time.perf_counter() >= float(deadline):
                         self._runtime_cap_hit = True
                         self._runtime_skipped_count += 1
                         results.append(self._runtime_cap_result(scenario))
                         continue
-                result = self._execute_one_scenario(adapter, scenario)
-                result = self._apply_failure_triage_and_rerun(
-                    client=adapter,
-                    scenario=scenario,
-                    result=result,
-                )
-                results.append(result)
+                    result = self._execute_one_scenario(
+                        adapter,
+                        scenario,
+                        deadline=deadline,
+                    )
+                    result = self._apply_failure_triage_and_rerun(
+                        client=adapter,
+                        scenario=scenario,
+                        result=result,
+                        deadline=deadline,
+                    )
+                    results.append(result)
+            finally:
+                adapter.close()
 
         return results
 
     def _execute_against_live_api(
-        self, scenarios: List[TestScenario]
+        self,
+        scenarios: List[TestScenario],
+        execution_deadline: Optional[float] = None,
     ) -> List[ScenarioExecutionResult]:
+        plan: List[Tuple[str, TestScenario]] = []
+        for scenario in scenarios:
+            if not self._is_safe_method_for_profile(str(scenario.method)):
+                plan.append(("unsafe", scenario))
+            else:
+                plan.append(("safe", scenario))
+
+        if not any(kind == "safe" for kind, _ in plan):
+            return [self._unsafe_action_result(scenario) for _, scenario in plan]
+
         results: List[ScenarioExecutionResult] = []
+        if bool(self._live_preflight_enabled):
+            preflight_ok, preflight_reason = self._preflight_live_connectivity()
+            if not preflight_ok:
+                for kind, scenario in plan:
+                    if kind == "unsafe":
+                        results.append(self._unsafe_action_result(scenario))
+                    else:
+                        results.append(
+                            self._environment_preflight_result(
+                                scenario,
+                                reason=preflight_reason,
+                            )
+                        )
+                return results
+
         run_started = time.perf_counter()
-        with _LiveRequestsAdapter(self.base_url, timeout_sec=12.0) as client:
-            for scenario in scenarios:
-                if self.max_runtime_sec is not None:
-                    elapsed = time.perf_counter() - run_started
-                    if elapsed >= float(self.max_runtime_sec):
-                        self._runtime_cap_hit = True
-                        self._runtime_skipped_count += 1
-                        results.append(self._runtime_cap_result(scenario))
-                        continue
-                if not self._is_safe_method_for_profile(str(scenario.method)):
+        deadline = execution_deadline
+        if deadline is None and self.max_runtime_sec is not None:
+            deadline = run_started + float(self.max_runtime_sec)
+        with _LiveRequestsAdapter(
+            self.base_url,
+            timeout_sec=float(self.runtime_settings.live_request_timeout_sec),
+        ) as client:
+            for kind, scenario in plan:
+                if kind == "unsafe":
                     results.append(self._unsafe_action_result(scenario))
                     continue
-                result = self._execute_one_scenario(client, scenario)
+                if deadline is not None and time.perf_counter() >= float(deadline):
+                    self._runtime_cap_hit = True
+                    self._runtime_skipped_count += 1
+                    results.append(self._runtime_cap_result(scenario))
+                    continue
+                result = self._execute_one_scenario(
+                    client,
+                    scenario,
+                    deadline=deadline,
+                )
                 result = self._apply_failure_triage_and_rerun(
                     client=client,
                     scenario=scenario,
                     result=result,
+                    deadline=deadline,
                 )
                 results.append(result)
         return results
@@ -5842,6 +8165,7 @@ class QASpecialistAgent:
         client: Any,
         scenario: TestScenario,
         result: ScenarioExecutionResult,
+        deadline: Optional[float] = None,
     ) -> ScenarioExecutionResult:
         verification = (
             dict(result.verification) if isinstance(result.verification, dict) else {}
@@ -5856,10 +8180,33 @@ class QASpecialistAgent:
             result.verification = verification
             return result
 
+        verification["repair_suggestion"] = self._derive_runtime_repair_suggestion(
+            scenario=scenario,
+            result=result,
+            taxonomy=taxonomy,
+        )
+
+        if deadline is not None and time.perf_counter() >= float(deadline):
+            verification["flaky_check"] = {
+                "reruns": 0,
+                "pass_count": 0,
+                "fail_count": 0,
+                "statuses": [result.actual_status],
+                "verdicts": [str(result.verdict).lower()],
+                "flaky": False,
+                "skipped": "runtime_cap_exceeded",
+            }
+            result.verification = verification
+            return result
+
         rerun_attempts = max(1, int(FLAKY_RERUN_MAX_ATTEMPTS)) - 1
         rerun_results: List[ScenarioExecutionResult] = []
         for _ in range(rerun_attempts):
-            rerun_results.append(self._execute_one_scenario(client, scenario))
+            if deadline is not None and time.perf_counter() >= float(deadline):
+                break
+            rerun_results.append(
+                self._execute_one_scenario(client, scenario, deadline=deadline)
+            )
 
         pass_count = sum(1 for item in rerun_results if str(item.verdict).lower() == "pass")
         fail_count = len(rerun_results) - pass_count
@@ -5889,11 +8236,6 @@ class QASpecialistAgent:
             "verdicts": all_verdicts,
             "flaky": bool(flaky),
         }
-        verification["repair_suggestion"] = self._derive_runtime_repair_suggestion(
-            scenario=scenario,
-            result=result,
-            taxonomy=taxonomy,
-        )
         if flaky:
             verification["flaky_check"]["stabilized_verdict"] = "suspect"
             verification["passed"] = False
@@ -5916,6 +8258,15 @@ class QASpecialistAgent:
         documented = set(op_meta.get("response_statuses", []) if isinstance(op_meta, dict) else [])
         actual = result.actual_status
         expected = int(getattr(result, "expected_status", 0) or 0)
+        verification = (
+            result.verification if isinstance(result.verification, dict) else {}
+        )
+        status_check = (
+            verification.get("status_check", {})
+            if isinstance(verification.get("status_check", {}), dict)
+            else {}
+        )
+        corrected_expectation = bool(status_check.get("corrected", False))
         response_excerpt = str(getattr(result, "response_excerpt", "") or "").lower()
         error_text = str(getattr(result, "error", "") or "").lower()
         endpoint_resolved = str(getattr(result, "endpoint_resolved", "") or "")
@@ -5923,6 +8274,13 @@ class QASpecialistAgent:
         if verdict == "pass":
             return {"category": "none", "kind": "none", "reason": "passed", "confidence": 1.0}
         if verdict == "blocked":
+            if error_text.startswith("environment_preflight_failed"):
+                return {
+                    "category": "environment_error",
+                    "kind": "env_issue",
+                    "reason": "preflight_connectivity_failed",
+                    "confidence": 0.99,
+                }
             return {"category": "safety_block", "kind": "policy", "reason": "unsafe_action_blocked", "confidence": 1.0}
         if "timeout" in error_text or "connection" in error_text:
             return {"category": "environment_error", "kind": "env_issue", "reason": "transport_failure", "confidence": 0.95}
@@ -5930,6 +8288,31 @@ class QASpecialistAgent:
             return {"category": "server_error", "kind": "service_issue", "reason": f"http_{actual}", "confidence": 0.95}
         if actual == 405 and endpoint_resolved.endswith("/"):
             return {"category": "path_param_empty_segment", "kind": "agent_issue", "reason": "resolved_path_trailing_slash", "confidence": 0.95}
+        if (
+            expected in AUTH_NEGATIVE_STATUS_CODES
+            and actual is not None
+            and int(actual) < 400
+            and not corrected_expectation
+        ):
+            return {
+                "category": "authorization_bypass",
+                "kind": "security_issue",
+                "reason": "expected_auth_failure_but_request_succeeded",
+                "confidence": 0.98,
+            }
+        if (
+            str(getattr(scenario, "test_type", "")).strip().lower() in SECURITY_FOCUSED_TEST_TYPES
+            and expected >= 400
+            and actual is not None
+            and int(actual) < 400
+            and not corrected_expectation
+        ):
+            return {
+                "category": "security_regression",
+                "kind": "security_issue",
+                "reason": "negative_security_assertion_failed",
+                "confidence": 0.9,
+            }
         if actual is not None and actual in documented and expected not in documented:
             return {"category": "expectation_mismatch_documented", "kind": "agent_issue", "reason": "expected_not_in_documented_statuses", "confidence": 0.9}
         if "missing required field" in response_excerpt:
@@ -5966,6 +8349,415 @@ class QASpecialistAgent:
                 "reason": category,
             }
         return {}
+
+    def _recommended_action_for_failure(
+        self,
+        *,
+        taxonomy: Dict[str, Any],
+        repair_suggestion: Dict[str, Any],
+    ) -> str:
+        suggestion_type = str(repair_suggestion.get("type", "") or "").strip().lower()
+        if suggestion_type == "override_expected_status":
+            return "Align expected status with documented responses and regenerate this scenario."
+        if suggestion_type == "repair_request_body":
+            return "Repair request body generation for required fields before rerun."
+
+        category = str(taxonomy.get("category", "") or "").strip().lower()
+        if category in {"authorization_bypass", "security_regression"}:
+            return "Treat as security regression: block release and investigate auth/authz enforcement."
+        if category == "behavioral_regression":
+            return "Service behavior diverges from expected contract; create bug with repro artifact."
+        if category == "expectation_mismatch_documented":
+            return "Expected status is inconsistent with documented responses; review scenario expectation logic."
+        if category == "request_body_missing_fields":
+            return "Generated payload is missing required fields; tighten request-body generation."
+        if category == "environment_error":
+            return "Stabilize test environment (timeouts/connectivity) before validating behavior."
+        if category == "server_error":
+            return "Investigate service-side 5xx errors with logs/traces and dependency health."
+        return "Investigate failure with repro artifact and taxonomy, then rerun."
+
+    def _failure_owner_bucket(self, taxonomy: Dict[str, Any]) -> str:
+        category = str(taxonomy.get("category", "") or "").strip().lower()
+        kind = str(taxonomy.get("kind", "") or "").strip().lower()
+        if category in {
+            "expectation_mismatch_documented",
+            "request_body_missing_fields",
+            "path_param_empty_segment",
+        }:
+            return "agent_or_test_issue"
+        if kind == "agent_issue":
+            return "agent_or_test_issue"
+        if category in {"environment_error", "safety_block"}:
+            return "environment_or_policy"
+        if category in {
+            "authorization_bypass",
+            "security_regression",
+            "behavioral_regression",
+            "server_error",
+        }:
+            return "service_or_spec_issue"
+        if kind in {"service_issue", "service_or_spec_issue", "security_issue"}:
+            return "service_or_spec_issue"
+        return "unknown"
+
+    def _taxonomy_improvement_hints(self, category: str) -> List[str]:
+        clean = str(category or "").strip().lower()
+        if clean in {"authorization_bypass", "security_regression"}:
+            return [
+                "Block release for impacted endpoints and investigate auth/authz enforcement.",
+                "Add explicit regression assertions for auth-negative probes.",
+            ]
+        if clean == "server_error":
+            return [
+                "Collect service logs/traces for failing requests and patch handler exceptions.",
+                "Add targeted 5xx guardrails in CI for affected operations.",
+            ]
+        if clean == "behavioral_regression":
+            return [
+                "Align implementation with documented contract or update spec if behavior is intended.",
+                "Create endpoint-specific regression tests using failing payloads as fixtures.",
+            ]
+        if clean == "expectation_mismatch_documented":
+            return [
+                "Update scenario expectation logic to use documented status codes.",
+                "Regenerate suspect scenarios with corrected expected statuses.",
+            ]
+        if clean == "request_body_missing_fields":
+            return [
+                "Tighten payload generation to always include required request fields.",
+                "Prioritize schema-driven body synthesis before mutation layers.",
+            ]
+        if clean == "path_param_empty_segment":
+            return [
+                "Fix path parameter resolver to avoid empty path segments.",
+                "Add path canonicalization checks to scenario generation.",
+            ]
+        if clean in {"environment_error", "safety_block"}:
+            return [
+                "Stabilize environment/runtime constraints before behavioral triage.",
+                "Retry after resolving transport/sandbox policy limitations.",
+            ]
+        return ["Investigate failure cluster with repro artifacts and tighten assertions."]
+
+    def _build_failure_diagnosis(
+        self, results: List[ScenarioExecutionResult]
+    ) -> Dict[str, Any]:
+        owner_counts: Dict[str, int] = {
+            "service_or_spec_issue": 0,
+            "agent_or_test_issue": 0,
+            "environment_or_policy": 0,
+            "unknown": 0,
+        }
+        category_counts: Dict[str, int] = {}
+        root_cause_counts: Dict[Tuple[str, str, str], int] = {}
+
+        endpoint_stats: Dict[str, Dict[str, Any]] = {}
+        hard_fail_total = 0
+        suspect_total = 0
+        blocked_total = 0
+
+        for result in results:
+            method = str(getattr(result, "method", "") or "").strip().upper() or "UNKNOWN"
+            endpoint_template = str(getattr(result, "endpoint_template", "") or "").strip()
+            endpoint_resolved = str(getattr(result, "endpoint_resolved", "") or "").strip()
+            endpoint = endpoint_template or endpoint_resolved or "/unknown"
+            operation_key = f"{method} {endpoint}"
+            verdict = str(getattr(result, "verdict", "fail") or "fail").strip().lower()
+
+            row = endpoint_stats.setdefault(
+                operation_key,
+                {
+                    "operation_key": operation_key,
+                    "method": method,
+                    "endpoint": endpoint,
+                    "total": 0,
+                    "passed": 0,
+                    "hard_failed": 0,
+                    "suspect": 0,
+                    "blocked": 0,
+                    "category_counts": {},
+                    "reason_counts": {},
+                    "owner_counts": {},
+                    "sample_failures": [],
+                },
+            )
+            row["total"] += 1
+            if verdict == "pass":
+                row["passed"] += 1
+            elif verdict == "suspect":
+                row["suspect"] += 1
+                suspect_total += 1
+            elif verdict == "blocked":
+                row["blocked"] += 1
+                blocked_total += 1
+            else:
+                row["hard_failed"] += 1
+                hard_fail_total += 1
+
+            if verdict == "pass":
+                continue
+
+            verification = (
+                result.verification if isinstance(result.verification, dict) else {}
+            )
+            taxonomy = (
+                verification.get("failure_taxonomy", {})
+                if isinstance(verification.get("failure_taxonomy", {}), dict)
+                else {}
+            )
+            repair_suggestion = (
+                verification.get("repair_suggestion", {})
+                if isinstance(verification.get("repair_suggestion", {}), dict)
+                else {}
+            )
+            category = str(taxonomy.get("category", "") or "").strip().lower() or "uncategorized"
+            reason = str(taxonomy.get("reason", "") or "").strip().lower() or "unknown_reason"
+            owner = self._failure_owner_bucket(taxonomy)
+            recommended_action = self._recommended_action_for_failure(
+                taxonomy=taxonomy,
+                repair_suggestion=repair_suggestion,
+            )
+
+            owner_counts[owner] = int(owner_counts.get(owner, 0) + 1)
+            category_counts[category] = int(category_counts.get(category, 0) + 1)
+            root_key = (category, reason, owner)
+            root_cause_counts[root_key] = int(root_cause_counts.get(root_key, 0) + 1)
+
+            row_category_counts = row["category_counts"]
+            row_category_counts[category] = int(row_category_counts.get(category, 0) + 1)
+            row_reason_counts = row["reason_counts"]
+            row_reason_counts[reason] = int(row_reason_counts.get(reason, 0) + 1)
+            row_owner_counts = row["owner_counts"]
+            row_owner_counts[owner] = int(row_owner_counts.get(owner, 0) + 1)
+
+            if len(row["sample_failures"]) < 3:
+                row["sample_failures"].append(
+                    {
+                        "name": str(getattr(result, "name", "") or ""),
+                        "display_name": str(getattr(result, "display_name", "") or ""),
+                        "test_type": str(getattr(result, "test_type", "") or ""),
+                        "expected_status": getattr(result, "expected_status", None),
+                        "actual_status": getattr(result, "actual_status", None),
+                        "verdict": verdict,
+                        "category": category,
+                        "reason": reason,
+                        "owner": owner,
+                        "recommended_action": recommended_action,
+                        "mutation_strategy": str(
+                            getattr(result, "mutation_strategy", "") or ""
+                        ),
+                    }
+                )
+
+        non_pass_total = int(sum(owner_counts.values()))
+        owner_chart = []
+        for owner, count in sorted(
+            owner_counts.items(),
+            key=lambda item: (-int(item[1]), item[0]),
+        ):
+            owner_chart.append(
+                {
+                    "owner": owner,
+                    "count": int(count),
+                    "ratio": round((float(count) / float(non_pass_total)) if non_pass_total else 0.0, 4),
+                }
+            )
+
+        root_cause_top: List[Dict[str, Any]] = []
+        for (category, reason, owner), count in sorted(
+            root_cause_counts.items(),
+            key=lambda item: (-int(item[1]), item[0][0], item[0][1]),
+        )[:12]:
+            root_cause_top.append(
+                {
+                    "category": category,
+                    "reason": reason,
+                    "owner": owner,
+                    "count": int(count),
+                    "ratio": round((float(count) / float(non_pass_total)) if non_pass_total else 0.0, 4),
+                }
+            )
+
+        endpoint_diagnosis: List[Dict[str, Any]] = []
+        for operation_key, row in endpoint_stats.items():
+            total = int(row.get("total", 0))
+            passed = int(row.get("passed", 0))
+            hard_failed = int(row.get("hard_failed", 0))
+            suspect = int(row.get("suspect", 0))
+            blocked = int(row.get("blocked", 0))
+            non_pass = hard_failed + suspect + blocked
+
+            category_counts_local = row.get("category_counts", {})
+            owner_counts_local = row.get("owner_counts", {})
+            reason_counts_local = row.get("reason_counts", {})
+            dominant_category = (
+                max(
+                    category_counts_local.items(),
+                    key=lambda item: (int(item[1]), item[0]),
+                )[0]
+                if category_counts_local
+                else "none"
+            )
+            dominant_owner = (
+                max(
+                    owner_counts_local.items(),
+                    key=lambda item: (int(item[1]), item[0]),
+                )[0]
+                if owner_counts_local
+                else "none"
+            )
+
+            hints: List[str] = []
+            categories_for_hints = [dominant_category] + list(category_counts_local.keys())
+            for category in categories_for_hints:
+                for hint in self._taxonomy_improvement_hints(str(category)):
+                    if hint not in hints:
+                        hints.append(hint)
+                    if len(hints) >= 3:
+                        break
+                if len(hints) >= 3:
+                    break
+            if not hints and non_pass > 0:
+                hints.append("Investigate failure cluster with repro artifacts and tighten assertions.")
+
+            if total > 0 and non_pass / total >= 0.5 and total >= 3:
+                status = "critical"
+            elif non_pass > 0:
+                status = "needs_attention"
+            else:
+                status = "healthy"
+
+            top_reasons = [
+                {"reason": str(reason), "count": int(count)}
+                for reason, count in sorted(
+                    reason_counts_local.items(),
+                    key=lambda item: (-int(item[1]), item[0]),
+                )[:3]
+            ]
+
+            endpoint_diagnosis.append(
+                {
+                    "operation_key": operation_key,
+                    "method": str(row.get("method", "")),
+                    "endpoint": str(row.get("endpoint", "")),
+                    "status": status,
+                    "total": total,
+                    "passed": passed,
+                    "hard_failed": hard_failed,
+                    "suspect": suspect,
+                    "blocked": blocked,
+                    "pass_rate": round((float(passed) / float(total)) if total else 0.0, 4),
+                    "non_pass_rate": round((float(non_pass) / float(total)) if total else 0.0, 4),
+                    "dominant_owner": dominant_owner,
+                    "dominant_category": dominant_category,
+                    "top_reasons": top_reasons,
+                    "improvements": hints,
+                    "sample_failures": list(row.get("sample_failures", [])),
+                }
+            )
+
+        endpoint_diagnosis.sort(
+            key=lambda item: (
+                -int(item.get("hard_failed", 0)),
+                -int(item.get("suspect", 0)),
+                -int(item.get("blocked", 0)),
+                -int(item.get("total", 0)),
+                str(item.get("operation_key", "")),
+            )
+        )
+
+        priority_map = {
+            "authorization_bypass": "P0",
+            "security_regression": "P0",
+            "server_error": "P0",
+            "behavioral_regression": "P1",
+            "expectation_mismatch_documented": "P1",
+            "request_body_missing_fields": "P1",
+            "path_param_empty_segment": "P1",
+            "environment_error": "P2",
+            "safety_block": "P2",
+            "uncategorized": "P2",
+        }
+        improvement_backlog: List[Dict[str, Any]] = []
+        for category, count in sorted(
+            category_counts.items(),
+            key=lambda item: (-int(item[1]), item[0]),
+        )[:10]:
+            owner = self._failure_owner_bucket({"category": category})
+            hints = self._taxonomy_improvement_hints(category)[:2]
+            improvement_backlog.append(
+                {
+                    "priority": priority_map.get(category, "P2"),
+                    "category": category,
+                    "owner": owner,
+                    "count": int(count),
+                    "suggested_actions": hints,
+                }
+            )
+
+        service_count = int(owner_counts.get("service_or_spec_issue", 0))
+        agent_count = int(owner_counts.get("agent_or_test_issue", 0))
+        env_count = int(owner_counts.get("environment_or_policy", 0))
+        unknown_count = int(owner_counts.get("unknown", 0))
+
+        if non_pass_total <= 0:
+            assessment = "no_failures_detected"
+            dominant_owner = "none"
+            confidence = 1.0
+        elif env_count > max(service_count, agent_count):
+            assessment = "mostly_environment_or_policy"
+            dominant_owner = "environment_or_policy"
+            confidence = round(
+                min(0.99, 0.55 + (float(env_count) / float(non_pass_total)) * 0.35),
+                4,
+            )
+        elif service_count >= max(2, int(agent_count * 1.5)):
+            assessment = "mostly_service_or_spec"
+            dominant_owner = "service_or_spec_issue"
+            confidence = round(
+                min(0.99, 0.55 + (float(service_count - agent_count) / float(non_pass_total)) * 0.45),
+                4,
+            )
+        elif agent_count >= max(2, int(service_count * 1.5)):
+            assessment = "mostly_agent_or_expectation"
+            dominant_owner = "agent_or_test_issue"
+            confidence = round(
+                min(0.99, 0.55 + (float(agent_count - service_count) / float(non_pass_total)) * 0.45),
+                4,
+            )
+        else:
+            assessment = "mixed_signal"
+            dominant_owner = (
+                "service_or_spec_issue"
+                if service_count >= agent_count
+                else "agent_or_test_issue"
+            )
+            confidence = round(
+                min(0.72, 0.5 + (float(abs(service_count - agent_count)) / float(non_pass_total)) * 0.22),
+                4,
+            )
+
+        return {
+            "non_pass_total": non_pass_total,
+            "hard_fail_total": int(hard_fail_total),
+            "suspect_total": int(suspect_total),
+            "blocked_total": int(blocked_total),
+            "owner_breakdown": {key: int(value) for key, value in owner_counts.items()},
+            "owner_chart": owner_chart,
+            "root_cause_top": root_cause_top,
+            "endpoint_diagnosis": endpoint_diagnosis[:20],
+            "improvement_backlog": improvement_backlog,
+            "agent_assessment": {
+                "assessment": assessment,
+                "dominant_owner": dominant_owner,
+                "confidence": float(confidence),
+                "service_or_spec_count": service_count,
+                "agent_or_test_count": agent_count,
+                "environment_or_policy_count": env_count,
+                "unknown_count": unknown_count,
+            },
+        }
 
     def _ingest_runtime_repair_suggestions(
         self,
@@ -6033,8 +8825,9 @@ class QASpecialistAgent:
                     method=method,
                     op_meta=op_meta,
                 )
-                scenario.params = self._normalize_path_params_for_execution(
+                self._apply_customer_mutation_rules_for_execution(
                     scenario,
+                    method=method,
                     op_meta=op_meta,
                 )
                 scenario.expected_status = self._normalize_expected_status_for_execution(
@@ -6042,9 +8835,18 @@ class QASpecialistAgent:
                     method=method,
                     op_meta=op_meta,
                 )
+                scenario.params = self._normalize_path_params_for_execution(
+                    scenario,
+                    op_meta=op_meta,
+                )
             rendered_headers = self._render_headers(scenario.headers)
             scenario.headers = self._normalize_auth_headers_for_execution(
                 scenario, method, rendered_headers
+            )
+            scenario.params = self._normalize_auth_params_for_execution(
+                scenario,
+                method=method,
+                params=dict(scenario.params or {}),
             )
             prepared.append(scenario)
         return prepared
@@ -6141,7 +8943,13 @@ class QASpecialistAgent:
             scenario.params = path_safe_params
             if method in {"POST", "PUT", "PATCH"}:
                 self._repair_scenario_body_from_spec(scenario, op_meta)
-            if int(getattr(scenario, "expected_status", 0) or 0) >= 400:
+            preserve_negative_integration = self._scenario_has_assertion(
+                scenario, "real_life:concurrency_conflict"
+            )
+            if (
+                int(getattr(scenario, "expected_status", 0) or 0) >= 400
+                and not preserve_negative_integration
+            ):
                 scenario.expected_status = self._pick_happy_status_for_operation(method, op_meta)
             return
 
@@ -6218,8 +9026,10 @@ class QASpecialistAgent:
             if str(key) not in set(placeholders) and str(key) not in query_names
         ]
 
+        auth_negative_exempt = strategy in {"real_life_cross_tenant", "real_life_bola_probe"}
         auth_intent = bool(
             auth_required
+            and not auth_negative_exempt
             and (
                 self._is_auth_negative_scenario(scenario)
                 or strategy in {"missing_auth", "invalid_auth"}
@@ -6309,7 +9119,17 @@ class QASpecialistAgent:
 
     def _build_valid_auth_headers(self, scenario: TestScenario) -> Dict[str, str]:
         headers = dict(self._render_headers(scenario.headers))
-        headers["Authorization"] = "Bearer valid_token_123"
+        if self._runtime_auth_mode == "api_key":
+            headers.pop("Authorization", None)
+            headers.pop("authorization", None)
+            if self._runtime_api_key_in == "header":
+                headers[self._runtime_api_key_name] = self._runtime_api_key_value
+            return headers
+        if self._runtime_auth_mode == "none":
+            headers.pop("Authorization", None)
+            headers.pop("authorization", None)
+            return headers
+        headers["Authorization"] = self._auth_bearer_valid()
         headers.pop("authorization", None)
         return headers
 
@@ -6323,11 +9143,23 @@ class QASpecialistAgent:
             ]
         ).lower()
         missing_hint = strategy == "missing_auth" or "missing auth" in scenario_text or "without auth" in scenario_text
+        if self._runtime_auth_mode == "api_key":
+            if missing_hint:
+                headers.pop("Authorization", None)
+                headers.pop("authorization", None)
+                if self._runtime_api_key_in == "header":
+                    headers.pop(self._runtime_api_key_name, None)
+                return headers
+            headers.pop("Authorization", None)
+            headers.pop("authorization", None)
+            if self._runtime_api_key_in == "header":
+                headers[self._runtime_api_key_name] = self._runtime_api_key_invalid_value
+            return headers
         if missing_hint:
             headers.pop("Authorization", None)
             headers.pop("authorization", None)
             return headers
-        headers["Authorization"] = "Bearer invalid"
+        headers["Authorization"] = self._auth_bearer_invalid()
         headers.pop("authorization", None)
         return headers
 
@@ -6343,7 +9175,28 @@ class QASpecialistAgent:
             test_type=test_type_value,
             expected_status=int(scenario.expected_status),
         )
+        if self._scenario_has_assertion(scenario, "real_life:concurrency_conflict"):
+            return 409
+        if self._scenario_has_assertion(scenario, "real_life:cross_tenant"):
+            return 403
+        if self._scenario_has_assertion(scenario, "real_life:bola_probe"):
+            return 403
         response_statuses = set(op_meta.get("response_statuses", []) or [])
+        if (
+            not response_statuses
+            and int(normalized_status) == 400
+            and test_type_value in {"input_validation", "error_handling", "boundary_testing", "security"}
+        ):
+            endpoint_text = str(getattr(scenario, "endpoint", "") or "").lower()
+            params_text = " ".join(
+                str(value).lower()
+                for value in list((scenario.params or {}).values())
+                if value is not None
+            )
+            if any(token in endpoint_text for token in ("nonexistent", "notfound", "missing", "invalid")) or any(
+                token in params_text for token in ("nonexistent", "notfound", "missing", "invalid", "9999")
+            ):
+                normalized_status = 404
         operation_key = self._operation_key(method, scenario.endpoint)
         auth_required = operation_key in self._auth_required_ops
         if (
@@ -6441,6 +9294,11 @@ class QASpecialistAgent:
         params = dict(scenario.params or {})
         placeholders = set(PATH_PARAM_PATTERN.findall(str(scenario.endpoint or "")))
         query_names = set(str(item) for item in (op_meta.get("query_param_names", []) or []))
+        query_param_schemas = (
+            op_meta.get("query_param_schemas", {})
+            if isinstance(op_meta.get("query_param_schemas", {}), dict)
+            else {}
+        )
 
         path_only = {k: v for k, v in params.items() if str(k) in placeholders}
         query_only = {k: v for k, v in params.items() if str(k) not in placeholders}
@@ -6457,17 +9315,26 @@ class QASpecialistAgent:
                 if str(key) in query_names:
                     filtered[str(key)] = value
             for qname in sorted(query_names):
-                if qname in filtered:
-                    raw_value = filtered[qname]
-                    qlower = str(qname).lower()
-                    if ("limit" in qlower or "size" in qlower) and str(raw_value).isdigit():
-                        parsed = int(str(raw_value))
-                        if parsed <= 0 or parsed > 1000:
-                            filtered[qname] = 10
-                    elif ("page" in qlower or "offset" in qlower) and str(raw_value).lstrip("-").isdigit():
-                        parsed = int(str(raw_value))
-                        if parsed < 0:
-                            filtered[qname] = 0 if "offset" in qlower else 1
+                if qname not in filtered:
+                    continue
+                schema = (
+                    query_param_schemas.get(qname, {})
+                    if isinstance(query_param_schemas.get(qname, {}), dict)
+                    else {}
+                )
+                raw_value = filtered[qname]
+                qlower = str(qname).lower()
+                if isinstance(schema, dict) and schema and not self._value_satisfies_schema(raw_value, schema):
+                    filtered[qname] = self._sample_query_value(qname, 200, schema=schema)
+                    continue
+                if ("limit" in qlower or "size" in qlower) and str(raw_value).isdigit():
+                    parsed = int(str(raw_value))
+                    if parsed <= 0 or parsed > 1000:
+                        filtered[qname] = 10
+                elif ("page" in qlower or "offset" in qlower) and str(raw_value).lstrip("-").isdigit():
+                    parsed = int(str(raw_value))
+                    if parsed < 0:
+                        filtered[qname] = 0 if "offset" in qlower else 1
             return {**path_only, **filtered}
 
         # For negative scenarios, keep generated params intact to preserve
@@ -6785,8 +9652,68 @@ class QASpecialistAgent:
 
         return True
 
+    def _scenario_has_assertion(self, scenario: TestScenario, marker: str) -> bool:
+        marker_text = str(marker or "").strip()
+        if not marker_text:
+            return False
+        return any(str(item).strip() == marker_text for item in list(scenario.assertions or []))
+
+    def _force_probe_failure(self, verification: Dict[str, Any], reason: str) -> None:
+        if not isinstance(verification, dict):
+            return
+        verification["passed"] = False
+        verification["verdict"] = "fail"
+        status_check = verification.setdefault("status_check", {})
+        if isinstance(status_check, dict):
+            if not str(status_check.get("suspect_reason", "")).strip():
+                status_check["suspect_reason"] = str(reason)
+            status_check["matched"] = bool(status_check.get("matched", True))
+        contract_check = verification.setdefault("contract_check", {})
+        if isinstance(contract_check, dict):
+            issues = contract_check.setdefault("issues", [])
+            if isinstance(issues, list):
+                issues.append(str(reason))
+            contract_check["checked"] = bool(contract_check.get("checked", False))
+            if contract_check.get("valid") is None:
+                contract_check["valid"] = False
+
+    def _percentile_ms(self, samples: List[float], percentile: float) -> float:
+        if not samples:
+            return 0.0
+        values = sorted(float(item) for item in samples)
+        if len(values) == 1:
+            return values[0]
+        rank = max(0.0, min(1.0, float(percentile) / 100.0)) * float(len(values) - 1)
+        lower_idx = int(math.floor(rank))
+        upper_idx = int(math.ceil(rank))
+        if lower_idx == upper_idx:
+            return values[lower_idx]
+        lower_val = values[lower_idx]
+        upper_val = values[upper_idx]
+        fraction = rank - float(lower_idx)
+        return float(lower_val + (upper_val - lower_val) * fraction)
+
+    def _response_has_sensitive_leak(self, response_text: str) -> bool:
+        text = str(response_text or "")
+        if not text:
+            return False
+        patterns = (
+            r'"password"\s*:',
+            r'"secret"\s*:',
+            r'"api[_-]?key"\s*:',
+            r'"private[_-]?key"\s*:',
+            r'"ssn"\s*:',
+            r'"credit[_-]?card"\s*:',
+            r'"access[_-]?token"\s*:',
+            r'"refresh[_-]?token"\s*:',
+        )
+        return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in patterns)
+
     def _execute_one_scenario(
-        self, client: Any, scenario: TestScenario
+        self,
+        client: Any,
+        scenario: TestScenario,
+        deadline: Optional[float] = None,
     ) -> ScenarioExecutionResult:
         method = scenario.method.upper()
         display_name = self._scenario_display_name(scenario)
@@ -6807,16 +9734,163 @@ class QASpecialistAgent:
         )
         query_params = self._strip_path_params(scenario.endpoint, normalized_params)
         body = scenario.body if method in {"POST", "PUT", "PATCH"} else None
+        replay_probe_enabled = self._scenario_has_assertion(scenario, "real_life:idempotency_replay")
+        retry_503_probe_enabled = self._scenario_has_assertion(scenario, "real_life:retry_on_503")
+        timeout_retry_probe_enabled = self._scenario_has_assertion(scenario, "real_life:timeout_retry")
+        latency_probe_enabled = self._scenario_has_assertion(scenario, "real_life:p95_p99_probe")
+        concurrency_probe_enabled = self._scenario_has_assertion(scenario, "real_life:concurrency_conflict")
+        payload_drift_probe_enabled = self._scenario_has_assertion(scenario, "real_life:payload_drift_probe")
+        data_leakage_probe_enabled = self._scenario_has_assertion(scenario, "real_life:data_leakage_probe")
 
         started = time.perf_counter()
-        try:
-            response = client.request(
-                method=method,
-                url=endpoint_resolved,
-                headers=headers,
-                params=query_params,
-                json=body,
+        runtime_cap_label = self._runtime_cap_error_label()
+
+        def _request(
+            *,
+            req_headers: Optional[Dict[str, str]] = None,
+            req_params: Optional[Dict[str, Any]] = None,
+            req_json: Optional[Any] = None,
+            timeout: Optional[float] = None,
+        ) -> Any:
+            effective_timeout = self._remaining_timeout_until_deadline(
+                deadline,
+                default_timeout=timeout,
             )
+            try:
+                return client.request(
+                    method=method,
+                    url=endpoint_resolved,
+                    headers=req_headers,
+                    params=req_params,
+                    json=req_json,
+                    timeout=effective_timeout,
+                )
+            except TimeoutError as exc:
+                if deadline is not None and time.perf_counter() >= float(deadline):
+                    raise TimeoutError(runtime_cap_label) from exc
+                raise
+
+        try:
+            response: Any
+            replay_probe: Dict[str, Any] = {}
+            resiliency_probe: Dict[str, Any] = {}
+            performance_probe: Dict[str, Any] = {}
+            concurrency_probe: Dict[str, Any] = {}
+            payload_drift_probe: Dict[str, Any] = {}
+
+            if latency_probe_enabled:
+                sample_count = 20
+                latencies_ms: List[float] = []
+                statuses: List[int] = []
+                last_response: Any = None
+                for _ in range(sample_count):
+                    sample_started = time.perf_counter()
+                    sample_response = _request(
+                        req_headers=headers,
+                        req_params=query_params,
+                        req_json=body,
+                    )
+                    sample_elapsed_ms = (time.perf_counter() - sample_started) * 1000.0
+                    latencies_ms.append(float(sample_elapsed_ms))
+                    statuses.append(int(getattr(sample_response, "status_code", 0)))
+                    last_response = sample_response
+                response = last_response
+                performance_probe = {
+                    "enabled": True,
+                    "sample_count": int(sample_count),
+                    "p95_ms": round(self._percentile_ms(latencies_ms, 95.0), 3),
+                    "p99_ms": round(self._percentile_ms(latencies_ms, 99.0), 3),
+                    "avg_ms": round((sum(latencies_ms) / len(latencies_ms)) if latencies_ms else 0.0, 3),
+                    "statuses": statuses[:5],
+                }
+            elif (retry_503_probe_enabled or timeout_retry_probe_enabled):
+                first_headers = dict(headers)
+                if retry_503_probe_enabled:
+                    first_headers["X-QA-Chaos"] = self._chaos_mode_once_503()
+                    first_headers.setdefault(
+                        "X-QA-Chaos-Key",
+                        f"{method}:{scenario.endpoint}:retry503",
+                    )
+                if timeout_retry_probe_enabled:
+                    first_headers["X-QA-Chaos"] = self._chaos_mode_once_timeout()
+                    first_headers.setdefault(
+                        "X-QA-Chaos-Key",
+                        f"{method}:{scenario.endpoint}:timeout",
+                    )
+                first_status: Optional[int] = None
+                first_error = ""
+                try:
+                    first_response = _request(
+                        req_headers=first_headers,
+                        req_params=query_params,
+                        req_json=body,
+                        timeout=0.35 if timeout_retry_probe_enabled else None,
+                    )
+                    first_status = int(getattr(first_response, "status_code", 0))
+                except Exception as first_exc:
+                    first_error = str(first_exc)
+
+                second_headers = {
+                    key: value
+                    for key, value in dict(headers).items()
+                    if str(key).lower() not in {"x-qa-chaos", "x-qa-chaos-key"}
+                }
+                response = _request(
+                    req_headers=second_headers,
+                    req_params=query_params,
+                    req_json=body,
+                )
+                resiliency_probe = {
+                    "enabled": True,
+                    "retry_on_503": bool(retry_503_probe_enabled),
+                    "timeout_retry": bool(timeout_retry_probe_enabled),
+                    "first_status": first_status,
+                    "first_error": first_error,
+                    "second_status": int(getattr(response, "status_code", 0)),
+                }
+            elif concurrency_probe_enabled and method in {"POST", "PUT", "PATCH"}:
+                first_response = _request(
+                    req_headers=headers,
+                    req_params=query_params,
+                    req_json=body,
+                )
+                second_response = _request(
+                    req_headers=headers,
+                    req_params=query_params,
+                    req_json=body,
+                )
+                response = second_response
+                concurrency_probe = {
+                    "enabled": True,
+                    "first_status": int(getattr(first_response, "status_code", 0)),
+                    "second_status": int(getattr(second_response, "status_code", 0)),
+                    "conflict_seen": bool(
+                        int(getattr(first_response, "status_code", 0)) == 409
+                        or int(getattr(second_response, "status_code", 0)) == 409
+                    ),
+                }
+            elif replay_probe_enabled and method in {"POST", "PUT", "PATCH"}:
+                first_response = _request(
+                    req_headers=headers,
+                    req_params=query_params,
+                    req_json=body,
+                )
+                response = _request(
+                    req_headers=headers,
+                    req_params=query_params,
+                    req_json=body,
+                )
+                replay_probe = {
+                    "enabled": True,
+                    "first_status": int(getattr(first_response, "status_code", 0)),
+                    "second_status": int(getattr(response, "status_code", 0)),
+                }
+            else:
+                response = _request(
+                    req_headers=headers,
+                    req_params=query_params,
+                    req_json=body,
+                )
             duration_ms = (time.perf_counter() - started) * 1000.0
             actual_status = int(response.status_code)
             verification = self._verify_then_correct_result(
@@ -6829,9 +9903,84 @@ class QASpecialistAgent:
             intent_meta = self._scenario_intent_metadata(scenario)
             if intent_meta:
                 verification["intent"] = intent_meta
+            if replay_probe:
+                replay_probe["second_status"] = int(actual_status)
+                verification["replay_probe"] = replay_probe
+            if resiliency_probe:
+                retry_signal_ok = True
+                if bool(resiliency_probe.get("retry_on_503", False)):
+                    first_status = resiliency_probe.get("first_status")
+                    first_error = str(resiliency_probe.get("first_error", "")).lower()
+                    retry_signal_ok = bool(first_status in {503, 504} or "503" in first_error)
+                if bool(resiliency_probe.get("timeout_retry", False)):
+                    first_error = str(resiliency_probe.get("first_error", "")).lower()
+                    first_status = resiliency_probe.get("first_status")
+                    timeout_signal = bool("timeout" in first_error or first_status in {503, 504})
+                    retry_signal_ok = bool(retry_signal_ok and timeout_signal)
+                resiliency_probe["retry_signal_ok"] = bool(retry_signal_ok)
+                verification["resiliency_probe"] = resiliency_probe
+                if not retry_signal_ok:
+                    self._force_probe_failure(verification, "resiliency_probe_not_triggered")
+            if performance_probe:
+                p95_threshold_ms = float(os.getenv("QA_PERF_P95_THRESHOLD_MS", "250") or 250)
+                p99_threshold_ms = float(os.getenv("QA_PERF_P99_THRESHOLD_MS", "500") or 500)
+                p95_ms = float(performance_probe.get("p95_ms", 0.0))
+                p99_ms = float(performance_probe.get("p99_ms", 0.0))
+                perf_ok = bool(p95_ms <= p95_threshold_ms and p99_ms <= p99_threshold_ms)
+                performance_probe["p95_threshold_ms"] = float(p95_threshold_ms)
+                performance_probe["p99_threshold_ms"] = float(p99_threshold_ms)
+                performance_probe["within_threshold"] = bool(perf_ok)
+                verification["performance_probe"] = performance_probe
+                if not perf_ok:
+                    self._force_probe_failure(verification, "performance_p95_p99_threshold_exceeded")
+            if concurrency_probe:
+                verification["concurrency_probe"] = concurrency_probe
+                if not bool(concurrency_probe.get("conflict_seen", False)):
+                    self._force_probe_failure(verification, "concurrency_conflict_not_observed")
+            if payload_drift_probe_enabled and method in {"POST", "PUT", "PATCH"}:
+                alt_headers = dict(headers)
+                alt_headers["X-Client-Platform"] = "mobile"
+                alt_body = deepcopy(body) if isinstance(body, dict) else body
+                if isinstance(alt_body, dict) and "clientVersion" not in alt_body and "client_version" not in alt_body:
+                    alt_body["clientVersion"] = "1.0-mobile"
+                try:
+                    alt_response = _request(
+                        req_headers=alt_headers,
+                        req_params=query_params,
+                        req_json=alt_body,
+                    )
+                    alt_status = int(getattr(alt_response, "status_code", 0))
+                except Exception as drift_exc:
+                    alt_status = None
+                    payload_drift_probe["drift_error"] = str(drift_exc)
+                drift_ok = bool(
+                    alt_status is not None
+                    and 200 <= int(actual_status) < 300
+                    and 200 <= int(alt_status) < 300
+                )
+                payload_drift_probe.update(
+                    {
+                        "enabled": True,
+                        "web_status": int(actual_status),
+                        "mobile_status": alt_status,
+                        "compatible": bool(drift_ok),
+                    }
+                )
+                verification["payload_drift_probe"] = payload_drift_probe
+                if not drift_ok:
+                    self._force_probe_failure(verification, "payload_drift_incompatible_status")
+
+            response_excerpt = self._response_excerpt(response)
+            if data_leakage_probe_enabled:
+                leak_detected = self._response_has_sensitive_leak(response_excerpt)
+                verification["data_leakage_probe"] = {
+                    "enabled": True,
+                    "sensitive_leak_detected": bool(leak_detected),
+                }
+                if leak_detected:
+                    self._force_probe_failure(verification, "sensitive_data_leakage_detected")
             verdict = str(verification.get("verdict", "fail"))
             passed = bool(verdict == "pass")
-            response_excerpt = self._response_excerpt(response)
 
             return ScenarioExecutionResult(
                 name=scenario.name,
@@ -6852,6 +10001,11 @@ class QASpecialistAgent:
                 history_seeded=bool(history_seeded),
             )
         except Exception as exc:
+            error_text = str(exc)
+            if error_text.startswith(runtime_cap_label):
+                self._runtime_cap_hit = True
+                self._runtime_skipped_count += 1
+                return self._runtime_cap_result(scenario)
             duration_ms = (time.perf_counter() - started) * 1000.0
             return ScenarioExecutionResult(
                 name=scenario.name,
@@ -6952,8 +10106,8 @@ class QASpecialistAgent:
         rendered: Dict[str, str] = {}
         for k, v in (headers or {}).items():
             value = str(v)
-            value = value.replace("{{auth_token}}", "valid_token_123")
-            value = value.replace("{{admin_token}}", "admin_token_123")
+            value = value.replace("{{auth_token}}", str(self.runtime_settings.auth_token_valid))
+            value = value.replace("{{admin_token}}", str(self.runtime_settings.auth_token_admin))
             rendered[k] = value
         return rendered
 
@@ -6962,17 +10116,95 @@ class QASpecialistAgent:
     ) -> Dict[str, str]:
         normalized = dict(headers or {})
         operation_key = self._operation_key(method, scenario.endpoint)
+        profile_override = (
+            self._operation_auth_profiles.get(operation_key, {})
+            if isinstance(self._operation_auth_profiles, dict)
+            else {}
+        )
+        override_mode_raw = str(profile_override.get("authMode", "")).strip().lower()
+        override_mode = (
+            override_mode_raw
+            if override_mode_raw in {"none", "bearer", "api_key"}
+            else ""
+        )
+        if override_mode == "none":
+            normalized.pop("Authorization", None)
+            normalized.pop("authorization", None)
+            api_key_name = str(
+                profile_override.get("apiKeyName", self._runtime_api_key_name)
+            ).strip() or self._runtime_api_key_name
+            normalized.pop(api_key_name, None)
+            return normalized
+        if override_mode == "bearer":
+            normalized.pop("Authorization", None)
+            normalized.pop("authorization", None)
+            if self._is_auth_negative_scenario(scenario):
+                normalized["Authorization"] = self._auth_bearer_invalid()
+            else:
+                token = str(profile_override.get("bearerToken", "")).strip()
+                token = token if token else self._auth_bearer_valid().replace("Bearer ", "", 1)
+                normalized["Authorization"] = f"Bearer {token}"
+            return normalized
+        if override_mode == "api_key":
+            api_key_name = str(
+                profile_override.get("apiKeyName", self._runtime_api_key_name)
+            ).strip() or self._runtime_api_key_name
+            api_key_in = (
+                "query"
+                if str(profile_override.get("apiKeyIn", "header")).strip().lower() == "query"
+                else "header"
+            )
+            normalized.pop("Authorization", None)
+            normalized.pop("authorization", None)
+            if api_key_in == "header":
+                if self._is_auth_negative_scenario(scenario):
+                    normalized[api_key_name] = self._runtime_api_key_invalid_value
+                else:
+                    key_value = str(profile_override.get("apiKeyValue", "")).strip()
+                    normalized[api_key_name] = (
+                        key_value if key_value else self._runtime_api_key_value
+                    )
+            else:
+                normalized.pop(api_key_name, None)
+            return normalized
+
         if operation_key not in self._auth_required_ops:
             return normalized
 
+        if self._runtime_auth_mode == "api_key":
+            # API key in query is normalized separately in `_normalize_auth_params_for_execution`.
+            if self._runtime_api_key_in == "header":
+                if self._is_auth_negative_scenario(scenario):
+                    normalized = self._build_auth_negative_headers(scenario)
+                else:
+                    normalized = self._build_valid_auth_headers(scenario)
+            else:
+                existing_key = self._select_target_key(
+                    normalized, self._runtime_api_key_name
+                )
+                if existing_key is not None:
+                    normalized.pop(existing_key, None)
+            normalized.pop("Authorization", None)
+            normalized.pop("authorization", None)
+            return normalized
+
+        if self._runtime_auth_mode == "none":
+            normalized.pop("Authorization", None)
+            normalized.pop("authorization", None)
+            return normalized
+
         if self._is_auth_negative_scenario(scenario):
+            if self._scenario_has_assertion(scenario, "real_life:data_leakage_probe"):
+                normalized["Authorization"] = self._auth_bearer_invalid()
+                normalized.pop("authorization", None)
+                return normalized
             auth_value = self._read_authorization_header(normalized)
             if auth_value and auth_value.lower().startswith("bearer "):
                 token = auth_value.split(" ", 1)[1].strip()
                 token_lower = token.lower()
                 token_is_invalid_hint = (
-                    token_lower in {"invalid", "expired", ""}
-                    or any(marker in token_lower for marker in ("invalid", "expired"))
+                    token_lower in {"", *self._auth_token_invalid_markers()}
+                    or any(marker in token_lower for marker in self._auth_token_invalid_markers())
                 )
                 try:
                     expected_status = int(getattr(scenario, "expected_status", 0) or 0)
@@ -6981,13 +10213,81 @@ class QASpecialistAgent:
                 # For expected 401 auth-negative checks, force an invalid token
                 # whenever a bearer token is present to avoid false-positive 2xx.
                 if token_is_invalid_hint or expected_status == 401:
-                    normalized["Authorization"] = "Bearer invalid"
+                    normalized["Authorization"] = self._auth_bearer_invalid()
                     normalized.pop("authorization", None)
             return normalized
 
         if not self._has_authorization_header(normalized):
-            normalized["Authorization"] = "Bearer valid_token_123"
+            normalized["Authorization"] = self._auth_bearer_valid()
             normalized.pop("authorization", None)
+        return normalized
+
+    def _normalize_auth_params_for_execution(
+        self, scenario: TestScenario, *, method: str, params: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        normalized = dict(params or {})
+        operation_key = self._operation_key(method, scenario.endpoint)
+        profile_override = (
+            self._operation_auth_profiles.get(operation_key, {})
+            if isinstance(self._operation_auth_profiles, dict)
+            else {}
+        )
+        override_mode_raw = str(profile_override.get("authMode", "")).strip().lower()
+        override_mode = (
+            override_mode_raw
+            if override_mode_raw in {"none", "bearer", "api_key"}
+            else ""
+        )
+        if override_mode == "api_key":
+            api_key_name = str(
+                profile_override.get("apiKeyName", self._runtime_api_key_name)
+            ).strip() or self._runtime_api_key_name
+            api_key_in = (
+                "query"
+                if str(profile_override.get("apiKeyIn", "header")).strip().lower() == "query"
+                else "header"
+            )
+            if api_key_in != "query":
+                normalized.pop(api_key_name, None)
+                return normalized
+            if self._is_auth_negative_scenario(scenario):
+                normalized[api_key_name] = self._runtime_api_key_invalid_value
+            else:
+                key_value = str(profile_override.get("apiKeyValue", "")).strip()
+                normalized[api_key_name] = (
+                    key_value if key_value else self._runtime_api_key_value
+                )
+            return normalized
+        if override_mode == "none":
+            normalized.pop(self._runtime_api_key_name, None)
+            return normalized
+        if override_mode == "bearer":
+            normalized.pop(self._runtime_api_key_name, None)
+            return normalized
+
+        if operation_key not in self._auth_required_ops:
+            return normalized
+        if self._runtime_auth_mode != "api_key" or self._runtime_api_key_in != "query":
+            return normalized
+        if self._is_auth_negative_scenario(scenario):
+            strategy = str(self._extract_rl_mutation_strategy(scenario))
+            scenario_text = " ".join(
+                [
+                    str(getattr(scenario, "name", "") or ""),
+                    str(getattr(scenario, "description", "") or ""),
+                ]
+            ).lower()
+            missing_hint = (
+                strategy == "missing_auth"
+                or "missing auth" in scenario_text
+                or "without auth" in scenario_text
+            )
+            if missing_hint:
+                normalized.pop(self._runtime_api_key_name, None)
+            else:
+                normalized[self._runtime_api_key_name] = self._runtime_api_key_invalid_value
+            return normalized
+        normalized[self._runtime_api_key_name] = self._runtime_api_key_value
         return normalized
 
     def _has_authorization_header(self, headers: Dict[str, str]) -> bool:
@@ -7027,6 +10327,7 @@ class QASpecialistAgent:
         status_match = self._status_matches_expectation(scenario, actual_status)
         corrected_expected_status: Optional[int] = None
         corrected = False
+        equivalent_success_status = False
 
         operation_key = self._operation_key(scenario.method.upper(), scenario.endpoint)
         op_meta = self._operation_index.get(operation_key, {})
@@ -7035,6 +10336,15 @@ class QASpecialistAgent:
             for item in (op_meta.get("response_statuses", []) or [])
             if isinstance(item, int) or str(item).isdigit()
         }
+        if (
+            not status_match
+            and 200 <= int(expected_status) < 300
+            and 200 <= int(actual_status) < 300
+            and expected_status in documented_statuses
+            and int(actual_status) in documented_statuses
+        ):
+            status_match = True
+            equivalent_success_status = True
         if (
             not status_match
             and documented_statuses
@@ -7075,6 +10385,7 @@ class QASpecialistAgent:
                 "corrected_expected_status": corrected_expected_status,
                 "corrected": bool(corrected),
                 "matched": bool(status_match),
+                "equivalent_success_status": bool(equivalent_success_status),
                 "suspect_reason": suspect_reason,
                 "documented_statuses": sorted(documented_statuses),
             },
@@ -7106,21 +10417,41 @@ class QASpecialistAgent:
             "valid": None,
             "issues": [],
         }
-        if not result["schema_found"]:
-            # Fallback sanity check so contract metrics are still informative
-            # when specs omit response schemas.
+        body_text = str(getattr(response, "text", "") or "").strip()
+        if int(actual_status) in {204, 205, 304}:
             result["checked"] = True
-            if int(actual_status) == 204:
-                body_text = str(getattr(response, "text", "") or "").strip()
-                result["valid"] = body_text == ""
-                if body_text:
+            if body_text:
+                result["valid"] = False
+                result["issues"].append("no_content_status_returned_non_empty_body")
+            else:
+                result["valid"] = True
+                if result["schema_found"]:
                     result["issues"].append(
-                        "no_response_schema_defined_expected_empty_body_for_204"
+                        "ignored_response_schema_for_no_content_status"
                     )
                 else:
                     result["issues"].append(
-                        "no_response_schema_defined_used_empty_body_sanity_check"
+                        "no_response_schema_defined_expected_empty_body_for_no_content_status"
                     )
+            return result
+
+        if not result["schema_found"]:
+            # Missing response schema is common in real-world specs. Keep strict mode
+            # focused on validating present schemas unless explicitly configured.
+            result["checked"] = True
+            if bool(self.strict_contract_checks) and bool(
+                self.strict_contract_require_response_schema
+            ):
+                result["valid"] = False
+                result["issues"].append(
+                    "no_response_schema_defined_strict_contract_check_enabled"
+                )
+                return result
+            if bool(self.strict_contract_checks):
+                result["valid"] = True
+                result["issues"].append(
+                    "no_response_schema_defined_strict_mode_warn_only"
+                )
                 return result
             try:
                 payload = response.json()
@@ -7166,6 +10497,124 @@ class QASpecialistAgent:
             result["valid"] = False
             result["issues"].append(f"response_schema_validation_error: {str(exc)}")
         return result
+
+    def _evaluate_critical_quality_gate(
+        self,
+        results: List[ScenarioExecutionResult],
+    ) -> Tuple[Dict[str, Any], List[str]]:
+        configured_ops = sorted(set(self._critical_operations or set()))
+        configured_assertions = list(self._critical_assertions or [])
+        operation_map: Dict[str, List[ScenarioExecutionResult]] = {}
+        for result in results:
+            operation_key = self._operation_key(
+                str(getattr(result, "method", "")).upper(),
+                str(getattr(result, "endpoint_template", "")),
+            )
+            operation_map.setdefault(operation_key, []).append(result)
+
+        coverage: Dict[str, Dict[str, Any]] = {}
+        assertion_results: List[Dict[str, Any]] = []
+        fail_reasons: List[str] = []
+
+        for operation_id in configured_ops:
+            op_results = operation_map.get(operation_id, [])
+            pass_count = sum(
+                1
+                for item in op_results
+                if str(getattr(item, "verdict", "fail")).strip().lower() == "pass"
+            )
+            fail_count = max(0, len(op_results) - pass_count)
+            coverage[operation_id] = {
+                "total": int(len(op_results)),
+                "pass": int(pass_count),
+                "fail": int(fail_count),
+            }
+            if not op_results:
+                fail_reasons.append(f"critical_operation_uncovered:{operation_id}")
+            elif pass_count <= 0:
+                fail_reasons.append(f"critical_operation_no_pass:{operation_id}")
+
+        for row in configured_assertions:
+            if not isinstance(row, dict):
+                continue
+            operation_id = self._normalize_operation_identifier(row.get("operationId", ""))
+            if not operation_id:
+                continue
+            op_results = operation_map.get(operation_id, [])
+            pass_results = [
+                item
+                for item in op_results
+                if str(getattr(item, "verdict", "fail")).strip().lower() == "pass"
+            ]
+            expected_status = row.get("expectedStatus")
+            allowed_statuses = (
+                [int(v) for v in list(row.get("allowedStatuses", []) or []) if str(v).isdigit()]
+                if isinstance(row.get("allowedStatuses"), list)
+                else []
+            )
+            min_pass_count = 1
+            try:
+                min_pass_count = max(1, int(row.get("minPassCount", 1)))
+            except Exception:
+                min_pass_count = 1
+
+            ok = False
+            reason = "no_results_for_operation"
+            if op_results:
+                if expected_status is not None:
+                    try:
+                        expected_int = int(expected_status)
+                    except Exception:
+                        expected_int = None
+                    if expected_int is not None:
+                        ok = any(
+                            int(getattr(item, "actual_status", -1) or -1) == expected_int
+                            and str(getattr(item, "verdict", "fail")).strip().lower() == "pass"
+                            for item in op_results
+                        )
+                        reason = "expected_status_not_observed_as_pass"
+                elif allowed_statuses:
+                    allow = set(allowed_statuses)
+                    ok = any(
+                        int(getattr(item, "actual_status", -1) or -1) in allow
+                        and str(getattr(item, "verdict", "fail")).strip().lower() == "pass"
+                        for item in op_results
+                    )
+                    reason = "allowed_statuses_not_observed_as_pass"
+                else:
+                    ok = len(pass_results) >= int(min_pass_count)
+                    reason = "insufficient_pass_count"
+
+            assertion_results.append(
+                {
+                    "operationId": operation_id,
+                    "expectedStatus": expected_status,
+                    "allowedStatuses": allowed_statuses,
+                    "minPassCount": int(min_pass_count),
+                    "total": int(len(op_results)),
+                    "pass": int(len(pass_results)),
+                    "ok": bool(ok),
+                    "reason": "" if ok else reason,
+                }
+            )
+            if not ok:
+                fail_reasons.append(f"critical_assertion_failed:{operation_id}")
+
+        summary = {
+            "enabled": bool(configured_ops or configured_assertions),
+            "configured_operations": configured_ops,
+            "configured_assertions_count": int(len(configured_assertions)),
+            "operation_coverage": coverage,
+            "assertion_results": assertion_results,
+            "failed_operation_count": int(
+                sum(1 for item in coverage.values() if int(item.get("pass", 0)) <= 0)
+            ),
+            "failed_assertion_count": int(
+                sum(1 for item in assertion_results if not bool(item.get("ok", False)))
+            ),
+        }
+        deduped_fail_reasons = list(dict.fromkeys(fail_reasons))
+        return summary, deduped_fail_reasons
 
     def _build_summary(
         self,
@@ -7260,25 +10709,57 @@ class QASpecialistAgent:
                 scenarios=scenarios,
                 pass_rate=float(pass_rate),
             )[1]
+        critical_gate, critical_fail_reasons = self._evaluate_critical_quality_gate(
+            results
+        )
+        quality_gate_fail_reasons.extend(list(critical_fail_reasons or []))
+        quality_gate_fail_reasons = list(dict.fromkeys(quality_gate_fail_reasons))
         meets_quality_gate = len(quality_gate_fail_reasons) == 0
 
-        failed_examples = [
-            {
-                "name": r.name,
-                "display_name": str(getattr(r, "display_name", "") or ""),
-                "name_raw": str(getattr(r, "name_raw", r.name) or r.name),
-                "method": r.method,
-                "endpoint": r.endpoint_resolved,
-                "expected_status": r.expected_status,
-                "actual_status": r.actual_status,
-                "verdict": str(getattr(r, "verdict", "fail") or "fail"),
-                "error": r.error,
-                "mutation_strategy": str(getattr(r, "mutation_strategy", "") or ""),
-                "history_seeded": bool(getattr(r, "history_seeded", False)),
-            }
-            for r in results
-            if str(getattr(r, "verdict", "fail") or "fail") != "pass"
-        ][:25]
+        failed_examples: List[Dict[str, Any]] = []
+        for result in results:
+            if str(getattr(result, "verdict", "fail") or "fail") == "pass":
+                continue
+            verification = (
+                result.verification if isinstance(result.verification, dict) else {}
+            )
+            taxonomy = (
+                verification.get("failure_taxonomy", {})
+                if isinstance(verification.get("failure_taxonomy", {}), dict)
+                else {}
+            )
+            repair_suggestion = (
+                verification.get("repair_suggestion", {})
+                if isinstance(verification.get("repair_suggestion", {}), dict)
+                else {}
+            )
+            failed_examples.append(
+                {
+                    "name": result.name,
+                    "display_name": str(getattr(result, "display_name", "") or ""),
+                    "name_raw": str(getattr(result, "name_raw", result.name) or result.name),
+                    "method": result.method,
+                    "endpoint": result.endpoint_resolved,
+                    "expected_status": result.expected_status,
+                    "actual_status": result.actual_status,
+                    "verdict": str(getattr(result, "verdict", "fail") or "fail"),
+                    "error": result.error,
+                    "mutation_strategy": str(
+                        getattr(result, "mutation_strategy", "") or ""
+                    ),
+                    "history_seeded": bool(getattr(result, "history_seeded", False)),
+                    "failure_taxonomy": taxonomy,
+                    "repair_suggestion": repair_suggestion,
+                    "recommended_action": self._recommended_action_for_failure(
+                        taxonomy=taxonomy,
+                        repair_suggestion=repair_suggestion,
+                    ),
+                }
+            )
+            if len(failed_examples) >= 25:
+                break
+
+        failure_diagnosis = self._build_failure_diagnosis(results)
 
         return {
             "total_scenarios": total,
@@ -7294,6 +10775,7 @@ class QASpecialistAgent:
             "quality_gate_fail_reasons": quality_gate_fail_reasons,
             "quality_gate_warnings": quality_gate_warnings,
             "llm_degradation_policy": llm_degradation_policy,
+            "critical_gate": critical_gate,
             "average_duration_ms": round(avg_duration_ms, 3),
             "contract_checks_run": int(contract_checked),
             "contract_check_failures": int(contract_failed),
@@ -7316,6 +10798,7 @@ class QASpecialistAgent:
             "environment_profile": self.environment_profile,
             "test_type_breakdown": by_type,
             "failed_examples": failed_examples,
+            "failure_diagnosis": failure_diagnosis,
         }
 
     def _spec_operation_keys_for_summary(self, spec: Dict[str, Any]) -> set[str]:
@@ -7908,7 +11391,7 @@ class QASpecialistAgent:
             return 401
         if ttype == "error_handling" and status < 400:
             return 400
-        if ttype in {"input_validation", "boundary_testing"} and status < 400:
+        if ttype in {"input_validation", "boundary_testing", "security"} and status < 400:
             return 400
         return status
 
@@ -9169,7 +12652,11 @@ class QASpecialistAgent:
 
             spec_copy = self.output_dir / "openapi_under_test_repro.yaml"
             spec_copy.write_text(yaml.safe_dump(spec, sort_keys=False), encoding="utf-8")
-            server = DynamicMockServer(str(spec_copy), host="127.0.0.1", port=0)
+            server = DynamicMockServer(
+                str(spec_copy),
+                host=str(self.runtime_settings.dynamic_mock_host),
+                port=0,
+            )
             with TestClient(server.app) as raw_client:
                 client = _TestClientRequestsAdapter(raw_client)
                 self._collect_repro_artifacts_from_client(
@@ -9179,10 +12666,13 @@ class QASpecialistAgent:
                     seen=seen,
                     artifacts=artifacts,
                     limit=limit,
-                    base_url_hint="http://testserver",
+                    base_url_hint=str(self.runtime_settings.script_exec_base_url_hint),
                 )
         else:
-            with _LiveRequestsAdapter(self.base_url, timeout_sec=12.0) as client:
+            with _LiveRequestsAdapter(
+                self.base_url,
+                timeout_sec=float(self.runtime_settings.live_request_timeout_sec),
+            ) as client:
                 self._collect_repro_artifacts_from_client(
                     client=client,
                     scenario_by_name=scenario_by_name,
@@ -9399,6 +12889,7 @@ class QASpecialistAgent:
         scenario_context = report.get("scenario_context", {})
         spec_intelligence = report.get("spec_intelligence", {}) or {}
         oss_tooling = report.get("oss_tooling", {}) or {}
+        mcp = report.get("mcp", {}) or {}
 
         lines = [
             "# QA Specialist Execution Report",
@@ -9413,6 +12904,8 @@ class QASpecialistAgent:
             f"- Isolation: `{metadata['isolation_mode']}`",
             f"- Environment Profile: `{metadata.get('environment_profile', '')}`",
             f"- LLM Scenario Debug Log: `{metadata.get('llm_scenario_debug_log', '')}`",
+            f"- MCP Enabled: `{metadata.get('mcp_enabled', False)}`",
+            f"- MCP Configured Servers: `{metadata.get('mcp_configured_servers', 0)}`",
             f"- Runtime Cap (sec): `{summary.get('max_runtime_sec', 'n/a')}`",
             f"- Runtime Cap Hit: `{summary.get('runtime_cap_hit', False)}`",
             f"- Runtime Skipped: `{summary.get('runtime_skipped_scenarios', 0)}`",
@@ -9510,6 +13003,15 @@ class QASpecialistAgent:
                 f"- CLI Binaries: `{(oss_tooling.get('binaries', {}) or {})}`",
                 f"- Spec Validation: `{(oss_tooling.get('spec_validation', {}) or {})}`",
                 "",
+                "## MCP Tools",
+                f"- Enabled: `{mcp.get('enabled', False)}`",
+                f"- Configured Servers: `{mcp.get('configured_servers', 0)}`",
+                f"- Connected Servers: `{mcp.get('connected_servers', 0)}`",
+                f"- Tool Calls Attempted: `{mcp.get('tool_calls_attempted', 0)}`",
+                f"- Tool Calls Succeeded: `{mcp.get('tool_calls_succeeded', 0)}`",
+                f"- Context Excerpts Added: `{len(mcp.get('excerpts', []) or [])}`",
+                f"- Errors: `{mcp.get('errors', [])}`",
+                "",
                 "## Adaptive Selection Policy",
                 f"- Algorithm: `{selection_policy.get('algorithm', 'n/a')}`",
                 f"- Candidate Scenarios: `{selection_policy.get('candidate_count', 0)}`",
@@ -9517,6 +13019,8 @@ class QASpecialistAgent:
                 f"- RL Mutated Candidates: `{selection_policy.get('mutated_candidate_count', 0)}`",
                 f"- Selected Scenarios: `{selection_policy.get('selected_count', 0)}`",
                 f"- Base Max Scenarios: `{selection_policy.get('base_max_scenarios', 0)}`",
+                f"- Auto Floor Budget: `{selection_policy.get('auto_floor_budget', 0)}`",
+                f"- Auto Budget Expanded: `{selection_policy.get('auto_budget_expanded', False)}`",
                 f"- Effective Budget: `{selection_policy.get('effective_budget', 0)}`",
                 "- Expanded For Uncertainty: "
                 + f"`{selection_policy.get('budget_expanded_for_uncertainty', False)}`",
@@ -9614,6 +13118,48 @@ class QASpecialistAgent:
         else:
             lines.append("- None")
 
+        diagnosis = summary.get("failure_diagnosis", {}) or {}
+        if isinstance(diagnosis, dict) and diagnosis:
+            agent_assessment = diagnosis.get("agent_assessment", {}) or {}
+            lines.extend(
+                [
+                    "",
+                    "## Failure Diagnosis",
+                    f"- Non-Pass Total: `{diagnosis.get('non_pass_total', 0)}`",
+                    f"- Hard Fail Total: `{diagnosis.get('hard_fail_total', 0)}`",
+                    f"- Suspect Total: `{diagnosis.get('suspect_total', 0)}`",
+                    f"- Dominant Owner: `{agent_assessment.get('dominant_owner', 'n/a')}`",
+                    f"- Assessment: `{agent_assessment.get('assessment', 'n/a')}`",
+                    f"- Confidence: `{agent_assessment.get('confidence', 0)}`",
+                ]
+            )
+            owner_chart = diagnosis.get("owner_chart", []) or []
+            if isinstance(owner_chart, list) and owner_chart:
+                lines.append("- Owner Breakdown:")
+                for item in owner_chart[:6]:
+                    if not isinstance(item, dict):
+                        continue
+                    lines.append(
+                        "- "
+                        + f"`{item.get('owner', 'unknown')}` "
+                        + f"count={item.get('count', 0)} "
+                        + f"ratio={item.get('ratio', 0)}"
+                    )
+            endpoint_diag = diagnosis.get("endpoint_diagnosis", []) or []
+            if isinstance(endpoint_diag, list) and endpoint_diag:
+                lines.append("- Endpoint Hotspots:")
+                for item in endpoint_diag[:8]:
+                    if not isinstance(item, dict):
+                        continue
+                    lines.append(
+                        "- "
+                        + f"`{item.get('operation_key', '')}` "
+                        + f"hard_failed={item.get('hard_failed', 0)} "
+                        + f"suspect={item.get('suspect', 0)} "
+                        + f"status={item.get('status', 'n/a')} "
+                        + f"owner={item.get('dominant_owner', 'n/a')}"
+                    )
+
         gam = report.get("gam", {})
         gam_diag = gam.get("diagnostics", {})
         gam_warnings = gam_diag.get("warnings", [])
@@ -9696,7 +13242,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--base-url",
-        default="http://localhost:8000",
+        default=DEFAULT_BASE_URL,
         help="Base URL used when generating test scripts",
     )
     parser.add_argument(
@@ -9763,42 +13309,46 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
 
-    agent = QASpecialistAgent(
-        spec_path=args.spec,
-        nlp_prompt=args.prompt,
-        tenant_id=args.tenant_id,
-        workspace_id=args.workspace_id,
-        base_url=args.base_url,
-        output_dir=args.output_dir,
-        max_scenarios=args.max_scenarios,
-        max_runtime_sec=args.max_runtime_sec,
-        llm_token_cap=args.llm_token_cap,
-        environment_profile=args.environment_profile,
-        pass_threshold=args.pass_threshold,
-        rl_checkpoint_path=args.rl_checkpoint,
-        learning_state_path=args.learning_state,
-        script_kind=args.script_kind,
-        rl_train_mode=args.rl_train_mode,
-    )
+    try:
+        agent = QASpecialistAgent(
+            spec_path=args.spec,
+            nlp_prompt=args.prompt,
+            tenant_id=args.tenant_id,
+            workspace_id=args.workspace_id,
+            base_url=args.base_url,
+            output_dir=args.output_dir,
+            max_scenarios=args.max_scenarios,
+            max_runtime_sec=args.max_runtime_sec,
+            llm_token_cap=args.llm_token_cap,
+            environment_profile=args.environment_profile,
+            pass_threshold=args.pass_threshold,
+            rl_checkpoint_path=args.rl_checkpoint,
+            learning_state_path=args.learning_state,
+            script_kind=args.script_kind,
+            rl_train_mode=args.rl_train_mode,
+        )
 
-    report = agent.run()
-    summary = report["summary"]
-    files = report["report_files"]
+        report = agent.run()
+        summary = report["summary"]
+        files = report["report_files"]
 
-    print("QA specialist run complete")
-    print(f"Spec: {report['metadata']['spec_title']}")
-    print(
-        f"Scenarios: total={summary['total_scenarios']} "
-        f"passed={summary['passed_scenarios']} failed={summary['failed_scenarios']}"
-    )
-    print(f"Pass rate: {summary['pass_rate']}")
-    print(f"Quality gate met: {summary['meets_quality_gate']}")
-    print(f"JSON report: {files['json']}")
-    print(f"Markdown report: {files['markdown']}")
-    llm_debug_log = str((report.get("report_files", {}) or {}).get("llm_scenario_debug", "")).strip()
-    if llm_debug_log:
-        print(f"LLM scenario debug log: {llm_debug_log}")
-    return 0
+        print("QA specialist run complete")
+        print(f"Spec: {report['metadata']['spec_title']}")
+        print(
+            f"Scenarios: total={summary['total_scenarios']} "
+            f"passed={summary['passed_scenarios']} failed={summary['failed_scenarios']}"
+        )
+        print(f"Pass rate: {summary['pass_rate']}")
+        print(f"Quality gate met: {summary['meets_quality_gate']}")
+        print(f"JSON report: {files['json']}")
+        print(f"Markdown report: {files['markdown']}")
+        llm_debug_log = str((report.get("report_files", {}) or {}).get("llm_scenario_debug", "")).strip()
+        if llm_debug_log:
+            print(f"LLM scenario debug log: {llm_debug_log}")
+        return 0
+    except Exception as exc:
+        print(f"QA specialist run failed: {exc}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

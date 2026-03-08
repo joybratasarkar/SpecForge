@@ -1,141 +1,203 @@
 # Customer UI API and Runtime Flow
 
-This document explains exactly how the customer-facing UI triggers the QA agent and how data moves between frontend, backend, and runner.
+This document describes how the customer UI builds payloads, starts jobs, streams status, and reads artifacts in both supported UI modes.
 
-## Connection Modes
+## 1. Connection Modes
 
-1. Next.js only mode:
-- frontend calls Next API routes on the same origin (`/api/jobs`, etc.)
-- Next API routes execute `run_qa_domain.sh`
+## 1.1 Split Mode (Recommended)
 
-2. Split mode (recommended for FastAPI backend):
-- frontend calls FastAPI directly using `NEXT_PUBLIC_BACKEND_BASE_URL=http://127.0.0.1:8787`
-- FastAPI routes execute `run_qa_domain.sh`
+1. UI runs in Next.js.
+2. Browser calls FastAPI directly using `NEXT_PUBLIC_BACKEND_BASE_URL`.
+3. Backend APIs are served by `backend/qa_customer_api.py`.
 
-Both modes use the same request/response shape.
+Typical base URL:
 
-## API Endpoints
+1. `http://127.0.0.1:8787`
+
+## 1.2 Full Next Mode
+
+1. UI and API routes run inside Next.js.
+2. `/api/jobs` is handled by `frontend/customer-ui-next/app/api/jobs/route.js`.
+3. Node runner (`frontend/customer-ui-next/lib/runner.js`) executes `backend/run_qa_domain.sh` locally.
+
+## 2. Frontend Request Assembly
+
+UI page:
+
+1. `frontend/customer-ui-next/app/page.js`
+
+Normalization/storage helpers:
+
+1. `frontend/customer-ui-next/lib/store.js`
+
+Runner:
+
+1. `frontend/customer-ui-next/lib/runner.js`
+
+The UI builds a frontend-shaped payload (camelCase). Core fields:
+
+1. Workload and scope:
+- `domains`, `specPaths`, `scopeMode`, `includeOperations`, `excludeOperations`, `requestMutationRules`
+
+2. Runtime knobs:
+- `tenantId`, `workspaceId`, `scriptKind`, `maxScenarios`, `maxRuntimeSec`, `llmTokenCap`
+- `environmentProfile`, `environmentTargets`, `baseUrl`
+
+3. Auth:
+- `authMode` (`none|bearer|api_key|basic|form` in frontend normalization)
+- `authContext` (for bearer/api_key specifically used by backend runner path)
+- `authProfiles` (operation-level overrides)
+
+4. Gates and reporting:
+- `passThreshold`, `releaseGate`, `criticalOperations`, `criticalAssertions`, `resourceLimits`, `reportMode`
+
+5. Persistence mode:
+- `customerMode`, `verifyPersistence`, `customerRoot`
+
+Note:
+
+1. UI enforces `customerIntent` and uploaded/pasted spec before submit.
+2. For custom domains, `specPaths.<domain>` is required.
+
+## 3. Split Mode FastAPI Endpoints
+
+Base: `http://127.0.0.1:8787`
 
 1. `POST /api/jobs`
-- Purpose: start one QA job across selected domains.
-- Request body:
-```json
-{
-  "domains": ["ecommerce", "healthcare"],
-  "tenantId": "customer_default",
-  "prompt": "optional context",
-  "maxScenarios": 16,
-  "passThreshold": 0.7,
-  "baseUrl": "http://localhost:8000",
-  "customerMode": true,
-  "verifyPersistence": true,
-  "customerRoot": "~/.spec_test_pilot"
-}
-```
-- Response:
-```json
-{
-  "jobId": "abc123",
-  "status": "queued"
-}
-```
+- creates async job and returns `{"job_id":"...","status":"queued"}`
 
 2. `GET /api/jobs`
-- Purpose: list jobs and top-level status.
+- lists jobs
 
-3. `GET /api/jobs/{jobId}?tail=1200`
-- Purpose: snapshot of one job.
-- Includes:
-  - run status and timestamps
-  - current domain in progress
-  - per-domain result map
-  - recent log lines
+3. `GET /api/jobs/{job_id}`
+- job snapshot (`status`, `current_domain`, `results`, `logs`, request payload)
 
-4. `GET /api/jobs/{jobId}/events`
-- Purpose: realtime stream over SSE.
-- Events:
-  - `snapshot`: full incremental job snapshot
-  - `done`: terminal signal when run finishes
+4. `GET /api/jobs/{job_id}/events`
+- SSE stream (`snapshot`, `done`)
 
-5. `GET /api/jobs/{jobId}/report/{domain}?format=json|md`
-- Purpose: fetch final report payload for one domain.
-- JSON is used for parsed interactive viewer.
-- Markdown is used for raw readable report view.
+5. `GET /api/jobs/{job_id}/report/{domain}`
+- report JSON/Markdown
+- supports `format=json|md` and `view=full|executive|summary|technical`
 
-6. `GET /api/jobs/{jobId}/generated-tests/{domain}`
-- Purpose: list generated test scripts for one domain.
-- Response includes:
-  - `kind` (`python_pytest`, `javascript_jest`, `curl_script`, `java_restassured`)
-  - `path`
-  - `exists`
-  - `size_bytes`
-  - `safe_to_read`
+6. `GET /api/jobs/{job_id}/generated-tests/{domain}`
+- list generated scripts and safety metadata
 
-7. `GET /api/jobs/{jobId}/generated-tests/{domain}/{kind}`
-- Purpose: return script content for preview/download in UI.
+7. `GET /api/jobs/{job_id}/generated-tests/{domain}/{kind}`
+- fetch script contents (path-safe)
 
-## Runtime Sequence
+8. Alias endpoints:
+- `/api/runs*` mirrors `/api/jobs*`
 
-1. User clicks `Run QA Agent` in frontend.
-2. Frontend sends `POST /api/jobs`.
-3. Backend creates `jobId`, stores job as `queued`, returns immediately.
-4. Worker starts domain loop:
-- builds command for `run_qa_domain.sh`
-- executes process
-- streams logs into job store
-- reads `qa_execution_report.json`
-- stores per-domain summary + report paths
-5. Frontend subscribes to `GET /api/jobs/{jobId}/events`.
-6. UI updates:
-- runtime status
-- step map
-- domain cards
-- report viewer
-- generated scripts panel
-- Agent R&D panel
-- flow step telemetry (for example: `selected=<x> / candidates=<y>` for Scenario Selection)
-7. On terminal state (`completed` or `failed`), backend emits `done`.
+9. Periodic RL endpoints:
+- `GET /api/system/periodic-rl`
+- `POST /api/system/periodic-rl/run-now`
 
-## Report Viewer Mapping
+## 4. Full Next Mode Endpoints
 
-The interactive report viewer reads these JSON keys:
+Next APIs mirror job behavior with local in-memory store:
 
-1. Summary cards:
-- `summary.total_scenarios`
-- `summary.pass_rate`
-- `summary.meets_quality_gate`
-- `agent_lightning.training_stats.rl_training_steps`
-- `agent_lightning.training_stats.rl_buffer_size`
-- `learning.feedback.run_reward`
+1. `POST /api/jobs` and `GET /api/jobs`
+2. `GET /api/jobs/{jobId}`
+3. `GET /api/jobs/{jobId}/events` (SSE)
+4. `GET /api/jobs/{jobId}/report/{domain}`
+5. `GET /api/jobs/{jobId}/generated-tests/{domain}`
+6. `GET /api/jobs/{jobId}/generated-tests/{domain}/{kind}`
+7. `POST /api/spec-upload` for local file upload in Next mode
 
-2. Scenario table:
-- `scenario_results[]` entries:
-  - `name`, `test_type`, `method`, `endpoint_template`
-  - `expected_status`, `actual_status`
-  - `passed`, `duration_ms`
+Run aliases also exist:
 
-3. Raw view:
-- complete JSON/Markdown body for audit/debug
+1. `/api/runs`
+2. `/api/runs/{runId}`
+3. `/api/runs/{runId}/events`
 
-4. Generated scripts panel:
-- list and preview based on `generated_test_files`
-- secure script fetch through backend endpoint (path safety check)
+## 5. End-to-End Runtime Sequence (Split Mode)
 
-5. Agent R&D panel:
-- `selection_policy` (algorithm, candidate/selected counts, top decisions)
-- `learning.feedback` (run reward, reward breakdown, decision counts)
-- `learning.state_snapshot.weakest_patterns`
+1. User configures intent/auth/spec/scope in UI.
+2. UI sends `POST /api/jobs`.
+3. FastAPI validates via `RunRequest` and queues worker.
+4. Worker executes domain loop:
+- builds `run_qa_domain.sh` command
+- injects auth/scope/limit env vars
+- streams logs into job state
+- loads report artifacts into `results[domain]`
+5. UI consumes:
+- SSE snapshots for live state
+- report endpoint for summary/raw
+- generated-tests endpoints for script listing/preview
+6. Job ends as `completed` or `failed`.
 
-## Field Compatibility
+## 6. Field Shape Compatibility in UI
 
-The Next UI handles both field conventions:
+UI reads both snake_case and camelCase to support both backends.
 
-1. FastAPI shape:
-- `current_domain`, `started_at`, `completed_at`
-- `return_code`, `pass_rate`, `total_scenarios`, ...
+Examples:
 
-2. Next API route shape:
-- `currentDomain`, `startedAt`, `completedAt`
-- `exitCode`, `passRate`, `totalScenarios`, ...
+1. job progress fields:
+- `current_domain` (FastAPI)
+- `currentDomain` (Next local)
 
-This compatibility layer prevents blank cards when switching backend mode.
+2. timestamps:
+- `started_at`/`completed_at`
+- `startedAt`/`completedAt`
+
+3. domain result status code:
+- `return_code` (FastAPI)
+- `exitCode` (Next local)
+
+## 7. Auth and Secret Handling
+
+Split mode FastAPI behavior:
+
+1. request payload stores redacted auth context (`token provided` flags, not raw secrets)
+2. runtime secrets are kept in memory (`_job_runtime_secrets`)
+3. child process gets secrets only through environment variables during execution
+
+Full Next mode behavior:
+
+1. store keeps `runtimeSecrets` separately from public request fields
+2. runner injects secrets into child env similarly
+
+## 8. Generated Artifacts Exposed to UI
+
+For each domain result:
+
+1. `report_json` / `report_md` paths
+2. `summary` object (pass rate, quality gate, RL/GAM summary counters)
+3. `generated_tests` map (kind -> file path)
+
+Generated script endpoints return only files within domain output directory.
+
+## 9. Practical Payload Example
+
+```json
+{
+  "domains": ["bearer_inventory_smoke"],
+  "specPaths": {
+    "bearer_inventory_smoke": ".../backend/examples/openapi_smoke_types/bearer_inventory.yaml"
+  },
+  "tenantId": "customer_payload_test",
+  "workspaceId": "customer_payload_test",
+  "scriptKind": "python_pytest",
+  "maxScenarios": 8,
+  "passThreshold": 0.6,
+  "baseUrl": "http://127.0.0.1:8000",
+  "environmentProfile": "mock",
+  "authMode": "bearer",
+  "authContext": {"bearerToken": "***"},
+  "scopeMode": "advanced",
+  "includeOperations": ["GET /inventory", "POST /inventory"],
+  "releaseGate": {"enabled": false, "safeModeOnFail": false},
+  "reportMode": "summary",
+  "customerMode": true,
+  "verifyPersistence": false,
+  "customerRoot": "/tmp/specforge_customer"
+}
+```
+
+## 10. Operational Validation Checklist
+
+1. `POST /api/jobs` returns a job id.
+2. `GET /api/jobs/{id}` transitions to terminal state.
+3. `GET /api/jobs/{id}/report/{domain}` returns summary.
+4. `GET /api/jobs/{id}/generated-tests/{domain}` shows at least one script kind.
+5. `GET /api/jobs/{id}/generated-tests/{domain}/{kind}` returns script text.

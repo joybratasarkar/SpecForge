@@ -1,415 +1,280 @@
 # QA Agent Runtime Step Map
 
-This is a run-time map of the QA specialist pipeline, with each step showing:
+This document maps the active QA runtime path step-by-step, including wrapper layers, core method boundaries, and persisted outputs.
 
-1. exact code entrypoint
-2. input payload for that step
-3. output payload from that step
-4. what gets persisted
+## 1. Covered Runtime Path
 
-Primary runtime path covered here:
+1. Wrapper/API layer:
+- `backend/qa_customer_api.py` (`POST /api/jobs`, worker `_run_job`)
+- `backend/run_qa_domain.sh`
 
-1. `qa_agent_runner.py`
-2. `spec_test_pilot/qa_specialist_agent.py`
-3. `spec_test_pilot/adaptive_policy.py`
-4. `spec_test_pilot/agent_lightning_v2.py`
+2. Core runner:
+- `backend/qa_agent_runner.py`
+- `backend/spec_test_pilot/qa_specialist_agent.py`
 
-Customer-facing wrapper:
+3. Learning/policy:
+- `backend/spec_test_pilot/adaptive_policy.py`
+- `backend/spec_test_pilot/agent_lightning_v2.py`
 
-1. `run_qa_domain.sh --customer-mode --verify-persistence`
-2. auto-manages persistent workspace/checkpoint and optional second-pass persistence validation
-
-## 1. One-Page Flow Diagram
+## 2. One-Page Flow
 
 ```mermaid
 flowchart TD
-    A[CLI Args\n--spec --tenant-id --prompt --output-dir\n--max-scenarios --pass-threshold --rl-checkpoint]
-    B[QASpecialistAgent.__init__\nload learning_state + policy state\nload RL checkpoint]
-    C[_load_spec + _build_auth_requirement_map]
-    D[GAM start_session + research]
-    E[HumanTesterSimulator.think_like_tester]
-    F[_select_scenarios_with_learning\ncontextual linear-UCB + uncertainty coverage + RL risk]
-    G[_apply_scenario_repairs]
-    H[_generate_test_files\nPython / JS / Java / cURL]
-    I[_execute_in_isolated_mock\nDynamicMockServer + TestClient]
-    J[_build_summary]
-    K[_compute_learning_feedback\nrun_reward + decision_signals]
-    L[_update_learning_state + _save_learning_state]
-    M[_run_agent_lightning_training\ntrain_agent + train_step + checkpoint autosave]
-    N[_write_reports\nqa_execution_report.json + qa_execution_report.md]
-
-    A --> B --> C --> D --> E --> F --> G --> H --> I --> J --> K --> L --> M --> N
+    A[POST /api/jobs or CLI args] --> B[_run_job builds env + command]
+    B --> C[run_qa_domain.sh]
+    C --> D[qa_agent_runner.py main()]
+    D --> E[QASpecialistAgent.__init__]
+    E --> F[QASpecialistAgent.run()]
+    F --> G[spec intelligence]
+    G --> H[GAM research/context]
+    H --> I[scenario generation]
+    I --> J[mutation + selection + repair]
+    J --> K[execute + verify]
+    K --> L[summary + learning feedback]
+    L --> M[RL buffer update + checkpoint]
+    M --> N[write report JSON/MD]
 ```
 
-## 2. Runtime Sequence Diagram
+## 3. Job API Contract (FastAPI)
 
-```mermaid
-sequenceDiagram
-    participant CLI as qa_agent_runner.py
-    participant QA as QASpecialistAgent
-    participant GAM as GAMMemorySystem
-    participant POL as AdaptiveScenarioPolicy
-    participant ISO as DynamicMockServer/TestClient
-    participant RL as AgentLightningTrainer(v2)
-    participant FS as Filesystem
+`POST /api/jobs` request is validated by `RunRequest` in `backend/qa_customer_api.py`.
 
-    CLI->>QA: build from CLI args
-    QA->>QA: load learning_state.json + RL checkpoint
-    QA->>QA: load spec + auth map
-    QA->>GAM: start_session + research
-    QA->>QA: generate scenarios
-    QA->>POL: score/select scenarios
-    POL-->>QA: selected scenarios + score trace
-    QA->>QA: apply repairs
-    QA->>FS: write generated_tests/*
-    QA->>ISO: execute scenarios in-memory
-    ISO-->>QA: scenario execution results
-    QA->>QA: build summary + decision rewards
-    QA->>POL: observe() per decision
-    QA->>FS: save learning_state.json
-    QA->>RL: train_agent(task_payload)
-    RL-->>QA: training_result + training_stats
-    RL->>FS: save checkpoint
-    QA->>FS: write qa_execution_report.json/.md
-    QA-->>CLI: run summary + report paths
-```
+Key accepted fields:
 
-## 3. Step-by-Step I/O Map
+1. Workload/scoping:
+- `domains`, `specPaths`, `scopeMode`, `includeOperations`, `excludeOperations`, `requestMutationRules`
 
-| Step | Code | Inputs | Outputs | Persisted |
-|---|---|---|---|---|
-| 0 | `build_arg_parser()/main()` | CLI args (`--spec`, `--prompt`, `--tenant-id`, `--base-url`, `--output-dir`, `--max-scenarios`, `--pass-threshold`, `--rl-checkpoint`, `--script-kind`) | configured `QASpecialistAgent` | none |
-| 1 | `QASpecialistAgent.__init__` | parsed args | in-memory runtime state (`gam`, `rl_trainer`, `learning_state`, `adaptive_policy`) | output dir created; RL checkpoint loaded if exists |
-| 2 | `_load_spec` | `spec_path` | parsed OpenAPI dict | none |
-| 3 | `_build_auth_requirement_map` | OpenAPI dict | `self._auth_required_ops` set | none |
-| 4 | `gam.start_session` + `gam.research` | tenant + spec metadata | research plan/reflection/excerpts | GAM session pages |
-| 5 | `HumanTesterSimulator.think_like_tester` | spec + effective prompt | candidate `TestScenario[]` | none |
-| 6 | `_select_scenarios_with_learning` | candidates + weights + policy state + RL risk | selected scenarios + `selection_trace` + `selection_summary` | stored later in `learning_state.json` + report |
-| 7 | `_apply_scenario_repairs` | selected scenarios + schema + scenario stats | repaired scenarios + repair summary | repair rule state |
-| 8 | `_generate_test_files` | repaired scenarios + base URL + `script_kind` | one generated script file map (`generated_test_files`) | one file under `generated_tests/` |
-| 9 | `_execute_generated_script` | spec + generated script path | generated-script execution summary (`generated_script_execution`) | in report |
-| 10 | `_execute_in_isolated_mock` | spec + repaired scenarios | `ScenarioExecutionResult[]` | `openapi_under_test.yaml` |
-| 11 | `_build_summary` | execution results + spec | summary metrics (pass/fail/rate/gate) | in report |
-| 12 | `_compute_learning_feedback` | scenarios + results + summary | `run_reward`, `decision_signals[]` | in report |
-| 13 | `_update_learning_state` | decision signals | updated weights/stats/policy posterior | later saved in `learning_state.json` |
-| 14 | `_save_learning_state` | current learning state | serialized learning snapshot | `learning_state.json` |
-| 15 | `_run_agent_lightning_training` | `spec_title`, `summary`, `report_path`, `learning_feedback` | `training_result`, `training_stats` | RL checkpoint autosave |
-| 16 | `_write_reports` | full report dict | JSON/MD report paths | `qa_execution_report.json`, `qa_execution_report.md` |
+2. Runtime:
+- `tenantId`, `workspaceId`, `environmentProfile`, `baseUrl`, `maxScenarios`, `maxRuntimeSec`, `llmTokenCap`
 
-## 4. Detailed Step Contracts
+3. Auth:
+- `authMode`, `authContext`, `authProfiles`
 
-## Step 0: CLI Input Contract
+4. Gates/reporting:
+- `passThreshold`, `releaseGate`, `resourceLimits`, `criticalOperations`, `criticalAssertions`, `reportMode`
+
+5. Persistence mode:
+- `customerMode`, `verifyPersistence`, `customerRoot`
+
+Response:
 
 ```json
-{
-  "spec": "/tmp/openapi_ecommerce.yaml",
-  "prompt": "Generate comprehensive QA tests...",
-  "tenant_id": "qa_demo",
-  "base_url": "http://localhost:8000",
-  "output_dir": "/tmp/qa_demo_run",
-  "max_scenarios": 16,
-  "pass_threshold": 0.7,
-  "rl_checkpoint": "/tmp/agent_lightning_ecommerce.pt"
-}
+{"job_id":"<12-char>","status":"queued"}
 ```
 
-## Step 1: Runtime Initialization Contract
+## 4. Wrapper Step Map (`qa_customer_api.py` + `run_qa_domain.sh`)
 
-`QASpecialistAgent.__init__` creates and wires:
+1. `create_job(req)`
+- normalizes request shape and redacts auth context
+- stores runtime secrets separately (`_job_runtime_secrets`)
+- queues threadpool task `_run_job(job_id)`
 
-1. `self.gam = GAMMemorySystem(...)`
-2. `self.rl_trainer = AgentLightningTrainer(...)`
-3. `self.rl_trainer.register_agent("qa_specialist", self._qa_agent_feedback)`
-4. `self.learning_state = _load_learning_state()`
-5. `self.adaptive_policy = AdaptiveScenarioPolicy.from_state(...)`
+2. `_run_job(job_id)`
+- per domain: builds command to `run_qa_domain.sh`
+- injects runtime env vars (auth, scope, limits, report mode)
+- streams child stdout to job logs
+- reads report artifacts and stores domain result
 
-Checkpoint behavior:
+3. `run_qa_domain.sh`
+- optional spec generation for preset domains
+- executes `qa_agent_runner.py`
+- optional CI gate + safe-mode rollback behavior
+- optional persistence verification second pass
 
-1. if checkpoint path exists, RL replay/model state is loaded
-2. if missing, trainer starts clean
+## 5. Core Step Map (`QASpecialistAgent.run()`)
 
-## Step 2: Spec Load Contract
+### Step 0: Initialization (`__init__`)
 
-Input:
+Inputs:
 
-1. file extension `.yaml/.yml` or JSON
+1. CLI/runtime args
+2. env configuration (`runtime_settings`, learning policy, auth/scope env)
 
-Output:
+Creates:
 
-1. top-level object (`dict`) required
-2. throws if file missing or parse invalid
+1. `GAMMemorySystem`
+2. `AgentLightningTrainer` (`agent_lightning_v2`)
+3. learning state and adaptive policy from persisted files
 
-## Step 3: Auth Map Contract
+Persistence side effects:
 
-Input:
+1. resolves checkpoint path and learning state path
+2. cleans stale atomic temp files
 
-1. global `security`
-2. operation-level `security`
+### Step 1: Spec Intelligence
 
-Output:
+Methods:
 
-1. set of operation keys, e.g. `"POST /orders"`, requiring auth
-
-Used later by `_normalize_auth_headers_for_execution`.
-
-## Step 4: GAM Research Contract
-
-Research context payload:
-
-```json
-{
-  "spec_title": "E-commerce API",
-  "auth_type": "bearer",
-  "endpoints": [{"method":"GET","path":"/products"}],
-  "tenant_id": "qa_demo"
-}
-```
-
-Research output:
-
-1. `plan`
-2. `reflection`
-3. `memory_excerpts[]`
-
-These feed prompt composition.
-
-## Step 5: Scenario Generation Contract
-
-Input:
-
-1. OpenAPI spec
-2. effective prompt (`user prompt + memory excerpt hints`)
-
-Output:
-
-1. candidate `TestScenario[]`
-
-Typical test types:
-
-1. `authentication`
-2. `input_validation`
-3. `error_handling`
-4. `boundary_testing`
-
-## Step 6: Adaptive Selection Contract
-
-Per candidate score components:
-
-1. `expected_reward`
-2. `uncertainty`
-3. `exploration_bonus`
-4. `failure_focus_bonus`
-5. `rl_risk`
-6. `novelty_bonus`
-7. diversity penalties (endpoint/type repetition)
-
-Selection policy behavior:
-
-1. force uncertainty coverage set first
-2. fill remaining budget by adjusted score rank
-3. record top decision trace (name, score parts, reason)
-
-Outputs persisted in report:
-
-1. `selection_policy.top_decisions[]`
-2. `selection_policy.uncertain_candidate_count`
-3. `selection_policy.uncertain_selected_count`
-
-## Step 7: Repair Rule Contract
-
-Uses historical `scenario_stats` to create rule actions, e.g.:
-
-1. `override_expected_status`
-2. `repair_request_body`
-
-Applied before execution and summarized as:
-
-1. active rules
-2. applied repairs
-3. status overrides
-4. request-body repairs
-
-## Step 8: Generated Test Artifacts Contract
+1. `_load_spec`
+2. `_build_auth_requirement_map`
+3. `_build_operation_index`
+4. `_build_spec_intelligence`
 
 Outputs:
 
-Exactly one generated script is produced per run, based on `--script-kind`:
+1. auth-required operation set
+2. operation metadata index
+3. dependency/workflow/risk intelligence block
 
-1. `python_pytest` -> `generated_tests/test_api.py`
-2. `javascript_jest` -> `generated_tests/test_api.test.js`
-3. `curl_script` -> `generated_tests/test_api.sh`
-4. `java_restassured` -> `generated_tests/APITests.java`
+### Step 2: GAM Memory Research
 
-`generated_script_execution` captures execution status and pass/fail counts.
+Methods:
 
-## Step 9: Isolated Execution Contract
+1. `gam.start_session`
+2. `_persist_rl_learning_signal_page`
+3. `_persist_gam_spec_context_page`
+4. `gam.research`
+5. `_build_gam_context_pack`
 
-Execution runtime:
+Optional enrichment:
 
-1. copy spec to `openapi_under_test.yaml`
-2. start `DynamicMockServer` from copied spec
-3. execute each scenario with in-memory `TestClient`
+1. trusted fallback excerpts
+2. MCP tool excerpts (`_collect_mcp_tool_excerpts`)
 
-Per-scenario output:
+Outputs:
 
-```json
-{
-  "name": "test_post__orders_no_auth",
-  "test_type": "authentication",
-  "method": "POST",
-  "endpoint_template": "/orders",
-  "endpoint_resolved": "/orders",
-  "expected_status": 401,
-  "actual_status": 401,
-  "passed": true,
-  "duration_ms": 1.2,
-  "error": "",
-  "response_excerpt": "{...}"
-}
-```
+1. memory excerpts
+2. diagnostics and context pack
+3. prompt focus points
 
-## Step 10: Summary Contract
+### Step 3: Scenario Generation
 
-Summary object keys:
+Methods:
 
-1. `total_scenarios`
-2. `passed_scenarios`
-3. `failed_scenarios`
-4. `pass_rate`
-5. `pass_threshold`
-6. `meets_quality_gate`
-7. `average_duration_ms`
-8. `detected_endpoints`
-9. `scenario_count_generated`
-10. `test_type_breakdown`
-11. `failed_examples`
+1. `HumanTesterSimulator.think_like_tester`
+2. `_ensure_happy_path_coverage`
+3. `_inject_workflow_sequence_scenarios`
+4. `_inject_real_life_guardrail_scenarios`
 
-## Step 11: Learning Feedback Contract
+Outputs:
 
-Run-level values:
+1. base candidate scenarios
+2. prompt trace + scenario generation trace
 
-1. `run_reward`
-2. reward component breakdown
+### Step 4: Mutation, Selection, and Repair
 
-Decision-level values:
+Methods:
 
-1. one `DecisionLearningSignal` per executed scenario
-2. includes `scenario_fingerprint` and scalar `reward`
+1. `_augment_scenarios_with_rl_mutation`
+2. `_select_scenarios_with_learning`
+3. `_apply_scenario_repairs`
+4. `_prepare_scenarios_for_execution_and_scripts`
 
-## Step 12/13: Learning State Update + Save
+Outputs:
 
-Updated structures:
+1. selected executable scenario set
+2. mutation and selection traces/summaries
+3. repair summary
 
-1. `test_type_weights`
-2. `endpoint_weights`
-3. `scenario_stats` (attempts/failure_rate/avg_reward/status counts)
-4. `decision_history`
-5. `adaptive_policy` state (`A`, `b`, config)
-6. `selection_trace`, `selection_summary`
-7. `scenario_repair_rules`
+### Step 5: Execute and Verify
 
-Persisted at:
+Methods:
 
-1. `<output_dir>/learning_state.json`
+1. `_execute_scenarios`
+2. `_execute_in_isolated_mock` or `_execute_against_live_api`
+3. `_verify_then_correct_result`
+4. `_verify_response_contract`
+5. `_apply_failure_triage_and_rerun`
+6. `_build_failure_diagnosis`
 
-## Step 14: RL Training Contract
+Outputs:
 
-Task payload to RL:
+1. `ScenarioExecutionResult[]`
+2. verification payloads (status/contract/flaky/taxonomy)
 
-```json
-{
-  "spec_title": "E-commerce API",
-  "tenant_id": "qa_demo",
-  "pass_rate": 0.875,
-  "pass_threshold": 0.7,
-  "total_scenarios": 16,
-  "failed_scenarios": 2,
-  "report_path": "/tmp/.../qa_execution_report.json",
-  "summary": {"...": "..."},
-  "learning_reward_score": 0.93,
-  "decision_signals": [{"...": "..."}]
-}
-```
+### Step 6: Script Generation and Script Execution
 
-Inside `AgentLightningTrainer.train_agent(...)`:
+Methods:
 
-1. start observability session
-2. collect initial `action` trace
-3. collect per-scenario `scenario_decision` traces from `decision_signals`
-4. collect final `observation` trace
-5. credit assignment
-6. transition creation into replay buffer
-7. RL `train_step`
-8. checkpoint autosave
+1. `_generate_test_files`
+2. `_execute_generated_script`
 
-Reported back to QA report:
+Notes:
+
+1. one primary script kind per run (`python_pytest`, `javascript_jest`, `curl_script`, or `java_restassured`)
+2. script safety checks are enforced before execution
+
+### Step 7: Summary and Learning Update
+
+Methods:
+
+1. `_build_summary`
+2. `_build_repro_artifacts`
+3. `_compute_learning_feedback`
+4. `_update_learning_state`
+5. `_compute_learning_delta_summary`
+6. `_save_learning_state`
+
+Outputs:
+
+1. summary and quality-gate verdict
+2. reward and decision signals
+3. updated learning state snapshot
+
+### Step 8: RL Adapter Call + Report Write
+
+Methods:
+
+1. `_run_agent_lightning_training`
+2. `_write_reports`
+
+Important behavior:
+
+1. `train_agent(...)` in this path buffers transitions and autosaves checkpoint
+2. heavy RL optimization runs in periodic batches (`run_periodic_training`)
+
+Outputs:
 
 1. `agent_lightning.training_result`
 2. `agent_lightning.training_stats`
+3. final report files and paths
 
-## Step 15: Final Report Contract
+## 6. Persisted Artifacts
 
-`qa_execution_report.json` top-level keys:
+Per run output directory:
 
-1. `metadata`
-2. `summary`
-3. `learning`
-4. `selection_policy`
-5. `repair_policy`
-6. `generated_test_files`
-7. `generated_script_execution`
-8. `scenario_results`
-9. `gam`
-10. `agent_lightning`
-11. `paper_references`
-12. `report_files`
+1. `qa_execution_report.json`
+2. `qa_execution_report.md`
+3. `generated_tests/*`
+4. `llm_scenario_debug.jsonl`
+5. `openapi_under_test.yaml` (mock execution path)
 
-## 5. Runtime Log Markers -> Step Mapping
+Across runs:
 
-| Log Marker | Mapped Step |
-|---|---|
-| `[OK] OpenAPI spec written` | pre-step 0 (domain wrapper script) |
-| `[RUN] QA specialist agent` | step 0 |
-| `Started observability session ...` | step 15 start |
-| `RL training executed: Loss=...` | step 15 train step |
-| `RL TRAINING ACTIVE: Step N ...` | step 15 train result |
-| `QA specialist run complete` | step 16 done |
-| `JSON report: ...` | step 16 output |
+1. RL checkpoint (`*.pt`)
+2. learning state (`*_learning_state.json`)
+3. GAM memory pages JSON
 
-## 6. How to Inspect Each Step While Running
+## 7. Periodic RL Runtime Map
 
-1. Run a domain:
-```bash
-./backend/run_qa_domain.sh --domain ecommerce --action both --output-dir /tmp/qa_map_demo --rl-checkpoint /tmp/qa_map_demo.pt
-```
+FastAPI periodic worker (`qa_customer_api.py`):
 
-2. Inspect final report keys:
-```bash
-jq 'keys' /tmp/qa_map_demo/qa_execution_report.json
-```
+1. discovers checkpoints from `/tmp/qa_ui_checkpoints/*.pt` and known job results
+2. for each checkpoint:
+- loads trainer
+- runs `run_periodic_training(max_steps, min_buffer_size)`
+- autosaves checkpoint
 
-3. Inspect selection policy details:
-```bash
-jq '.selection_policy' /tmp/qa_map_demo/qa_execution_report.json
-```
+Control knobs:
 
-4. Inspect learning feedback + decision signals:
-```bash
-jq '.learning.feedback' /tmp/qa_map_demo/qa_execution_report.json
-```
+1. `QA_RL_PERIODIC_ENABLED`
+2. `QA_RL_PERIODIC_INTERVAL_SEC`
+3. `QA_RL_PERIODIC_MAX_STEPS`
+4. `QA_RL_PERIODIC_MIN_BUFFER`
 
-5. Inspect RL stats/checkpoint:
-```bash
-jq '.agent_lightning.training_stats, .learning.agent_lightning_checkpoint' /tmp/qa_map_demo/qa_execution_report.json
-```
+APIs:
 
-6. Inspect persisted policy/memory state:
-```bash
-jq '.run_count, .adaptive_policy.feature_dim, (.scenario_stats | length), (.scenario_repair_rules | length)' /tmp/qa_map_demo/learning_state.json
-```
+1. `GET /api/system/periodic-rl`
+2. `POST /api/system/periodic-rl/run-now`
 
-## 7. Known Separation: Current vs Official Path
+## 8. Minimal Runtime Validation Checklist
 
-1. `qa_agent_runner.py` uses `agent_lightning_v2.py` runtime.
-2. `qa_official_lightning_runner.py` uses `spec_test_pilot/agent_lightning_official.py` (official package adapter).
-3. They are separate execution paths; this document maps the QA production path.
+1. Job accepted: `POST /api/jobs` returns `job_id`.
+2. Job progresses: `queued -> running -> completed|failed`.
+3. Domain result contains non-empty `report_json` and `generated_tests`.
+4. Report includes:
+- `metadata.stage_metrics_ms`
+- `summary`
+- `learning.feedback`
+- `agent_lightning.training_stats`
+5. Periodic RL endpoint reports non-zero `runs_total` over time when enabled.

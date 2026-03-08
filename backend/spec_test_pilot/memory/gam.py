@@ -554,18 +554,16 @@ class Memorizer:
         """
         self.page_store = page_store
         self._active_sessions: Dict[str, Session] = {}
-        raw_memo_mode = (
-            str(os.getenv("GAM_MEMO_LLM_MODE", os.getenv("GAM_LLM_MODE", "on")))
-            .strip()
-            .lower()
-            or "on"
-        )
-        if raw_memo_mode != "on":
-            logger.warning(
-                "Ignoring GAM_MEMO_LLM_MODE=%s. GAM memo LLM mode is enforced to 'on'.",
-                raw_memo_mode,
+        raw_memo_mode = str(
+            os.getenv("GAM_MEMO_LLM_MODE", os.getenv("GAM_LLM_MODE", "auto"))
+        ).strip().lower() or "auto"
+        if raw_memo_mode not in {"on", "off", "auto"}:
+            raw_memo_mode = "auto"
+        if raw_memo_mode == "auto":
+            raw_memo_mode = (
+                "on" if str(os.getenv("OPENAI_API_KEY", "")).strip() else "off"
             )
-        self._llm_mode = "on"
+        self._llm_mode = raw_memo_mode
         self._llm_model = (
             str(os.getenv("GAM_MEMO_OPENAI_MODEL", os.getenv("GAM_OPENAI_MODEL", "gpt-4.1-mini")))
             .strip()
@@ -1063,13 +1061,14 @@ class Researcher:
             "reflect_success": 0,
             "reflect_errors": 0,
         }
-        raw_llm_mode = str(os.getenv("GAM_LLM_MODE", "on")).strip().lower() or "on"
-        if raw_llm_mode != "on":
-            logger.warning(
-                "Ignoring GAM_LLM_MODE=%s. GAM researcher LLM mode is enforced to 'on'.",
-                raw_llm_mode,
+        raw_llm_mode = str(os.getenv("GAM_LLM_MODE", "auto")).strip().lower() or "auto"
+        if raw_llm_mode not in {"on", "off", "auto"}:
+            raw_llm_mode = "auto"
+        if raw_llm_mode == "auto":
+            raw_llm_mode = (
+                "on" if str(os.getenv("OPENAI_API_KEY", "")).strip() else "off"
             )
-        self._llm_mode = "on"
+        self._llm_mode = raw_llm_mode
         self._llm_model = str(os.getenv("GAM_OPENAI_MODEL", "gpt-4.1-mini")).strip() or "gpt-4.1-mini"
         self._llm_temperature = self._safe_float(os.getenv("GAM_LLM_TEMPERATURE"), default=0.1)
         self._llm_max_tokens = self._safe_int(os.getenv("GAM_LLM_MAX_TOKENS"), default=700)
@@ -2373,6 +2372,18 @@ class GAMMemorySystem:
             Path(storage_path).expanduser().resolve() if storage_path else None
         )
         self.autosave = bool(autosave)
+        self.atomic_tmp_max_age_sec = max(
+            60,
+            int(
+                str(
+                    os.getenv(
+                        "QA_ATOMIC_TMP_MAX_AGE_SEC",
+                        "21600",
+                    )
+                ).strip()
+                or "21600"
+            ),
+        )
         self._load_storage_if_available()
     
     def research(self, context: Dict[str, Any]) -> ResearchResult:
@@ -2433,13 +2444,24 @@ class GAMMemorySystem:
         """Persist page store to disk if storage path is configured."""
         if self.storage_path is None:
             return
-        self.storage_path.parent.mkdir(parents=True, exist_ok=True)
+        target = self.storage_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        self._cleanup_stale_tmp_files(target)
         payload = {
             "version": 1,
             "saved_at": time.time(),
             "pages": self.page_store.export_pages(),
         }
-        self.storage_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        tmp_path = target.with_name(f".{target.name}.tmp.{uuid.uuid4().hex}")
+        try:
+            tmp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            os.replace(tmp_path, target)
+        finally:
+            if tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except Exception:
+                    pass
 
     def _autosave(self) -> None:
         if self.autosave:
@@ -2456,3 +2478,26 @@ class GAMMemorySystem:
         except Exception:
             # Fall back to in-memory defaults if persistence file is invalid.
             return
+
+    def _cleanup_stale_tmp_files(self, target_path: Path) -> int:
+        cleaned = 0
+        now = time.time()
+        pattern = f".{target_path.name}.tmp.*"
+        try:
+            for candidate in target_path.parent.glob(pattern):
+                if not candidate.is_file():
+                    continue
+                try:
+                    age_sec = now - float(candidate.stat().st_mtime)
+                except Exception:
+                    age_sec = float(self.atomic_tmp_max_age_sec + 1)
+                if age_sec < float(self.atomic_tmp_max_age_sec):
+                    continue
+                try:
+                    candidate.unlink()
+                    cleaned += 1
+                except Exception:
+                    continue
+        except Exception:
+            return int(cleaned)
+        return int(cleaned)

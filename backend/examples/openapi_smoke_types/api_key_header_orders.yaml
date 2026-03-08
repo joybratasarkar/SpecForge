@@ -1,0 +1,141 @@
+openapi: "3.0.3"
+info:
+  title: API Key Header Orders API
+  version: "1.0.0"
+servers:
+  - url: http://127.0.0.1:8000
+paths:
+  /orders:
+    get:
+      security:
+        - apiKeyAuth: []
+      parameters:
+        - in: query
+          name: status
+          schema:
+            type: string
+            enum: [pending, shipped, delivered]
+      responses:
+        "200":
+          description: ok
+        "401":
+          description: unauthorized
+    post:
+      security:
+        - apiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OrderCreate"
+      responses:
+        "201":
+          description: created
+        "400":
+          description: bad request
+        "401":
+          description: unauthorized
+  /orders/{orderId}:
+    parameters:
+      - in: path
+        name: orderId
+        required: true
+        schema:
+          type: string
+    get:
+      security:
+        - apiKeyAuth: []
+      responses:
+        "200":
+          description: ok
+        "401":
+          description: unauthorized
+        "404":
+          description: not found
+    patch:
+      security:
+        - apiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                status:
+                  type: string
+                  enum: [pending, shipped, delivered]
+                note:
+                  type: string
+      responses:
+        "200":
+          description: updated
+        "400":
+          description: bad request
+        "401":
+          description: unauthorized
+        "404":
+          description: not found
+    delete:
+      security:
+        - apiKeyAuth: []
+      responses:
+        "204":
+          description: deleted
+        "401":
+          description: unauthorized
+        "404":
+          description: not found
+  /orders/{orderId}/attachments:
+    parameters:
+      - in: path
+        name: orderId
+        required: true
+        schema:
+          type: string
+    post:
+      security:
+        - apiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+                - file
+              properties:
+                file:
+                  type: string
+                  format: binary
+                comment:
+                  type: string
+      responses:
+        "201":
+          description: created
+        "400":
+          description: bad request
+        "401":
+          description: unauthorized
+components:
+  securitySchemes:
+    apiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+  schemas:
+    OrderCreate:
+      type: object
+      required:
+        - customerEmail
+        - amount
+      properties:
+        customerEmail:
+          type: string
+          format: email
+        amount:
+          type: number
+          minimum: 0.1
+        note:
+          type: string

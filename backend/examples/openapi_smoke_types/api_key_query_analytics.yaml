@@ -1,0 +1,58 @@
+openapi: "3.0.3"
+info:
+  title: API Key Query Analytics API
+  version: "1.0.0"
+servers:
+  - url: http://127.0.0.1:8000
+paths:
+  /analytics/events:
+    get:
+      security:
+        - queryKeyAuth: []
+      parameters:
+        - in: query
+          name: from
+          schema:
+            type: string
+            format: date-time
+        - in: query
+          name: to
+          schema:
+            type: string
+            format: date-time
+      responses:
+        "200":
+          description: ok
+        "401":
+          description: unauthorized
+  /analytics/reports:
+    post:
+      security:
+        - queryKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - reportType
+              properties:
+                reportType:
+                  type: string
+                  enum: [daily, weekly, monthly]
+                includeDetails:
+                  type: boolean
+      responses:
+        "202":
+          description: accepted
+        "400":
+          description: bad request
+        "401":
+          description: unauthorized
+components:
+  securitySchemes:
+    queryKeyAuth:
+      type: apiKey
+      in: query
+      name: api_key
